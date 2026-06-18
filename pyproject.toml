@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "libre-eomt"
+version = "0.1.0"
+description = "Standalone EoMT (Encoder-only Mask Transformer) for instance segmentation, with DINOv2 init, COCO training/validation and inference."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "libre-eomt contributors" }]
+keywords = ["eomt", "dinov2", "instance-segmentation", "transformers", "coco"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+    "transformers>=5.1.0",
+    "pycocotools>=2.0.0",
+    "scipy>=1.7.0",
+    "numpy>=1.19.0",
+    "Pillow>=9.1.0",
+    "tqdm>=4.65.0",
+    "PyYAML>=6.0",
+    "requests>=2.25.0",
+    "typer>=0.9.0",
+]
+
+[project.optional-dependencies]
+logging = ["tensorboard>=2.10", "wandb>=0.15"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+eomt = "eomt.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/your-org/libre-eomt"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eomt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,10 @@
+# COCO 2017 instance segmentation.
+# Paths are relative to `path` (which is itself relative to this file, or absolute).
+# With `download: true`, COCO 2017 is fetched from cocodataset.org if missing.
+
+path: datasets/coco
+train_images: train2017
+train_json: annotations/instances_train2017.json
+val_images: val2017
+val_json: annotations/instances_val2017.json
+download: true
