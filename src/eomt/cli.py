@@ -63,13 +63,26 @@ def train(
     aux_class_weights: bool = typer.Option(
         False, help="Inverse-sqrt-frequency CE weights per aux head (imbalance)."
     ),
+    aux_iou_gate: float = typer.Option(
+        0.5, help="Train aux heads only on matched queries with mask IoU >= this (0=off)."
+    ),
+    aux_class_gate: bool = typer.Option(
+        True, help="Also require the matched query's predicted primary class to be correct."
+    ),
+    aux_head_layers: int = typer.Option(
+        2, help="Aux head depth: 1=linear probe, >=2=MLP."
+    ),
+    aux_head_hidden: Optional[int] = typer.Option(
+        None, help="Aux MLP hidden width (default: encoder hidden_size)."
+    ),
+    aux_head_dropout: float = typer.Option(0.0, help="Aux MLP dropout."),
     clip_norm: float = typer.Option(0.01),
     workers: int = typer.Option(4),
     device: str = typer.Option("auto"),
     amp: bool = typer.Option(True),
     pretrained: bool = typer.Option(True, help="Init encoder from DINOv2."),
     project: str = typer.Option("runs/train"),
-    name: str = typer.Option("eomt"),
+    name: Optional[str] = typer.Option(None, help="Run name (default: eomt-{size})."),
     val_interval: int = typer.Option(1),
     logger: str = typer.Option("none", help="none | tensorboard | wandb."),
     resume: Optional[str] = typer.Option(
@@ -132,6 +145,11 @@ def train(
         aux_w_warmup=aux_w_warmup,
         aux_w_per_head=per_head,
         aux_class_weights=aux_class_weights,
+        aux_iou_gate=aux_iou_gate,
+        aux_class_gate=aux_class_gate,
+        aux_head_layers=aux_head_layers,
+        aux_head_hidden=aux_head_hidden,
+        aux_head_dropout=aux_head_dropout,
         clip_norm=clip_norm,
         workers=workers,
         device=device,

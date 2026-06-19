@@ -152,16 +152,22 @@ def aux_evaluate(
     num_workers: int = 4,
     amp: bool = False,
     verbose: bool = True,
-) -> dict[str, float]:
-    """Held-out matched-query accuracy per secondary head.
+    iou_gate: float = 0.5,
+    class_gate: bool = True,
+) -> tuple[dict[str, float], dict[str, dict[int, tuple[int, int]]]]:
+    """Held-out matched-query accuracy per secondary head, plus a per-primary breakdown.
 
     ``val_seg_ds`` is a :class:`~eomt.data.coco.CocoInstanceSeg` over the val split
     (deterministic val transform, sharing train's attribute id map). Runs the model
     mask-free, matches predictions to GT with EoMT's matcher, and reports top-1
-    accuracy on matched queries (ignoring ``-100`` labels). Returns
-    ``{name: accuracy}`` (NaN for a head with no matched, non-ignored queries).
+    accuracy on matched queries (ignoring ``-100`` labels).
+
+    The scalar accuracy uses the same gate as training (``iou_gate`` + ``class_gate``)
+    so it reflects the trained population. The per-primary diagnostic uses an
+    IoU-only gate (no class gate) so primary classes the model often *misclassifies*
+    still show up. Returns ``({name: accuracy}, {name: {primary_cls: (correct, total)}})``.
     """
-    from ..aux_cls import aux_accuracy
+    from ..aux_cls import aux_accuracy, aux_accuracy_by_primary, gate_indices, match_queries
     from ..data import collate_train
 
     device = torch.device(device) if not isinstance(device, torch.device) else device
@@ -176,6 +182,7 @@ def aux_evaluate(
     )
     hits = {s.name: 0 for s in val_seg_ds.aux_specs}
     tot = {s.name: 0 for s in val_seg_ds.aux_specs}
+    per_class: dict[str, dict[int, list[int]]] = {s.name: {} for s in val_seg_ds.aux_specs}
     use_amp = amp and device.type == "cuda"
 
     for pixel_values, mask_labels, class_labels, aux_labels in tqdm(
@@ -187,10 +194,29 @@ def aux_evaluate(
         aux_labels = {k: [t.to(device) for t in v] for k, v in aux_labels.items()}
         with torch.amp.autocast("cuda", enabled=use_amp):
             out = model(pixel_values)
+        indices = match_queries(model, out, mask_labels, class_labels)
+        gated = gate_indices(
+            out, indices, mask_labels, class_labels,
+            iou_thr=iou_gate, require_class=class_gate,
+        )
         for name, (hit, t) in aux_accuracy(
-            model, out, mask_labels, class_labels, aux_labels
+            model, out, mask_labels, class_labels, aux_labels, indices=gated
         ).items():
             hits[name] += hit
             tot[name] += t
+        # per-primary diagnostic: IoU-gated only (keep misclassified primaries)
+        iou_only = gate_indices(
+            out, indices, mask_labels, class_labels,
+            iou_thr=iou_gate, require_class=False,
+        )
+        for name, buckets in aux_accuracy_by_primary(
+            model, out, mask_labels, class_labels, aux_labels, indices=iou_only
+        ).items():
+            for cls_id, (c, t) in buckets.items():
+                acc = per_class[name].setdefault(cls_id, [0, 0])
+                acc[0] += c
+                acc[1] += t
 
-    return {n: (hits[n] / tot[n] if tot[n] else float("nan")) for n in hits}
+    scalar = {n: (hits[n] / tot[n] if tot[n] else float("nan")) for n in hits}
+    pc = {n: {c: (v[0], v[1]) for c, v in buckets.items()} for n, buckets in per_class.items()}
+    return scalar, pc

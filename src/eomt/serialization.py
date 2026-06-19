@@ -57,9 +57,15 @@ def wrap_checkpoint(
     task: str = "instance",
     family: str = "eomt",
     aux_heads: list | None = None,
+    aux_head_arch: dict | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
-    """Build a metadata-wrapped checkpoint that :func:`load_model` can restore."""
+    """Build a metadata-wrapped checkpoint that :func:`load_model` can restore.
+
+    ``aux_head_arch`` records the secondary-head network shape (``layers`` /
+    ``hidden`` / ``dropout``) so an MLP head is rebuilt identically on reload —
+    without it a non-linear head would be silently dropped by ``strict=False``.
+    """
     checkpoint: dict[str, Any] = {
         "model": state_dict,
         "schema_version": SCHEMA_VERSION,
@@ -72,6 +78,8 @@ def wrap_checkpoint(
         "imgsz": int(imgsz),
         "aux_heads": aux_specs_to_meta(aux_heads),
     }
+    if aux_heads and aux_head_arch is not None:
+        checkpoint["aux_head_arch"] = dict(aux_head_arch)
     checkpoint.update({k: v for k, v in extra.items() if v is not None})
     return checkpoint
 
@@ -138,8 +146,13 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     imgsz = int(ckpt.get("imgsz") or _infer_imgsz(state))
     names = ckpt.get("names")
     aux_heads = aux_specs_from_meta(ckpt.get("aux_heads")) or _infer_aux_heads(state)
+    # Rebuild the exact secondary-head shape. Checkpoints written before aux_head_arch
+    # existed only ever had single Linear heads, so default to that for them.
+    aux_head_arch = ckpt.get("aux_head_arch") or ({"layers": 1} if aux_heads else None)
 
-    model = build_model(size, nc=nc, imgsz=imgsz, names=names, aux_heads=aux_heads)
+    model = build_model(
+        size, nc=nc, imgsz=imgsz, names=names, aux_heads=aux_heads, aux_head_arch=aux_head_arch
+    )
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         warnings.warn(
@@ -178,6 +191,11 @@ def _infer_aux_heads(state: dict) -> list:
         for prefix in ("aux_heads.", "eomt_aux_heads."):
             if key.startswith(prefix) and key.endswith(".weight"):
                 name = key[len(prefix) : -len(".weight")]
+                # Only bare Linear heads are inferable from a metadata-less state dict;
+                # an MLP head (``aux_heads.<name>.<idx>.weight``) needs the saved
+                # ``aux_head_arch`` to rebuild and is skipped here.
+                if "." in name:
+                    continue
                 specs.append(AuxHeadSpec(name=name, num_classes=int(tensor.shape[0])))
     return specs
 

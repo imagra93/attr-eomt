@@ -80,7 +80,8 @@ def test_aux_heads_train_and_infer():
     a_loss, per_head = aux_loss(model, out, mask_labels, class_labels, aux_labels)
     assert set(per_head) == {"typology", "severity"}
     (total + a_loss).backward()
-    assert model.aux_heads["typology"].weight.grad is not None
+    # default head is a small MLP -> assert grads flow through *some* head param
+    assert any(p.grad is not None for p in model.aux_heads["typology"].parameters())
 
     acc = aux_accuracy(model, out, mask_labels, class_labels, aux_labels)
     assert set(acc) == {"typology", "severity"}
@@ -106,7 +107,7 @@ def test_aux_ignore_index():
 
     torch.manual_seed(0)
     model = build_model("s", nc=NC, imgsz=IMGSZ, aux_heads=[AuxHeadSpec("typ", 4)]).train()
-    hidden = model.aux_heads["typ"].in_features
+    hidden = model.config.hidden_size
     out = {"query_embed": torch.randn(1, 5, hidden, requires_grad=True)}
     indices = [(torch.tensor([0, 1]), torch.tensor([0, 1]))]  # 2 matched queries
 
@@ -158,6 +159,77 @@ def test_postprocess_instance_contract():
     assert res["masks"].shape[1:] == (15, 20)  # (orig_h, orig_w)
     assert res["boxes"].shape[1] == 4
     assert res["num_detections"] <= 10
+
+
+def test_aux_head_mlp_checkpoint_roundtrip(tmp_path):
+    """An MLP aux head must rebuild identically on reload (arch saved in metadata)."""
+    import warnings
+
+    import torch.nn as nn
+
+    from eomt.config import AuxHeadSpec
+    from eomt.serialization import load_model, save_checkpoint, wrap_checkpoint
+
+    torch.manual_seed(0)
+    specs = [AuxHeadSpec("typ", 4, {0: "a", 1: "b", 2: "c", 3: "d"})]
+    arch = {"layers": 2, "hidden": 64, "dropout": 0.0}
+    model = build_model("s", nc=NC, imgsz=IMGSZ, aux_heads=specs, aux_head_arch=arch).eval()
+    assert isinstance(model.aux_heads["typ"], nn.Sequential)  # MLP, not bare Linear
+
+    x = torch.randn(1, 3, IMGSZ, IMGSZ)
+    with torch.no_grad():
+        ref = model(x)["aux_queries_logits"]["typ"]
+
+    ckpt = wrap_checkpoint(
+        model.state_dict(), size="s", nc=NC, imgsz=IMGSZ, aux_heads=specs, aux_head_arch=arch
+    )
+    assert ckpt["aux_head_arch"] == arch
+    path = tmp_path / "m.pt"
+    save_checkpoint(ckpt, path)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loaded = load_model(path, device="cpu")
+    msgs = [str(w.message) for w in caught]
+    assert not any("missing" in m or "unexpected" in m for m in msgs), msgs
+    assert isinstance(loaded.aux_heads["typ"], nn.Sequential)
+    with torch.no_grad():
+        got = loaded(x)["aux_queries_logits"]["typ"]
+    assert torch.allclose(ref, got, atol=1e-5)
+
+
+def test_gate_indices_iou_and_class():
+    """gate_indices drops low-IoU and (optionally) wrong-class matched pairs."""
+    from eomt.aux_cls import gate_indices
+
+    # 1 image, 3 queries, 4x4 masks, NC+1=4 class logits.
+    masks = torch.full((1, 3, 4, 4), -10.0)
+    masks[0, 0, :2, :2] = 10.0  # query0 -> top-left block
+    masks[0, 1, 2:, 2:] = 10.0  # query1 -> bottom-right block
+    # query2 stays all-negative (empty mask -> IoU 0)
+    cls = torch.full((1, 3, 4), -10.0)
+    cls[0, 0, 0] = 10.0  # query0 predicts class 0
+    cls[0, 1, 2] = 10.0  # query1 predicts class 2 (wrong for gt1)
+    cls[0, 2, 1] = 10.0  # query2 predicts class 1
+    out = {"masks_queries_logits": masks, "class_queries_logits": cls}
+
+    gt0 = torch.zeros(4, 4); gt0[:2, :2] = 1.0
+    gt1 = torch.zeros(4, 4); gt1[2:, 2:] = 1.0
+    mask_labels = [torch.stack([gt0, gt1])]
+    class_labels = [torch.tensor([0, 1])]
+
+    # IoU-only: q0->gt0 (IoU 1) kept, q2->gt1 (IoU 0) dropped.
+    idx = [(torch.tensor([0, 2]), torch.tensor([0, 1]))]
+    src, tgt = gate_indices(out, idx, mask_labels, class_labels, iou_thr=0.5, require_class=False)[0]
+    assert src.tolist() == [0] and tgt.tolist() == [0]
+
+    # IoU + class: q1 localizes gt1 (IoU 1) but predicts class 2 != 1 -> dropped.
+    idx = [(torch.tensor([0, 1]), torch.tensor([0, 1]))]
+    src, tgt = gate_indices(out, idx, mask_labels, class_labels, iou_thr=0.5, require_class=True)[0]
+    assert src.tolist() == [0] and tgt.tolist() == [0]
+
+    # Disabled gate is a no-op (returns the same object).
+    assert gate_indices(out, idx, mask_labels, class_labels, iou_thr=0.0, require_class=False) is idx
 
 
 def test_build_model_rejects_unimplemented_family():

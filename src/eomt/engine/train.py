@@ -19,10 +19,17 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from ..aux_cls import aux_accuracy, aux_loss, match_queries
+from ..aux_cls import (
+    aux_accuracy,
+    aux_accuracy_by_primary,
+    aux_loss,
+    gate_indices,
+    match_queries,
+)
 from ..data import CocoInstanceSeg, CocoValImages, collate_train
 from ..data.transforms import build_val_transform
 from ..model import build_model, load_dinov2_backbone
+from ..plotting import plot_aux_per_class, plot_metrics_csv
 from ..serialization import load_raw, resolve_checkpoint, save_checkpoint, wrap_checkpoint
 from .validate import _SEGM_KEYS, aux_evaluate, evaluate
 
@@ -207,7 +214,7 @@ def train(
     min_scale: float = 0.5,
     max_scale: float = 1.0,
     project: str = "runs/train",
-    name: str = "eomt",
+    name: str | None = None,
     val_interval: int = 1,
     conf_thres: float = 0.0,
     max_det: int = 100,
@@ -215,6 +222,11 @@ def train(
     aux_w_warmup: float = 0.0,
     aux_w_per_head: dict[str, float] | None = None,
     aux_class_weights: bool = False,
+    aux_iou_gate: float = 0.5,
+    aux_class_gate: bool = True,
+    aux_head_layers: int = 2,
+    aux_head_hidden: int | None = None,
+    aux_head_dropout: float = 0.0,
     logger: str = "none",
     resume: str | None = None,
 ) -> dict:
@@ -223,9 +235,6 @@ def train(
         raise ValueError(f"imgsz={imgsz} must be divisible by 14 (DINOv2 grid).")
 
     dev = _resolve_device(device)
-    run_dir = Path(project) / name
-    weights_dir = run_dir / "weights"
-    weights_dir.mkdir(parents=True, exist_ok=True)
 
     # Resume may point at a checkpoint file OR a run/weights folder. Resolve it
     # and recover the model size/imgsz from its metadata BEFORE building the model
@@ -238,6 +247,26 @@ def train(
         if resume_ckpt.get("imgsz"):
             imgsz = int(resume_ckpt["imgsz"])
         print(f"[resume] checkpoint {resume_path} (size={size}, imgsz={imgsz})")
+
+    # Run directory. Default the name to ``eomt-<size>`` so different sizes don't
+    # overwrite each other; resolved after resume so it tracks the checkpoint's size.
+    if name is None:
+        name = f"eomt-{size}"
+    run_dir = Path(project) / name
+    weights_dir = run_dir / "weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
+    # Secondary-head architecture. New runs use the CLI flags (a small MLP by
+    # default). Resuming keeps the architecture recorded in the checkpoint so the
+    # saved head weights load 1:1; checkpoints predating this metadata only ever
+    # had single Linear heads, so default to that for them.
+    aux_head_arch = {
+        "layers": aux_head_layers,
+        "hidden": aux_head_hidden,
+        "dropout": aux_head_dropout,
+    }
+    if resume_ckpt is not None:
+        aux_head_arch = resume_ckpt.get("aux_head_arch") or {"layers": 1}
 
     # --- data ---
     train_ds = CocoInstanceSeg(
@@ -319,12 +348,19 @@ def train(
             "aux_w_warmup": aux_w_warmup,
             "aux_w_per_head": aux_w_per_head,
             "aux_class_weights": aux_class_weights,
+            "aux_iou_gate": aux_iou_gate,
+            "aux_class_gate": aux_class_gate,
+            "aux_head_arch": aux_head_arch,
             "aux_heads": {s.name: s.num_classes for s in aux_specs},
         },
     )
 
     # --- model ---
-    model = build_model(size, nc=nc, imgsz=imgsz, names=names, aux_heads=aux_specs).to(dev)
+    model = build_model(
+        size, nc=nc, imgsz=imgsz, names=names, aux_heads=aux_specs, aux_head_arch=aux_head_arch
+    ).to(dev)
+    if aux_specs:
+        print(f"[model] aux head arch: {model.aux_head_arch}")
     start_epoch, best_metric = 0, -1.0
     optimizer = build_optimizer(model, lr0, weight_decay, backbone_lr_mult)
 
@@ -363,6 +399,7 @@ def train(
             names=names,
             task="instance",
             aux_heads=aux_specs,
+            aux_head_arch=aux_head_arch,
             **extra,
         )
         save_checkpoint(ckpt, path)
@@ -376,6 +413,10 @@ def train(
         csv_fields += [f"val/aux_acc/{s.name}" for s in aux_specs]
     csv_log = _CsvLogger(run_dir / "metrics.csv", csv_fields)
 
+    # Per-primary aux accuracy is computed held-out in aux_evaluate when a val split
+    # exists; otherwise fall back to accumulating it over the train epoch.
+    track_pc_train = bool(aux_specs) and val_seg_ds is None
+
     # --- epochs ---
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -383,6 +424,8 @@ def train(
         # matched-query accuracy per aux head, accumulated over the epoch
         aux_hits = {s.name: 0 for s in aux_specs}
         aux_tot = {s.name: 0 for s in aux_specs}
+        # per-primary-class aux accuracy (only accumulated as the no-val fallback)
+        aux_pc: dict[str, dict[int, list[int]]] = {s.name: {} for s in aux_specs}
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs - 1}", unit="batch")
         for step, (pixel_values, mask_labels, class_labels, aux_labels) in enumerate(pbar):
             it = epoch * iters_per_epoch + step
@@ -400,16 +443,22 @@ def train(
             aux_labels = {k: [t.to(dev) for t in v] for k, v in aux_labels.items()}
 
             optimizer.zero_grad(set_to_none=True)
-            aux_indices = None
+            aux_gated = None
             with torch.amp.autocast("cuda", enabled=amp and dev.type == "cuda"):
                 out = model(pixel_values, mask_labels=mask_labels, class_labels=class_labels)
                 loss = out["loss"]
                 if aux_specs:
-                    # Match once per step; reuse for both the loss and the accuracy.
+                    # Match once per step, then gate to well-localized (IoU) and
+                    # correctly-classified queries so the attribute trains only on
+                    # instances the detector actually got right. Reuse for accuracy.
                     aux_indices = match_queries(model, out, mask_labels, class_labels)
+                    aux_gated = gate_indices(
+                        out, aux_indices, mask_labels, class_labels,
+                        iou_thr=aux_iou_gate, require_class=aux_class_gate,
+                    )
                     a_loss, _ = aux_loss(
                         model, out, mask_labels, class_labels, aux_labels,
-                        weights=aux_w_per_head, indices=aux_indices,
+                        weights=aux_w_per_head, indices=aux_gated,
                         class_weights=aux_class_weight,
                     )
                     aux_w_eff = aux_w * _aux_w_factor(it, total_iters, aux_w_warmup)
@@ -422,10 +471,22 @@ def train(
 
             if aux_specs:
                 for name, (hit, tot) in aux_accuracy(
-                    model, out, mask_labels, class_labels, aux_labels, indices=aux_indices
+                    model, out, mask_labels, class_labels, aux_labels, indices=aux_gated
                 ).items():
                     aux_hits[name] += hit
                     aux_tot[name] += tot
+                if track_pc_train:  # per-primary diagnostic when there is no val set
+                    iou_only = gate_indices(
+                        out, aux_indices, mask_labels, class_labels,
+                        iou_thr=aux_iou_gate, require_class=False,
+                    )
+                    for name, buckets in aux_accuracy_by_primary(
+                        model, out, mask_labels, class_labels, aux_labels, indices=iou_only
+                    ).items():
+                        for cls_id, (c, t) in buckets.items():
+                            acc = aux_pc[name].setdefault(cls_id, [0, 0])
+                            acc[0] += c
+                            acc[1] += t
 
             running += float(loss.detach())
             avg = running / (step + 1)
@@ -463,6 +524,7 @@ def train(
 
         # --- validation ---
         metrics = {}
+        epoch_aux_pc: dict[str, dict[int, tuple[int, int]]] | None = None
         if val_ds is not None and (epoch + 1) % val_interval == 0:
             metrics = evaluate(
                 model,
@@ -481,9 +543,10 @@ def train(
                 f"bbox mAP {metrics.get('bbox/mAP', 0):.4f}"
             )
             if val_seg_ds is not None:  # held-out matched-query accuracy per head
-                val_aux = aux_evaluate(
+                val_aux, epoch_aux_pc = aux_evaluate(
                     model, val_seg_ds, device=dev, batch_size=batch,
                     num_workers=workers, amp=amp,
+                    iou_gate=aux_iou_gate, class_gate=aux_class_gate,
                 )
                 metrics.update({f"aux_acc/{n}": v for n, v in val_aux.items()})
                 print(
@@ -506,6 +569,23 @@ def train(
         row.update({f"train/aux_acc/{n}": aux_acc[n] for n in aux_acc})
         row.update({f"val/{k}": v for k, v in metrics.items()})
         csv_log.append(row)
+
+        # --- per-epoch plots (overwrite each round; never fatal) ---
+        try:
+            plot_metrics_csv(run_dir / "metrics.csv", run_dir / "metrics.png")
+        except Exception as e:  # noqa: BLE001 - plotting must never crash training
+            print(f"[plot] metrics.png failed: {e}")
+        if aux_specs:
+            if epoch_aux_pc is None and track_pc_train:
+                epoch_aux_pc = {
+                    n: {c: (v[0], v[1]) for c, v in buckets.items()}
+                    for n, buckets in aux_pc.items()
+                }
+            if epoch_aux_pc is not None:
+                try:
+                    plot_aux_per_class(epoch_aux_pc, names, run_dir / "aux_per_class.png")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[plot] aux_per_class.png failed: {e}")
 
     if tb is not None:
         tb.close()

@@ -38,6 +38,59 @@ def _gather_matched(out: dict, indices):
     return torch.cat(feats), batch_tgt
 
 
+@torch.no_grad()
+def gate_indices(
+    out: dict,
+    indices,
+    mask_labels,
+    class_labels,
+    *,
+    iou_thr: float = 0.5,
+    require_class: bool = False,
+):
+    """Keep only well-localized (and optionally correctly-classified) matched pairs.
+
+    The Hungarian matcher assigns *every* GT a query, even one whose predicted mask
+    barely overlaps it (common early in training). For attribute supervision we want
+    queries that actually localize the instance, so we drop matched ``(src, tgt)``
+    pairs where the predicted-mask↔GT-mask IoU is ``< iou_thr``. With ``require_class``
+    we also drop pairs whose predicted primary class ≠ the GT class. Returns the same
+    ``[(src, tgt), ...]`` structure with each pair filtered (possibly to empty).
+
+    A no-op (returns ``indices`` unchanged) when ``iou_thr <= 0`` and not
+    ``require_class`` — i.e. the pre-gate behaviour.
+    """
+    if iou_thr <= 0 and not require_class:
+        return indices
+    masks = out["masks_queries_logits"]  # [B, Q, h, w]
+    cls = out["class_queries_logits"]  # [B, Q, C+1]
+    dev = masks.device
+    gated = []
+    for b, (src, tgt) in enumerate(indices):
+        src = src.to(dev)
+        tgt = tgt.to(dev)
+        if src.numel() == 0:
+            gated.append((src, tgt))
+            continue
+        keep = torch.ones(src.numel(), dtype=torch.bool, device=dev)
+        if iou_thr > 0:
+            pm = masks[b, src].sigmoid() > 0.5  # [n, h, w]
+            gm = mask_labels[b][tgt].to(dev).float()  # [n, H, W] in {0, 1}
+            if gm.shape[-2:] != pm.shape[-2:]:
+                gm = F.interpolate(
+                    gm.unsqueeze(1), size=pm.shape[-2:], mode="nearest"
+                ).squeeze(1)
+            gm = gm > 0.5
+            inter = (pm & gm).flatten(1).sum(1).float()
+            union = (pm | gm).flatten(1).sum(1).float().clamp(min=1.0)
+            keep &= (inter / union) >= iou_thr
+        if require_class:
+            pred_cls = cls[b, src].argmax(-1)
+            keep &= pred_cls == class_labels[b][tgt].to(dev)
+        gated.append((src[keep], tgt[keep]))
+    return gated
+
+
 def aux_loss(
     model,
     out: dict,
@@ -114,4 +167,42 @@ def aux_accuracy(
         gt = torch.cat([aux_labels[name][b][tgt] for (b, tgt) in batch_tgt]).to(pred.device)
         valid = gt != ignore_index
         res[name] = (int(((pred == gt) & valid).sum()), int(valid.sum()))
+    return res
+
+
+@torch.no_grad()
+def aux_accuracy_by_primary(
+    model,
+    out: dict,
+    mask_labels,
+    class_labels,
+    aux_labels: dict[str, list[torch.Tensor]],
+    *,
+    indices=None,
+    ignore_index: int = -100,
+) -> dict[str, dict[int, tuple[int, int]]]:
+    """Per-head accuracy bucketed by GT **primary** class.
+
+    Returns ``{head: {primary_class_id: (correct, total)}}`` over matched queries —
+    a diagnostic for *which primary classes* the attribute is (in)accurate on. Pass
+    ``indices`` (e.g. IoU-gated, but not class-gated, so weak primary classes still
+    appear) to control the population. Ignored labels are excluded.
+    """
+    if indices is None:
+        indices = match_queries(model, out, mask_labels, class_labels)
+    matched, batch_tgt = _gather_matched(out, indices)
+    res: dict[str, dict[int, tuple[int, int]]] = {name: {} for name in model.aux_heads}
+    if matched is None:
+        return res
+    prim = torch.cat([class_labels[b][tgt] for (b, tgt) in batch_tgt]).to(matched.device)
+    for name, head in model.aux_heads.items():
+        pred = head(matched).argmax(-1)
+        gt = torch.cat([aux_labels[name][b][tgt] for (b, tgt) in batch_tgt]).to(pred.device)
+        valid = gt != ignore_index
+        correct = (pred == gt) & valid
+        d: dict[int, tuple[int, int]] = {}
+        for c in prim[valid].unique().tolist():
+            sel = (prim == c) & valid
+            d[int(c)] = (int(correct[sel].sum()), int(sel.sum()))
+        res[name] = d
     return res

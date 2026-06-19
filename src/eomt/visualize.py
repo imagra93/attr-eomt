@@ -24,7 +24,7 @@ def _font(size: int):
 
 
 def _aux_label(result: dict, aux_names: dict[str, dict[int, str]] | None, i: int) -> str:
-    """Build the trailing ``· attr value pct`` text for instance ``i`` (if any)."""
+    """Build the secondary-class text for instance ``i`` (rendered on its own row)."""
     aux = result.get("aux")
     if not aux:
         return ""
@@ -36,7 +36,7 @@ def _aux_label(result: dict, aux_names: dict[str, dict[int, str]] | None, i: int
         if aux_names and head in aux_names:
             label = aux_names[head].get(idx, label)
         parts.append(f"{label} {prob:.2f}")
-    return "  ·  " + "  ".join(parts)
+    return "  ".join(parts)
 
 
 def draw_instances(
@@ -76,18 +76,22 @@ def draw_instances(
     out = Image.fromarray(img.clip(0, 255).astype(np.uint8))
     draw = ImageDraw.Draw(out)
     line_w = max(2, int(round(max(out.size) / 320)))
-    font = _font(max(12, int(round(max(out.size) / 50))))
+    font = _font(max(11, int(round(max(out.size) / 80))))
 
     for i in range(n):
         cls = int(classes[i])
         color = class_color(cls)
         label = names.get(cls, str(cls)) if names else str(cls)
-        text = f"{label} {float(scores[i]):.2f}{_aux_label(result, aux_names, i)}"
+        # primary class + score on the first row; secondary classes on the row below
+        text = f"{label} {float(scores[i]):.2f}"
+        aux = _aux_label(result, aux_names, i)
+        if aux:
+            text += "\n" + aux
         if draw_boxes:
             x1, y1, x2, y2 = [float(v) for v in boxes[i].tolist()]
             draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)
-            tb = draw.textbbox((x1, y1), text, font=font)
+            tb = draw.multiline_textbbox((x1, y1), text, font=font)
             draw.rectangle([tb[0], tb[1], tb[2], tb[3]], fill=color)
-            draw.text((x1, y1), text, fill=(0, 0, 0), font=font)
+            draw.multiline_text((x1, y1), text, fill=(0, 0, 0), font=font)
 
     return out

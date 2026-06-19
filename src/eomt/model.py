@@ -55,6 +55,44 @@ def _patch_eomt_sample_point_for_amp() -> None:
     _m._eomt_amp_sample_point_patched = True
 
 
+#: Default secondary-head architecture for new runs: a small 2-layer MLP.
+#: ``hidden=None`` means "use the encoder ``hidden_size``"; ``layers=1`` is a bare
+#: linear probe (the pre-MLP behaviour, kept for old checkpoints).
+DEFAULT_AUX_HEAD_ARCH: dict = {"layers": 2, "hidden": None, "dropout": 0.0}
+
+
+def _normalize_aux_arch(arch: dict | None) -> dict:
+    """Fill an aux-head arch dict with defaults (``layers`` / ``hidden`` / ``dropout``)."""
+    arch = dict(arch or {})
+    return {
+        "layers": int(arch.get("layers", DEFAULT_AUX_HEAD_ARCH["layers"])),
+        "hidden": arch.get("hidden", DEFAULT_AUX_HEAD_ARCH["hidden"]),
+        "dropout": float(arch.get("dropout", DEFAULT_AUX_HEAD_ARCH["dropout"])),
+    }
+
+
+def _build_aux_head(in_dim: int, num_classes: int, arch: dict) -> nn.Module:
+    """Build one secondary-head module from a normalized arch dict.
+
+    ``layers <= 1`` ⇒ a bare ``nn.Linear`` (linear probe). Otherwise a small MLP:
+    ``(Linear -> LayerNorm -> GELU -> [Dropout]) x (layers-1) -> Linear``.
+    """
+    layers = int(arch["layers"])
+    if layers <= 1:
+        return nn.Linear(in_dim, num_classes)
+    hidden = int(arch["hidden"] or in_dim)
+    dropout = float(arch["dropout"])
+    mods: list[nn.Module] = []
+    d = in_dim
+    for _ in range(layers - 1):
+        mods += [nn.Linear(d, hidden), nn.LayerNorm(hidden), nn.GELU()]
+        if dropout > 0:
+            mods.append(nn.Dropout(dropout))
+        d = hidden
+    mods.append(nn.Linear(d, num_classes))
+    return nn.Sequential(*mods)
+
+
 def build_model(
     size: str = "l",
     *,
@@ -63,12 +101,14 @@ def build_model(
     names: dict[int, str] | None = None,
     family: str = "instance",
     aux_heads: list[AuxHeadSpec] | None = None,
+    aux_head_arch: dict | None = None,
 ) -> "EoMTModel":
     """Build an :class:`EoMTModel`.
 
     ``family`` is accepted for forward-compatibility (a detect/box-head family
     and a semantic family may be added later); only ``"instance"`` is supported.
-    ``aux_heads`` adds one secondary per-instance classifier per spec.
+    ``aux_heads`` adds one secondary per-instance classifier per spec;
+    ``aux_head_arch`` sets their shared network shape (see ``_build_aux_head``).
     """
     if family != "instance":
         raise NotImplementedError(
@@ -81,6 +121,7 @@ def build_model(
         patch_size=PATCH_SIZE,
         names=names,
         aux_heads=aux_heads,
+        aux_head_arch=aux_head_arch,
     )
 
 
@@ -99,6 +140,7 @@ class EoMTModel(nn.Module):
         patch_size: int = PATCH_SIZE,
         names: dict[int, str] | None = None,
         aux_heads: list[AuxHeadSpec] | None = None,
+        aux_head_arch: dict | None = None,
     ):
         super().__init__()
         from transformers import EomtForUniversalSegmentation
@@ -117,9 +159,15 @@ class EoMTModel(nn.Module):
 
         # Secondary per-instance heads (attributes). Each reads the per-query
         # embedding — the input to ``class_predictor`` — captured by a hook.
+        # ``aux_head_arch`` (a small MLP by default) is the shared head shape; it is
+        # persisted in the checkpoint so reload rebuilds the same modules.
         self.aux_specs: list[AuxHeadSpec] = list(aux_heads or [])
+        self.aux_head_arch: dict = _normalize_aux_arch(aux_head_arch)
         self.aux_heads = nn.ModuleDict(
-            {s.name: nn.Linear(config.hidden_size, s.num_classes) for s in self.aux_specs}
+            {
+                s.name: _build_aux_head(config.hidden_size, s.num_classes, self.aux_head_arch)
+                for s in self.aux_specs
+            }
         )
         self._query_embed: torch.Tensor | None = None
         if self.aux_heads:
@@ -291,5 +339,19 @@ def load_dinov2_backbone(model: EoMTModel, *, verbose: bool = True) -> dict[str,
         print(
             f"[eomt] DINOv2 -> EoMT: matched={matched} skipped={skipped} "
             f"interpolated={interpolated}; prediction head left random."
+        )
+    # Guard against a silent half-random backbone: if a future transformers key
+    # rename broke the remap, ``strict=False`` would hide it and only this count
+    # would drop. Expect ~ all encoder/embedding tensors to copy across.
+    expected = sum(1 for dk in dino_sd if _remap_dinov2_key(dk) is not None) + 1  # +pos-embed
+    if matched < 0.8 * expected:
+        import warnings
+
+        warnings.warn(
+            f"[eomt] DINOv2 backbone load matched only {matched}/{expected} expected "
+            "tensors — the encoder is largely RANDOM. The DINOv2->EoMT key remap is "
+            "likely stale (transformers version change). Training will be far worse.",
+            RuntimeWarning,
+            stacklevel=2,
         )
     return {"matched": matched, "skipped": skipped, "interpolated": interpolated}
