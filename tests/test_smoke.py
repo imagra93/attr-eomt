@@ -235,3 +235,135 @@ def test_gate_indices_iou_and_class():
 def test_build_model_rejects_unimplemented_family():
     with pytest.raises(NotImplementedError):
         build_model("s", nc=NC, family="detect")
+
+
+# --- training-recipe improvements -------------------------------------------
+
+
+def test_grad_accumulation_matches_large_batch():
+    """Accumulating ``loss/accum`` over micro-batches == one full-batch step (mean loss)."""
+    import torch.nn as nn
+
+    torch.manual_seed(0)
+    lin = nn.Linear(4, 1)
+    x, y = torch.randn(4, 4), torch.randn(4, 1)
+
+    lin.zero_grad()
+    ((lin(x) - y) ** 2).mean().backward()
+    big = [p.grad.clone() for p in lin.parameters()]
+
+    accum = 2
+    lin.zero_grad()  # zero once at the window start
+    for i in range(accum):
+        xb, yb = x[i * 2 : (i + 1) * 2], y[i * 2 : (i + 1) * 2]
+        (((lin(xb) - yb) ** 2).mean() / accum).backward()  # divide, accumulate
+    acc = [p.grad.clone() for p in lin.parameters()]
+
+    for a, b in zip(acc, big):
+        assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_model_ema_tracks_params_and_copies_buffers():
+    from eomt.ema import ModelEMA
+
+    torch.manual_seed(0)
+    model = build_model("s", nc=NC, imgsz=IMGSZ).train()
+    ema = ModelEMA(model, decay=0.5, tau=0.0)  # tau<=0 -> constant decay 0.5
+
+    name = next(iter(dict(model.named_parameters())))
+    before = ema.module.state_dict()[name].clone()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1.0)
+    ema.update(model)
+    live = dict(model.named_parameters())[name]
+    after = ema.module.state_dict()[name]
+    assert torch.allclose(after, 0.5 * before + 0.5 * live, atol=1e-5)
+
+    # The annealed attn_mask_probs buffer is copied verbatim, never averaged.
+    model.eomt.attn_mask_probs.fill_(0.7)
+    ema.update(model)
+    assert torch.allclose(ema.module.eomt.attn_mask_probs, model.eomt.attn_mask_probs)
+
+
+def test_build_optimizer_no_decay_and_llrd():
+    from eomt.engine.train import _llrd_scale, build_optimizer
+
+    model = build_model("s", nc=NC, imgsz=IMGSZ)
+    opt = build_optimizer(model, lr=1e-4, weight_decay=0.05, backbone_lr_mult=0.1, llrd=1.0)
+
+    # Both a weight-decay and a no-weight-decay group exist.
+    wds = {g["weight_decay"] for g in opt.param_groups}
+    assert 0.0 in wds and 0.05 in wds
+    # llrd=1.0 -> exactly the legacy two LR levels (backbone*mult and head).
+    lrs = sorted(round(g["lr"], 10) for g in opt.param_groups)
+    assert set(lrs) == {1e-5, 1e-4}
+    # A LayerNorm weight (1-D) lands in a no-decay group.
+    pid2wd = {id(p): g["weight_decay"] for g in opt.param_groups for p in g["params"]}
+    ln = dict(model.named_parameters())["eomt.layernorm.weight"]
+    assert pid2wd[id(ln)] == 0.0
+
+    # llrd<1 -> deeper layers get higher LR than embeddings, and more groups.
+    assert _llrd_scale("eomt.embeddings.x", 12, 0.85) < _llrd_scale("eomt.layers.11.x", 12, 0.85)
+    opt2 = build_optimizer(model, 1e-4, 0.05, 0.1, llrd=0.85)
+    assert len(opt2.param_groups) > len(opt.param_groups)
+
+
+def test_lsj_train_transform_shapes_and_masks():
+    from torchvision import tv_tensors
+
+    from eomt.data.transforms import build_train_transform
+
+    torch.manual_seed(0)
+    tf = build_train_transform(IMGSZ, min_scale=0.1, max_scale=2.0)
+    img = tv_tensors.Image(torch.randint(0, 255, (3, 80, 120), dtype=torch.uint8))
+    masks = tv_tensors.Mask(torch.ones((2, 80, 120), dtype=torch.uint8))  # full -> always survive
+    out_img, out_masks = tf(img, masks)
+    assert out_img.shape == (3, IMGSZ, IMGSZ) and out_img.dtype == torch.float32
+    assert out_masks.shape == (2, IMGSZ, IMGSZ)
+    assert (out_masks.flatten(1).sum(1) > 0).all()  # both instances kept
+
+
+def test_preprocess_letterbox_meta_and_padding():
+    import numpy as np
+
+    from eomt.preprocess import preprocess_numpy
+
+    img = np.zeros((10, 40, 3), dtype=np.uint8)  # h=10, w=40 (wide)
+    chw, meta = preprocess_numpy(img, 20, letterbox=True)
+    assert chw.shape == (3, 20, 20)
+    assert meta["letterbox"] and meta["content_hw"] == (5, 20) and meta["input_size"] == 20
+    assert np.allclose(chw[:, 5:, :], 0.0)  # bottom padding == 0 (mean) in normalized space
+
+    _, meta2 = preprocess_numpy(img, 20, letterbox=False)
+    assert not meta2["letterbox"] and meta2["content_hw"] == (20, 20)
+
+
+def test_letterbox_inverse_crops_content_not_padding():
+    from eomt.postprocess import _masks_to_original
+    from eomt.preprocess import make_preprocess_meta
+
+    S = 20
+    meta = make_preprocess_meta(True, (5, 20), S)  # content = top 5 rows of the canvas
+    pos_content = torch.full((1, S, S), -10.0)
+    pos_content[:, :5, :] = 10.0  # active only in the real-content region
+    out = _masks_to_original(pos_content, 10, 40, meta)
+    assert out.shape == (1, 10, 40)
+    assert (out.sigmoid() > 0.5).all()  # content fills the whole original image
+
+    pos_padding = torch.full((1, S, S), -10.0)
+    pos_padding[:, 5:, :] = 10.0  # active only in the padding region
+    out2 = _masks_to_original(pos_padding, 10, 40, meta)
+    assert not (out2.sigmoid() > 0.5).any()  # padding is cropped away
+
+
+def test_checkpoint_stores_letterbox_mode(tmp_path):
+    from eomt.serialization import load_model, save_checkpoint, wrap_checkpoint
+
+    model = build_model("s", nc=NC, imgsz=IMGSZ).eval()
+    ckpt = wrap_checkpoint(model.state_dict(), size="s", nc=NC, imgsz=IMGSZ, letterbox=True)
+    assert ckpt["letterbox"] is True
+    path = tmp_path / "m.pt"
+    save_checkpoint(ckpt, path)
+    loaded = load_model(path, device="cpu")
+    assert loaded.preprocess_letterbox is True

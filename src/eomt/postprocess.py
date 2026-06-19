@@ -30,6 +30,30 @@ def boxes_from_masks(masks: torch.Tensor) -> torch.Tensor:
     return boxes
 
 
+def _masks_to_original(mask_logits, orig_h, orig_w, preprocess_meta):
+    """Upsample low-res mask logits ``(N, h, w)`` back to the original image size.
+
+    For **stretch** preprocessing (no meta, or ``letterbox=False``) the logits cover
+    the whole square input, so we resize straight to ``(orig_h, orig_w)``. For
+    **letterbox** we first upscale to the square canvas, crop off the bottom/right
+    padding (keeping only the real content region), then resize to the original —
+    exactly inverting :func:`eomt.preprocess.preprocess_numpy`.
+    """
+    if preprocess_meta and preprocess_meta.get("letterbox"):
+        size = int(preprocess_meta["input_size"])
+        ch, cw = (int(v) for v in preprocess_meta["content_hw"])
+        canvas = F.interpolate(
+            mask_logits.unsqueeze(0), size=(size, size), mode="bilinear", align_corners=False
+        )[0]
+        content = canvas[:, :ch, :cw]
+        return F.interpolate(
+            content.unsqueeze(0), size=(orig_h, orig_w), mode="bilinear", align_corners=False
+        )[0]
+    return F.interpolate(
+        mask_logits.unsqueeze(0), size=(orig_h, orig_w), mode="bilinear", align_corners=False
+    )[0]
+
+
 def postprocess_instance(
     output: dict,
     conf_thres: float,
@@ -37,6 +61,7 @@ def postprocess_instance(
     *,
     max_det: int = 100,
     mask_thresh: float = 0.5,
+    preprocess_meta: dict | None = None,
     **_: object,
 ) -> dict:
     """Convert raw EoMT output to the canonical instance-seg dict.
@@ -48,6 +73,9 @@ def postprocess_instance(
         original_size: ``(width, height)`` of the source image.
         max_det: cap on returned instances (highest scoring first).
         mask_thresh: sigmoid threshold for binarizing masks.
+        preprocess_meta: letterbox/stretch metadata from
+            :func:`eomt.preprocess.preprocess_numpy`; when it marks a letterbox the
+            padding is cropped before resizing masks back to the original size.
 
     Returns:
         ``{"num_detections", "boxes": (N,4), "scores": (N,), "classes": (N,),
@@ -97,12 +125,7 @@ def postprocess_instance(
     scores, classes = scores[sel], classes[sel]
     mask_logits = mask_logits[sel]
 
-    masks = F.interpolate(
-        mask_logits.unsqueeze(0),
-        size=(orig_h, orig_w),
-        mode="bilinear",
-        align_corners=False,
-    )[0]
+    masks = _masks_to_original(mask_logits, orig_h, orig_w, preprocess_meta)
     masks = masks.sigmoid() > mask_thresh  # (N, H, W) bool
 
     boxes = boxes_from_masks(masks)

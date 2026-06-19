@@ -45,11 +45,19 @@ def train(
     size: str = typer.Option("l", help="Model size: s | b | l."),
     imgsz: int = typer.Option(644, help="Square input size (divisible by 14)."),
     epochs: int = typer.Option(50),
-    batch: int = typer.Option(4),
+    batch: int = typer.Option(4, help="Micro-batch size (per optimizer micro-step)."),
+    nominal_batch: int = typer.Option(
+        16, help="Target effective batch via grad accumulation (0=off). EoMT recipe is 16."
+    ),
+    accum: int = typer.Option(0, help="Explicit grad-accum steps; overrides --nominal-batch when >0."),
     lr0: float = typer.Option(1e-4),
     weight_decay: float = typer.Option(0.05),
     backbone_lr_mult: float = typer.Option(0.1),
+    llrd: float = typer.Option(0.85, help="Layer-wise LR decay for the backbone (1.0=off)."),
     warmup_epochs: float = typer.Option(1.0),
+    ema: bool = typer.Option(True, help="Validate/export an EMA copy of the weights."),
+    ema_decay: float = typer.Option(0.9999, help="EMA decay (ramped via --ema-tau)."),
+    ema_tau: float = typer.Option(2000.0, help="EMA decay ramp time-constant (updates)."),
     mask_anneal: bool = typer.Option(True, help="Anneal masked attention off (EoMT recipe)."),
     mask_anneal_start: float = typer.Option(0.0, help="Anneal start, fraction of training."),
     mask_anneal_end: float = typer.Option(0.9, help="Anneal end (mask-free after), fraction."),
@@ -77,10 +85,18 @@ def train(
     ),
     aux_head_dropout: float = typer.Option(0.0, help="Aux MLP dropout."),
     clip_norm: float = typer.Option(0.01),
-    workers: int = typer.Option(4),
+    workers: int = typer.Option(8),
+    prefetch: int = typer.Option(4, help="DataLoader prefetch_factor per worker."),
     device: str = typer.Option("auto"),
     amp: bool = typer.Option(True),
+    tf32: bool = typer.Option(True, help="Enable TF32 matmul/conv on Ampere+ GPUs."),
+    compile: bool = typer.Option(False, help="torch.compile the model (experimental)."),
+    seed: Optional[int] = typer.Option(None, help="Seed RNGs for reproducibility."),
     pretrained: bool = typer.Option(True, help="Init encoder from DINOv2."),
+    flip_prob: float = typer.Option(0.5, help="Horizontal-flip probability (train aug)."),
+    min_scale: float = typer.Option(0.1, help="LSJ min scale (legacy stretch-style: 0.5)."),
+    max_scale: float = typer.Option(2.0, help="LSJ max scale (legacy stretch-style: 1.0)."),
+    letterbox: bool = typer.Option(True, help="Aspect-preserving letterbox eval (vs square stretch)."),
     project: str = typer.Option("runs/train"),
     name: Optional[str] = typer.Option(None, help="Run name (default: eomt-{size})."),
     val_interval: int = typer.Option(1),
@@ -134,10 +150,16 @@ def train(
         imgsz=imgsz,
         epochs=epochs,
         batch=batch,
+        nominal_batch=nominal_batch,
+        accum=accum,
         lr0=lr0,
         weight_decay=weight_decay,
         backbone_lr_mult=backbone_lr_mult,
+        llrd=llrd,
         warmup_epochs=warmup_epochs,
+        ema=ema,
+        ema_decay=ema_decay,
+        ema_tau=ema_tau,
         mask_anneal=mask_anneal,
         mask_anneal_start=mask_anneal_start,
         mask_anneal_end=mask_anneal_end,
@@ -152,9 +174,17 @@ def train(
         aux_head_dropout=aux_head_dropout,
         clip_norm=clip_norm,
         workers=workers,
+        prefetch=prefetch,
         device=device,
         amp=amp,
+        tf32=tf32,
+        compile=compile,
+        seed=seed,
         pretrained=pretrained,
+        flip_prob=flip_prob,
+        min_scale=min_scale,
+        max_scale=max_scale,
+        letterbox=letterbox,
         project=project,
         name=name,
         val_interval=val_interval,
@@ -180,6 +210,9 @@ def val(
     device: str = typer.Option("auto"),
     conf_thres: float = typer.Option(0.0),
     max_det: int = typer.Option(100),
+    letterbox: Optional[bool] = typer.Option(
+        None, help="Override eval preprocessing; default follows how the checkpoint was trained."
+    ),
 ):
     """Evaluate a checkpoint with COCO segm/bbox mAP."""
     from .data import CocoValImages, load_data_config
@@ -196,7 +229,8 @@ def val(
 
     model = load_model(weights, device=device)
     dev = next(model.parameters()).device
-    val_ds = CocoValImages(vi, vj, imgsz=int(model.image_size))
+    lb = letterbox if letterbox is not None else bool(getattr(model, "preprocess_letterbox", False))
+    val_ds = CocoValImages(vi, vj, imgsz=int(model.image_size), letterbox=lb)
     metrics = evaluate(
         model, val_ds, device=dev, batch_size=batch, num_workers=workers,
         conf_thres=conf_thres, max_det=max_det,

@@ -44,6 +44,7 @@ def _encode_mask(mask: np.ndarray):
     return rle
 
 
+
 def _cocoeval(coco_gt, results, img_ids, iou_type: str, verbose: bool) -> dict:
     from pycocotools.cocoeval import COCOeval
 
@@ -79,6 +80,9 @@ def evaluate(
     """Evaluate ``model`` on ``val_ds`` and return a COCO metrics dict."""
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
+    use_amp = amp and device.type == "cuda"
+    contig2cat = val_ds.contig2cat
+
     loader = DataLoader(
         val_ds,
         batch_size=batch_size,
@@ -87,13 +91,11 @@ def evaluate(
         collate_fn=collate_val,
         pin_memory=True,
     )
-    contig2cat = val_ds.contig2cat
 
     segm_results: list[dict] = []
     bbox_results: list[dict] = []
-    use_amp = amp and device.type == "cuda"
 
-    for pixel_values, image_ids, sizes in tqdm(
+    for pixel_values, image_ids, sizes, metas in tqdm(
         loader, desc="val", unit="batch", leave=False, disable=not verbose
     ):
         pixel_values = pixel_values.to(device)
@@ -102,7 +104,7 @@ def evaluate(
         mql = out["masks_queries_logits"]
         cql = out["class_queries_logits"]
 
-        for b, (img_id, (orig_w, orig_h)) in enumerate(zip(image_ids, sizes)):
+        for b, (img_id, (orig_w, orig_h), meta) in enumerate(zip(image_ids, sizes, metas)):
             res = postprocess_instance(
                 {
                     "masks_queries_logits": mql[b : b + 1],
@@ -111,6 +113,7 @@ def evaluate(
                 conf_thres,
                 (orig_w, orig_h),
                 max_det=max_det,
+                preprocess_meta=meta,
             )
             n = res["num_detections"]
             for i in range(n):

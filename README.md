@@ -49,6 +49,7 @@ seg = load_model("runs/train/eomt/weights/best.pt")   # reload a trained checkpo
 
 ```bash
 # Train (auto-downloads COCO 2017 if configs/coco.yaml points at a missing dir)
+# --batch 4 with the default --nominal-batch 16 accumulates to an effective batch of 16
 eomt train --data configs/coco.yaml --size s --epochs 50 --batch 4 --device cuda
 
 # Validate a checkpoint (COCO segm + bbox mAP)
@@ -69,6 +70,15 @@ Useful training knobs (full list via `eomt train --help`):
 
 | flag | default | effect |
 |------|---------|--------|
+| `--nominal-batch` / `--accum` | `16` / `0` | gradient accumulation to an **effective batch** of `--nominal-batch` (EoMT recipe is 16); `--accum N` sets the step count explicitly. See [Training recipe](#training-recipe) |
+| `--ema / --no-ema` | on | validate and export `best.pt` from an **EMA** (moving average) of the weights |
+| `--ema-decay` / `--ema-tau` | `0.9999` / `2000` | EMA decay and its warmup ramp time-constant (in optimizer steps) |
+| `--llrd` | `0.85` | **layer-wise LR decay** on the DINOv2 backbone (`1.0` = flat `--backbone-lr-mult`) |
+| `--min-scale` / `--max-scale` | `0.1` / `2.0` | **Large-Scale Jitter** range (legacy stretch-style crop: `0.5` / `1.0`) |
+| `--letterbox / --no-letterbox` | on | aspect-preserving **letterbox** eval (vs the legacy square stretch); recorded in the checkpoint |
+| `--tf32 / --no-tf32` | on | TF32 matmul/conv on Ampere+ GPUs (free speedup) |
+| `--compile` | off | `torch.compile` the model (experimental — the HF matcher/loss use dynamic shapes) |
+| `--seed` | none | seed Python/NumPy/Torch RNGs for reproducible runs |
 | `--mask-anneal / --no-mask-anneal` | on | anneal masked attention off over training (EoMT recipe, see below) |
 | `--mask-anneal-start` / `--mask-anneal-end` | `0.0` / `0.9` | fractions of training over which masked attention is linearly annealed `1 → 0` |
 | `--aux-w` | `1.0` | weight on the summed secondary-head loss (see below) |
@@ -153,6 +163,36 @@ lives in [data/sample_dataset/](data/sample_dataset/) — see its
 [data.yaml](data/sample_dataset/data.yaml) and annotation JSONs for the exact
 layout.
 
+## Training recipe
+
+Defaults follow the EoMT/Mask2Former fine-tuning recipe; each piece is a flag, so
+the legacy behaviour is one override away.
+
+- **Effective batch via gradient accumulation.** The LR / weight-decay / clip are
+  tuned for an effective batch of 16, so by default training accumulates
+  `round(--nominal-batch / --batch)` micro-batches per optimizer step (e.g.
+  `--batch 4` → 4 steps → effective 16). EoMT is a ViT (LayerNorm, no BatchNorm),
+  so this is ~equivalent to a true large batch at a fraction of the memory. Set
+  `--nominal-batch 0` (or `--accum 1`) for the old step-every-batch behaviour.
+- **EMA weights.** A moving average of the weights is kept during training and is
+  what gets validated and saved as `best.pt`; `last.pt` holds the live weights plus
+  the optimizer and EMA state for exact resume. Disable with `--no-ema`.
+- **Large-Scale Jitter (LSJ).** Training resizes aspect-preserving over
+  `[--min-scale, --max-scale]` (default `0.1–2.0`) then crops/pads to the square
+  input — a strong scale augmentation, especially for small objects.
+- **Letterbox eval.** Validation/inference resize the long side and pad to a square
+  (no aspect distortion); the padding is cropped back out in postprocessing. The
+  mode is stored per-checkpoint so `val`/`predict` match training automatically.
+- **Optimizer.** AdamW with no weight decay on norms/biases/embeddings and
+  layer-wise LR decay on the backbone (`--llrd`, deeper layers get a higher LR).
+  `--llrd 1.0` reproduces the legacy flat `--backbone-lr-mult`.
+- **Throughput.** TF32 + cudnn autotuner on by default; `--compile` and
+  `--seed` are available.
+
+Resuming a run (`--resume <run|ckpt>`) restores the epoch, optimizer, EMA, and
+`best_metric`, and recovers the dataset paths and architecture from the run's
+`args.yaml` / checkpoint metadata.
+
 ## Masked-attention annealing
 
 Training follows the EoMT recipe: the masked-attention probability is annealed
@@ -166,11 +206,12 @@ model is later run via `predict`/`val`. Disable with `--no-mask-anneal`.
 
 - Architecture (`s`/`b`/`l`) + DINOv2 init — `eomt.model`, `eomt.config`
 - Optional secondary per-instance attribute heads — `eomt.aux_cls`, `eomt.config.AuxHeadSpec`
-- COCO-format datasets (incl. per-instance attributes), augmentations
-  (torchvision v2), autodownload — `eomt.data`
-- Training loop (AdamW + backbone LR mult, cosine warmup, AMP, masked-attention
-  annealing, aux-head loss, ckpt, per-epoch `metrics.csv`) — `eomt.engine.train`
-- COCO-mAP validation (`pycocotools`) — `eomt.engine.validate`
+- COCO-format datasets (incl. per-instance attributes), Large-Scale Jitter +
+  letterbox augmentations (torchvision v2), autodownload — `eomt.data`
+- Training loop (AdamW + layer-wise LR decay + no-WD groups, cosine warmup,
+  gradient accumulation, AMP, EMA weights, masked-attention annealing, aux-head
+  loss, resume, per-epoch `metrics.csv`) — `eomt.engine.train`, `eomt.ema`
+- COCO-mAP validation (`pycocotools`) with letterbox-aware mask remapping — `eomt.engine.validate`
 - Mask2Former-style scoring (class confidence × mask objectness) — `eomt.postprocess`
 - Inference + rendering (with attribute labels) — `eomt.engine.predict`, `eomt.visualize`
 

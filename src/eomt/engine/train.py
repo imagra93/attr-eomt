@@ -28,12 +28,17 @@ from ..aux_cls import (
 )
 from ..data import CocoInstanceSeg, CocoValImages, collate_train
 from ..data.transforms import build_val_transform
+from ..ema import ModelEMA, _unwrap
 from ..model import build_model, load_dinov2_backbone
 from ..plotting import plot_aux_per_class, plot_metrics_csv
 from ..serialization import load_raw, resolve_checkpoint, save_checkpoint, wrap_checkpoint
 from .validate import _SEGM_KEYS, aux_evaluate, evaluate
 
 _ENCODER_PREFIXES = ("eomt.embeddings", "eomt.layers", "eomt.layernorm")
+# Parameters excluded from weight decay regardless of group: all 1-D tensors
+# (LayerNorm weights, every bias) plus token/positional embeddings — the standard
+# ViT fine-tuning policy (decaying these hurts).
+_NO_DECAY_TOKENS = ("position_embeddings", "cls_token", "register_tokens")
 
 
 def _resolve_device(device: str) -> torch.device:
@@ -42,19 +47,70 @@ def _resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
-def build_optimizer(model, lr: float, weight_decay: float, backbone_lr_mult: float):
-    """AdamW with a low LR multiplier on the pretrained DINOv2 encoder."""
-    backbone, head = [], []
+def _seed_everything(seed: int) -> None:
+    """Seed Python / NumPy / Torch RNGs for reproducible runs."""
+    import random
+
+    import numpy as np
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _count_encoder_layers(model) -> int:
+    """Number of transformer blocks in the encoder (max ``eomt.layers.<i>`` + 1)."""
+    ids = [
+        int(n.split("eomt.layers.")[1].split(".")[0])
+        for n, _ in model.named_parameters()
+        if n.startswith("eomt.layers.")
+    ]
+    return (max(ids) + 1) if ids else 0
+
+
+def _llrd_scale(name: str, num_layers: int, llrd: float) -> float:
+    """Layer-wise LR decay factor for a backbone param (1.0 at the top layer).
+
+    Maps embeddings→0, ``eomt.layers.i``→i+1, post-encoder norm→num_layers+1, then
+    scales by ``llrd ** (depth from the top)`` so deeper (later) layers — closer to
+    the task head — get a higher LR than the early, generic DINOv2 layers.
+    """
+    if llrd >= 1.0 or num_layers <= 0:
+        return 1.0
+    top = num_layers + 1
+    if name.startswith("eomt.embeddings"):
+        layer_id = 0
+    elif name.startswith("eomt.layers."):
+        layer_id = int(name.split("eomt.layers.")[1].split(".")[0]) + 1
+    else:  # post-encoder layernorm / anything else in the backbone
+        layer_id = top
+    return llrd ** (top - layer_id)
+
+
+def build_optimizer(
+    model, lr: float, weight_decay: float, backbone_lr_mult: float, llrd: float = 1.0
+):
+    """AdamW with backbone LR scaling, layer-wise LR decay, and no-WD on norms/biases.
+
+    Param groups are keyed by ``(lr, weight_decay)``: the DINOv2 encoder gets
+    ``lr * backbone_lr_mult`` further scaled per layer by ``llrd`` (``1.0`` = the
+    legacy flat multiplier); the task head gets full ``lr``. 1-D tensors and
+    positional/token embeddings are placed in weight-decay-free groups.
+    """
+    num_layers = _count_encoder_layers(model)
+    groups: dict[tuple, dict] = {}
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        (backbone if name.startswith(_ENCODER_PREFIXES) else head).append(p)
-    groups = [
-        {"params": backbone, "lr": lr * backbone_lr_mult},
-        {"params": head, "lr": lr},
-    ]
-    groups = [g for g in groups if g["params"]]
-    opt = torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
+        is_backbone = name.startswith(_ENCODER_PREFIXES)
+        base = lr * backbone_lr_mult if is_backbone else lr
+        lr_i = base * (_llrd_scale(name, num_layers, llrd) if is_backbone else 1.0)
+        no_decay = p.ndim <= 1 or any(tok in name for tok in _NO_DECAY_TOKENS)
+        wd_i = 0.0 if no_decay else weight_decay
+        key = (round(lr_i, 12), wd_i)
+        groups.setdefault(key, {"params": [], "lr": lr_i, "weight_decay": wd_i})["params"].append(p)
+    opt = torch.optim.AdamW(list(groups.values()), lr=lr, weight_decay=weight_decay)
     for g in opt.param_groups:
         g["initial_lr"] = g["lr"]
     return opt
@@ -196,23 +252,34 @@ def train(
     imgsz: int = 644,
     epochs: int = 50,
     batch: int = 4,
+    nominal_batch: int = 16,
+    accum: int = 0,
     lr0: float = 1e-4,
     weight_decay: float = 0.05,
     backbone_lr_mult: float = 0.1,
+    llrd: float = 0.85,
     warmup_epochs: float = 1.0,
     warmup_lr_start: float = 1e-6,
     min_lr_ratio: float = 0.01,
+    ema: bool = True,
+    ema_decay: float = 0.9999,
+    ema_tau: float = 2000.0,
     mask_anneal: bool = True,
     mask_anneal_start: float = 0.0,
     mask_anneal_end: float = 0.9,
     clip_norm: float = 0.01,
-    workers: int = 4,
+    workers: int = 8,
+    prefetch: int = 4,
     device: str = "auto",
     amp: bool = True,
+    tf32: bool = True,
+    compile: bool = False,
+    seed: int | None = None,
     pretrained: bool = True,
     flip_prob: float = 0.5,
-    min_scale: float = 0.5,
-    max_scale: float = 1.0,
+    min_scale: float = 0.1,
+    max_scale: float = 2.0,
+    letterbox: bool = True,
     project: str = "runs/train",
     name: str | None = None,
     val_interval: int = 1,
@@ -234,7 +301,31 @@ def train(
     if imgsz % 14:
         raise ValueError(f"imgsz={imgsz} must be divisible by 14 (DINOv2 grid).")
 
+    if seed is not None:
+        _seed_everything(seed)
+
     dev = _resolve_device(device)
+
+    # Speed knobs (no accuracy cost): TF32 matmul/conv on Ampere+, and cudnn
+    # autotuner — safe because the input is a fixed-size square every step.
+    if dev.type == "cuda":
+        if tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+
+    # Gradient accumulation: reach an effective (nominal) batch of ``nominal_batch``
+    # without the memory of a true large batch. EoMT is a ViT (LayerNorm, no
+    # BatchNorm) so accumulating ``accum`` micro-batches is ~equivalent to one large
+    # batch. ``accum`` overrides ``nominal_batch`` when > 0.
+    if accum > 0:
+        accum_steps = accum
+    elif nominal_batch > 0:
+        accum_steps = max(1, round(nominal_batch / batch))
+    else:
+        accum_steps = 1
+    eff_batch = batch * accum_steps
+    print(f"[batch] micro={batch} x accum={accum_steps} -> effective {eff_batch}")
 
     # Resume may point at a checkpoint file OR a run/weights folder. Resolve it
     # and recover the model size/imgsz from its metadata BEFORE building the model
@@ -293,12 +384,14 @@ def train(
         collate_fn=collate_train,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=workers > 0,
+        prefetch_factor=prefetch if workers > 0 else None,
     )
 
     val_ds = None
     val_seg_ds = None
     if val_images and val_json:
-        val_ds = CocoValImages(val_images, val_json, imgsz=imgsz)
+        val_ds = CocoValImages(val_images, val_json, imgsz=imgsz, letterbox=letterbox)
         print(f"[data] val:   {len(val_ds)} images")
         # Held-out aux accuracy needs GT masks/attrs in the train id space: a
         # deterministic (no-crop) seg view of the val split, sharing train's maps.
@@ -307,7 +400,7 @@ def train(
                 val_images,
                 val_json,
                 imgsz=imgsz,
-                transform=build_val_transform(imgsz),
+                transform=build_val_transform(imgsz, letterbox=letterbox),
                 shared_aux=(aux_specs, train_ds._attr_id_maps),
             )
 
@@ -327,13 +420,22 @@ def train(
             "val_json": val_json,
             "epochs": epochs,
             "batch": batch,
+            "accum": accum_steps,
+            "effective_batch": eff_batch,
             "lr0": lr0,
             "weight_decay": weight_decay,
             "backbone_lr_mult": backbone_lr_mult,
+            "llrd": llrd,
             "warmup_epochs": warmup_epochs,
             "min_lr_ratio": min_lr_ratio,
             "clip_norm": clip_norm,
+            "ema": ema,
+            "ema_decay": ema_decay,
+            "ema_tau": ema_tau,
             "amp": amp,
+            "tf32": tf32,
+            "compile": compile,
+            "seed": seed,
             "pretrained": pretrained,
             "mask_anneal": mask_anneal,
             "mask_anneal_start": mask_anneal_start,
@@ -341,6 +443,7 @@ def train(
             "flip_prob": flip_prob,
             "min_scale": min_scale,
             "max_scale": max_scale,
+            "letterbox": letterbox,
             "val_interval": val_interval,
             "conf_thres": conf_thres,
             "max_det": max_det,
@@ -362,7 +465,7 @@ def train(
     if aux_specs:
         print(f"[model] aux head arch: {model.aux_head_arch}")
     start_epoch, best_metric = 0, -1.0
-    optimizer = build_optimizer(model, lr0, weight_decay, backbone_lr_mult)
+    optimizer = build_optimizer(model, lr0, weight_decay, backbone_lr_mult, llrd)
 
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model"], strict=False)
@@ -375,6 +478,21 @@ def train(
         load_dinov2_backbone(model)
         model.to(dev)
 
+    # EMA of the weights, built after init/resume so it starts from real weights.
+    # Restored from the checkpoint when resuming so the average isn't lost.
+    ema_model = ModelEMA(model, decay=ema_decay, tau=ema_tau, device=dev) if ema else None
+    if ema_model is not None and resume_ckpt is not None and resume_ckpt.get("ema"):
+        ema_model.load_state_dict(resume_ckpt["ema"])
+        print(f"[resume] restored EMA ({ema_model.updates} updates)")
+
+    # ``torch.compile`` wraps the module; ``core`` is the un-wrapped model used for
+    # buffer access (``attn_mask_probs``) and state-dict export so checkpoints keep
+    # clean (un-prefixed) keys. Compile is experimental here — the HF matcher/loss
+    # use dynamic shapes that can trigger graph breaks/recompiles.
+    if compile:
+        model = torch.compile(model)
+    core = _unwrap(model)
+
     scaler = torch.amp.GradScaler("cuda", enabled=amp and dev.type == "cuda")
     iters_per_epoch = max(1, len(train_loader))
     total_iters = epochs * iters_per_epoch
@@ -383,7 +501,7 @@ def train(
 
     tb = _Logger(logger, run_dir, name) if logger != "none" else None
 
-    def _save(path: Path, *, with_trainer_state: bool):
+    def _save(path: Path, *, state_dict, with_trainer_state: bool):
         extra = {}
         if with_trainer_state:
             extra = {
@@ -391,8 +509,10 @@ def train(
                 "best_metric": best_metric,
                 "optimizer": optimizer.state_dict(),
             }
+            if ema_model is not None:
+                extra["ema"] = ema_model.state_dict()
         ckpt = wrap_checkpoint(
-            model.state_dict(),
+            state_dict,
             size=size,
             nc=nc,
             imgsz=imgsz,
@@ -400,6 +520,7 @@ def train(
             task="instance",
             aux_heads=aux_specs,
             aux_head_arch=aux_head_arch,
+            letterbox=letterbox,
             **extra,
         )
         save_checkpoint(ckpt, path)
@@ -435,14 +556,18 @@ def train(
 
             if mask_anneal:
                 p = _attn_mask_prob(it, total_iters, mask_anneal_start, mask_anneal_end)
-                model.eomt.attn_mask_probs.fill_(p)
+                core.eomt.attn_mask_probs.fill_(p)
 
             pixel_values = pixel_values.to(dev)
             mask_labels = [m.to(dev) for m in mask_labels]
             class_labels = [c.to(dev) for c in class_labels]
             aux_labels = {k: [t.to(dev) for t in v] for k, v in aux_labels.items()}
 
-            optimizer.zero_grad(set_to_none=True)
+            # Gradient accumulation: zero grads at the start of each window, divide
+            # the loss by ``accum_steps`` (so summed micro-batch grads average), and
+            # only step/clip/update on the window boundary (or the epoch's last batch).
+            if step % accum_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
             aux_gated = None
             with torch.amp.autocast("cuda", enabled=amp and dev.type == "cuda"):
                 out = model(pixel_values, mask_labels=mask_labels, class_labels=class_labels)
@@ -463,11 +588,15 @@ def train(
                     )
                     aux_w_eff = aux_w * _aux_w_factor(it, total_iters, aux_w_warmup)
                     loss = loss + aux_w_eff * a_loss
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
+            loss_item = float(loss.detach())  # unscaled, for logging
+            scaler.scale(loss / accum_steps).backward()
+            if (step + 1) % accum_steps == 0 or (step + 1) == iters_per_epoch:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(core.parameters(), clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                if ema_model is not None:
+                    ema_model.update(model)
 
             if aux_specs:
                 for name, (hit, tot) in aux_accuracy(
@@ -488,10 +617,10 @@ def train(
                             acc[0] += c
                             acc[1] += t
 
-            running += float(loss.detach())
+            running += loss_item
             avg = running / (step + 1)
             postfix = {
-                "loss": f"{float(loss):.3f}",
+                "loss": f"{loss_item:.3f}",
                 "avg": f"{avg:.3f}",
                 "lr": f"{optimizer.param_groups[-1]['lr']:.2e}",
             }
@@ -501,9 +630,9 @@ def train(
                 )
             pbar.set_postfix(postfix)
             if tb is not None and step % 20 == 0:
-                scalars = {"train/loss": float(loss), "lr/head": optimizer.param_groups[-1]["lr"]}
+                scalars = {"train/loss": loss_item, "lr/head": optimizer.param_groups[-1]["lr"]}
                 if mask_anneal:
-                    scalars["train/attn_mask_prob"] = float(model.eomt.attn_mask_probs[0])
+                    scalars["train/attn_mask_prob"] = float(core.eomt.attn_mask_probs[0])
                 tb.log(scalars, it)
 
         epoch_loss = running / iters_per_epoch
@@ -519,15 +648,20 @@ def train(
         # (deterministic, mask-free) so val mAP and the saved buffer match how the
         # model is later run via predict/val. Training stochasticity resumes on the
         # next epoch's first step. When annealing is disabled, leave the buffer as is.
+        # The EMA copy is what gets validated and exported as best.pt, so zero its
+        # buffer too (its buffers track the live model, which was just annealing).
+        eval_model = ema_model.module if ema_model is not None else core
         if mask_anneal:
-            model.eomt.attn_mask_probs.zero_()
+            core.eomt.attn_mask_probs.zero_()
+            if ema_model is not None:
+                eval_model.eomt.attn_mask_probs.zero_()
 
         # --- validation ---
         metrics = {}
         epoch_aux_pc: dict[str, dict[int, tuple[int, int]]] | None = None
         if val_ds is not None and (epoch + 1) % val_interval == 0:
             metrics = evaluate(
-                model,
+                eval_model,
                 val_ds,
                 device=dev,
                 batch_size=batch,
@@ -544,7 +678,7 @@ def train(
             )
             if val_seg_ds is not None:  # held-out matched-query accuracy per head
                 val_aux, epoch_aux_pc = aux_evaluate(
-                    model, val_seg_ds, device=dev, batch_size=batch,
+                    eval_model, val_seg_ds, device=dev, batch_size=batch,
                     num_workers=workers, amp=amp,
                     iou_gate=aux_iou_gate, class_gate=aux_class_gate,
                 )
@@ -557,11 +691,13 @@ def train(
                 tb.log({f"val/{k}": v for k, v in metrics.items()}, epoch)
 
         # --- checkpoints ---
-        _save(weights_dir / "last.pt", with_trainer_state=True)
+        # last.pt holds the live weights + trainer state (optimizer/EMA) for resume;
+        # best.pt holds the eval weights (EMA when enabled) for inference.
+        _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True)
         cur = metrics.get("segm/mAP", None)
         if cur is not None and cur > best_metric:
             best_metric = cur
-            _save(weights_dir / "best.pt", with_trainer_state=False)
+            _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False)
             print(f"[epoch {epoch}] new best segm mAP {best_metric:.4f} -> best.pt")
 
         # --- per-epoch metrics row (missing values -> nan) ---

@@ -212,6 +212,7 @@ class CocoValImages(Dataset):
         json_file: str | Path,
         imgsz: int = 644,
         *,
+        letterbox: bool = True,
         attributes: list[str] | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
     ):
@@ -219,6 +220,7 @@ class CocoValImages(Dataset):
 
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
+        self.letterbox = letterbox
         self.coco = COCO(str(json_file))
         self.cat2contig, self.contig2cat, self.names, self.num_classes = (
             _build_category_maps(self.coco)
@@ -240,8 +242,8 @@ class CocoValImages(Dataset):
         info = self.coco.loadImgs(img_id)[0]
         img = Image.open(self.img_dir / info["file_name"]).convert("RGB")
         orig_w, orig_h = img.size
-        chw, _ = preprocess_numpy(np.array(img), self.imgsz)
-        return torch.from_numpy(chw), int(img_id), orig_w, orig_h
+        chw, meta = preprocess_numpy(np.array(img), self.imgsz, letterbox=self.letterbox)
+        return torch.from_numpy(chw), int(img_id), orig_w, orig_h, meta
 
 
 def collate_train(batch):
@@ -263,4 +265,5 @@ def collate_val(batch):
     pixel_values = torch.stack([b[0] for b in batch])
     image_ids = [b[1] for b in batch]
     sizes = [(b[2], b[3]) for b in batch]
-    return pixel_values, image_ids, sizes
+    metas = [b[4] for b in batch]
+    return pixel_values, image_ids, sizes, metas

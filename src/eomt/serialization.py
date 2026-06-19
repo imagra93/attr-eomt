@@ -58,6 +58,7 @@ def wrap_checkpoint(
     family: str = "eomt",
     aux_heads: list | None = None,
     aux_head_arch: dict | None = None,
+    letterbox: bool = False,
     **extra: Any,
 ) -> dict[str, Any]:
     """Build a metadata-wrapped checkpoint that :func:`load_model` can restore.
@@ -76,6 +77,7 @@ def wrap_checkpoint(
         "nc": int(nc),
         "names": normalize_names(names, nc),
         "imgsz": int(imgsz),
+        "letterbox": bool(letterbox),
         "aux_heads": aux_specs_to_meta(aux_heads),
     }
     if aux_heads and aux_head_arch is not None:
@@ -160,6 +162,9 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
             RuntimeWarning,
             stacklevel=2,
         )
+    # Record the preprocessing mode the model was trained with so val/predict
+    # match it (older checkpoints predate this flag → legacy stretch resize).
+    model.preprocess_letterbox = bool(ckpt.get("letterbox", False))
     return model.to(_resolve_device(device)).eval()
 
 

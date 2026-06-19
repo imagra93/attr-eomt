@@ -34,14 +34,16 @@ def predict_image(
     conf_thres: float = 0.3,
     max_det: int = 100,
     mask_thresh: float = 0.5,
+    letterbox: bool = True,
 ) -> dict:
     """Run the model on one PIL image and return a ``postprocess_instance`` dict."""
     orig_w, orig_h = image.size
-    chw, _ = preprocess_numpy(np.array(image.convert("RGB")), imgsz)
+    chw, meta = preprocess_numpy(np.array(image.convert("RGB")), imgsz, letterbox=letterbox)
     tensor = torch.from_numpy(chw).unsqueeze(0).to(device)
     out = model(tensor)
     return postprocess_instance(
-        out, conf_thres, (orig_w, orig_h), max_det=max_det, mask_thresh=mask_thresh
+        out, conf_thres, (orig_w, orig_h), max_det=max_det,
+        mask_thresh=mask_thresh, preprocess_meta=meta,
     )
 
 
@@ -64,6 +66,7 @@ def predict(
     model = load_model(weights, device=device)
     dev = next(model.parameters()).device
     imgsz = int(model.image_size)
+    letterbox = bool(getattr(model, "preprocess_letterbox", False))
     names = getattr(model, "names", None)
     aux_names = {s.name: s.names for s in getattr(model, "aux_specs", [])}
 
@@ -81,6 +84,7 @@ def predict(
             conf_thres=conf_thres,
             max_det=max_det,
             mask_thresh=mask_thresh,
+            letterbox=letterbox,
         )
         rendered = draw_instances(
             image, result, names=names, aux_names=aux_names or None,
