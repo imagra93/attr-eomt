@@ -10,6 +10,11 @@ learnable queries producing mask-classification output (Mask2Former-style).
 This package wraps the Apache-2.0 HuggingFace `EomtForUniversalSegmentation`;
 weights trained from a DINOv2 initialization are yours to release.
 
+On top of the base model it adds **optional secondary per-instance
+classification heads** ("attributes"): extra per-detection labels that train and
+infer alongside segmentation without touching the primary class space — see
+[Secondary per-instance classification](#secondary-per-instance-classification).
+
 ## Sizes
 
 | size | backbone        | hidden | layers | heads | queries |
@@ -60,13 +65,114 @@ You can point training/validation at **any COCO-format dataset** by passing
 `--train-images/--train-json/--val-images/--val-json` directly, or by editing
 `configs/coco.yaml`.
 
+Useful training knobs (full list via `eomt train --help`):
+
+| flag | default | effect |
+|------|---------|--------|
+| `--mask-anneal / --no-mask-anneal` | on | anneal masked attention off over training (EoMT recipe, see below) |
+| `--mask-anneal-start` / `--mask-anneal-end` | `0.0` / `0.9` | fractions of training over which masked attention is linearly annealed `1 → 0` |
+| `--aux-w` | `1.0` | weight on the summed secondary-head loss (see below) |
+
+## Secondary per-instance classification
+
+The primary task (instance segmentation over `nc` classes) is **unchanged**.
+On top of it you can attach **one or several independent secondary classifiers**
+— a per-instance *attribute* predicted for each detected mask, read from that
+query's embedding. Each head is a single `Linear(hidden_size, num_classes)`; you
+can have as many as your data defines (they live in an `nn.ModuleDict`).
+
+This answers the "classes **and** subclasses per instance" need by encoding a
+*subclass per instance* rather than flattening to a `class × subclass` product
+space (which would wreck Hungarian matching and thin out per-class statistics).
+Because EoMT is NMS-free, two overlapping same-class instances stay two distinct
+queries; the attribute head separates them from their embeddings.
+
+> The examples below (`typology`, `severity`, …) are **illustrative only** — a
+> head is just a named set of mutually exclusive labels. Define whatever
+> attributes your dataset needs.
+
+### How it works
+
+- **Embedding source.** Each head reads the per-query embedding — the input to
+  EoMT's `class_predictor`, captured with a forward hook (`[B, Q, hidden]`).
+- **Matching.** Supervision reuses EoMT's *own* Hungarian matcher
+  (`model.eomt.criterion.matcher`), so every attribute is trained on the **same**
+  query→GT assignment the detection loss used. The attribute is read *after*
+  matching.
+- **Loss.** Cross-entropy per head over matched queries, summed across heads and
+  scaled by `--aux-w` (default `1.0`), added to the segmentation loss. Empty-match
+  batches contribute a graph-preserving zero.
+- **Checkpoint selection stays `segm/mAP`.** The attribute "rides along": its
+  per-head matched-query train accuracy is shown live in the progress bar, printed
+  each epoch (`[epoch N] aux train acc: …`) and written to `metrics.csv`, but never
+  drives `best.pt`. An epoch (or head) with no matched queries logs `nan`.
+- **Inference.** Postprocessing attaches `aux = {head: {"ids", "probs"}}` for the
+  same kept detections, and `predict` renders each attribute next to the class
+  label (`name 0.87 · value 0.93`) using names stored in the checkpoint.
+
+### Data format (auto-discovered from the COCO JSON)
+
+Attributes live **inside the COCO annotations** — each annotation is already a
+per-instance object, so alignment is automatic and `pycocotools` still parses it.
+Two additions to a standard COCO file:
+
+```jsonc
+{
+  "categories": [ {"id": 3, "name": "..."}, {"id": 7, "name": "..."} ],
+
+  "attributes": [                                       // NEW, top-level: per-head vocab(s)
+    {"name": "typology", "categories": [{"id": 0, "name": "scratch"},
+                                        {"id": 1, "name": "dent"}]},
+    {"name": "severity", "categories": [{"id": 10, "name": "low"},
+                                        {"id": 20, "name": "high"}]}
+  ],
+
+  "annotations": [
+    { "id": 1, "image_id": 42, "category_id": 3,
+      "segmentation": [...], "bbox": [...], "area": 1234, "iscrowd": 0,
+      "attributes": {"typology": 1, "severity": 20} }    // NEW, per instance: {head: raw_id}
+  ]
+}
+```
+
+- The top-level `attributes` list defines each head's vocabulary; raw ids are
+  remapped to a contiguous `0..n-1` per head. `categories` may be **omitted**, in
+  which case the id set is inferred from the annotations.
+- Per-annotation `attributes` is a `{head: raw_id}` map; a missing value defaults
+  to contiguous `0`.
+- Extra keys are valid COCO and ignored by existing tooling. A JSON with **no**
+  `attributes` ⇒ detection-only, behaving exactly as before.
+
+No YAML changes are needed — heads (count, classes, names) are discovered
+straight from the JSON, the same as `nc`. The dataset YAML stays as in
+[configs/coco.yaml](configs/coco.yaml). Programmatically,
+`CocoInstanceSeg(..., attributes=[...] | False)` restricts or disables heads.
+
+A tiny, self-contained example (two heads, including a non-contiguous id set)
+lives in [data/sample_dataset/](data/sample_dataset/) — see its
+[data.yaml](data/sample_dataset/data.yaml) and annotation JSONs for the exact
+layout.
+
+## Masked-attention annealing
+
+Training follows the EoMT recipe: the masked-attention probability is annealed
+`1 → 0` linearly over the `[--mask-anneal-start, --mask-anneal-end]` fraction of
+training, so the final stretch trains **mask-free** and matches efficient
+(mask-less) inference. Validation and checkpointing run with masked attention
+**off** (deterministic), so reported mAP and the saved buffer reflect how the
+model is later run via `predict`/`val`. Disable with `--no-mask-anneal`.
+
 ## What's included
 
 - Architecture (`s`/`b`/`l`) + DINOv2 init — `eomt.model`, `eomt.config`
-- COCO-format datasets, augmentations (torchvision v2), autodownload — `eomt.data`
-- Training loop (AdamW + backbone LR mult, cosine warmup, AMP, ckpt) — `eomt.engine.train`
+- Optional secondary per-instance attribute heads — `eomt.aux_cls`, `eomt.config.AuxHeadSpec`
+- COCO-format datasets (incl. per-instance attributes), augmentations
+  (torchvision v2), autodownload — `eomt.data`
+- Training loop (AdamW + backbone LR mult, cosine warmup, AMP, masked-attention
+  annealing, aux-head loss, ckpt, per-epoch `metrics.csv`) — `eomt.engine.train`
 - COCO-mAP validation (`pycocotools`) — `eomt.engine.validate`
-- Inference + rendering — `eomt.engine.predict`, `eomt.visualize`
+- Mask2Former-style scoring (class confidence × mask objectness) — `eomt.postprocess`
+- Inference + rendering (with attribute labels) — `eomt.engine.predict`, `eomt.visualize`
 
 ## Not included
 

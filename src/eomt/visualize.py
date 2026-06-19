@@ -23,11 +23,28 @@ def _font(size: int):
         return ImageFont.load_default()
 
 
+def _aux_label(result: dict, aux_names: dict[str, dict[int, str]] | None, i: int) -> str:
+    """Build the trailing ``· attr value pct`` text for instance ``i`` (if any)."""
+    aux = result.get("aux")
+    if not aux:
+        return ""
+    parts = []
+    for head, pred in aux.items():
+        idx = int(pred["ids"][i])
+        prob = float(pred["probs"][i][idx])
+        label = str(idx)
+        if aux_names and head in aux_names:
+            label = aux_names[head].get(idx, label)
+        parts.append(f"{label} {prob:.2f}")
+    return "  ·  " + "  ".join(parts)
+
+
 def draw_instances(
     image: Image.Image,
     result: dict,
     names: dict[int, str] | None = None,
     *,
+    aux_names: dict[str, dict[int, str]] | None = None,
     alpha: float = 0.5,
     draw_boxes: bool = True,
 ) -> Image.Image:
@@ -36,8 +53,10 @@ def draw_instances(
     Args:
         image: source PIL image (RGB).
         result: dict with ``masks`` ``(N,H,W)``, ``boxes`` ``(N,4)``, ``scores``,
-            ``classes`` (cpu tensors), at the image's original resolution.
+            ``classes`` (cpu tensors), at the image's original resolution. May
+            carry ``aux`` ``{head: {"ids", "probs"}}`` from secondary heads.
         names: optional ``{class_index: name}`` mapping for labels.
+        aux_names: optional ``{head: {id: name}}`` mapping for attribute labels.
     """
     img = np.array(image.convert("RGB")).astype(np.float32)
     masks = result["masks"]
@@ -63,7 +82,7 @@ def draw_instances(
         cls = int(classes[i])
         color = class_color(cls)
         label = names.get(cls, str(cls)) if names else str(cls)
-        text = f"{label} {float(scores[i]):.2f}"
+        text = f"{label} {float(scores[i]):.2f}{_aux_label(result, aux_names, i)}"
         if draw_boxes:
             x1, y1, x2, y2 = [float(v) for v in boxes[i].tolist()]
             draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)

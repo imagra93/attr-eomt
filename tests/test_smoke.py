@@ -49,11 +49,102 @@ def test_train_step_backward():
         (torch.rand(1, IMGSZ, IMGSZ) > 0.5).float(),
     ]
     class_labels = [torch.tensor([0, 1]), torch.tensor([2])]
-    loss = model(x, mask_labels=mask_labels, class_labels=class_labels)
+    out = model(x, mask_labels=mask_labels, class_labels=class_labels)
+    loss = out["loss"]
     assert loss.ndim == 0 and torch.isfinite(loss)
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert grads, "no gradients flowed"
+
+
+def test_aux_heads_train_and_infer():
+    from eomt.aux_cls import aux_accuracy, aux_loss
+    from eomt.config import AuxHeadSpec
+
+    torch.manual_seed(0)
+    specs = [AuxHeadSpec("typology", 4, {0: "a", 1: "b", 2: "c", 3: "d"}),
+             AuxHeadSpec("severity", 3, {0: "lo", 1: "mid", 2: "hi"})]
+    model = build_model("s", nc=NC, imgsz=IMGSZ, aux_heads=specs).train()
+    x = torch.randn(2, 3, IMGSZ, IMGSZ)
+    mask_labels = [
+        (torch.rand(2, IMGSZ, IMGSZ) > 0.5).float(),
+        (torch.rand(1, IMGSZ, IMGSZ) > 0.5).float(),
+    ]
+    class_labels = [torch.tensor([0, 1]), torch.tensor([2])]
+    aux_labels = {
+        "typology": [torch.tensor([1, 3]), torch.tensor([0])],
+        "severity": [torch.tensor([2, 0]), torch.tensor([1])],
+    }
+    out = model(x, mask_labels=mask_labels, class_labels=class_labels)
+    total = out["loss"]
+    a_loss, per_head = aux_loss(model, out, mask_labels, class_labels, aux_labels)
+    assert set(per_head) == {"typology", "severity"}
+    (total + a_loss).backward()
+    assert model.aux_heads["typology"].weight.grad is not None
+
+    acc = aux_accuracy(model, out, mask_labels, class_labels, aux_labels)
+    assert set(acc) == {"typology", "severity"}
+
+    # inference forward exposes per-head logits; postprocess attaches them
+    model.eval()
+    with torch.no_grad():
+        out = model(x)
+    assert out["aux_queries_logits"]["typology"].shape == (2, EOMT_CONFIGS["s"].num_queries, 4)
+    res = postprocess_instance(
+        {k: v[:1] if torch.is_tensor(v) else {n: t[:1] for n, t in v.items()}
+         for k, v in out.items() if k != "query_embed"},
+        conf_thres=0.0, original_size=(20, 15), max_det=5,
+    )
+    assert set(res["aux"]) == {"typology", "severity"}
+    assert res["aux"]["typology"]["probs"].shape[1] == 4
+
+
+def test_aux_ignore_index():
+    """Missing/OOV attributes (label -100) contribute no loss and are not counted."""
+    from eomt.aux_cls import aux_accuracy, aux_loss
+    from eomt.config import AuxHeadSpec
+
+    torch.manual_seed(0)
+    model = build_model("s", nc=NC, imgsz=IMGSZ, aux_heads=[AuxHeadSpec("typ", 4)]).train()
+    hidden = model.aux_heads["typ"].in_features
+    out = {"query_embed": torch.randn(1, 5, hidden, requires_grad=True)}
+    indices = [(torch.tensor([0, 1]), torch.tensor([0, 1]))]  # 2 matched queries
+
+    # One valid label, one ignored -> finite loss, accuracy denominator counts only 1.
+    aux_labels = {"typ": [torch.tensor([2, -100])]}
+    a_loss, per_head = aux_loss(model, out, None, None, aux_labels, indices=indices)
+    assert torch.isfinite(per_head["typ"])
+    a_loss.backward()
+    assert aux_accuracy(model, out, None, None, aux_labels, indices=indices)["typ"][1] == 1
+
+    # All ignored -> exactly-zero, finite, graph-preserving loss; no counted samples.
+    out2 = {"query_embed": torch.randn(1, 5, hidden, requires_grad=True)}
+    all_ignored = {"typ": [torch.tensor([-100, -100])]}
+    loss2, _ = aux_loss(model, out2, None, None, all_ignored, indices=indices)
+    assert torch.isfinite(loss2) and float(loss2.detach()) == 0.0
+    loss2.backward()  # must not raise (graph kept alive)
+    assert aux_accuracy(model, out2, None, None, all_ignored, indices=indices)["typ"] == (0, 0)
+
+
+def test_resolve_checkpoint_folder(tmp_path):
+    """A run/weights folder resolves to best.pt (infer) or last.pt (resume)."""
+    from eomt.serialization import resolve_checkpoint
+
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    (weights / "best.pt").write_bytes(b"x")
+    (weights / "last.pt").write_bytes(b"x")
+
+    # run folder -> weights/{best,last}.pt by preference
+    assert resolve_checkpoint(tmp_path, prefer="best").name == "best.pt"
+    assert resolve_checkpoint(tmp_path, prefer="last").name == "last.pt"
+    # weights folder directly
+    assert resolve_checkpoint(weights, prefer="best").name == "best.pt"
+    # an explicit file passes through unchanged
+    assert resolve_checkpoint(weights / "last.pt", prefer="best").name == "last.pt"
+
+    with pytest.raises(FileNotFoundError):
+        resolve_checkpoint(tmp_path / "nope")
 
 
 def test_postprocess_instance_contract():

@@ -65,6 +65,7 @@ def predict(
     dev = next(model.parameters()).device
     imgsz = int(model.image_size)
     names = getattr(model, "names", None)
+    aux_names = {s.name: s.names for s in getattr(model, "aux_specs", [])}
 
     out_root = Path(out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -82,7 +83,8 @@ def predict(
             mask_thresh=mask_thresh,
         )
         rendered = draw_instances(
-            image, result, names=names, alpha=alpha, draw_boxes=draw_boxes
+            image, result, names=names, aux_names=aux_names or None,
+            alpha=alpha, draw_boxes=draw_boxes,
         )
         dst = out_root / path.name
         rendered.save(dst)

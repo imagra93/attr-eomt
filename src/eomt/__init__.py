@@ -5,7 +5,7 @@ Public API:
     >>> from eomt import build_model, load_model, load_dinov2_backbone
     >>> model = build_model("s", nc=80)        # build architecture
     >>> load_dinov2_backbone(model)            # init encoder from DINOv2
-    >>> seg = load_model("best.pt")            # reload a trained checkpoint
+    >>> seg = load_model("runs/train/eomt")    # reload from a run folder (size auto-detected)
 """
 
 from __future__ import annotations
@@ -13,7 +13,13 @@ from __future__ import annotations
 from .config import EOMT_CONFIGS, SIZES, build_eomt_config
 from .model import EoMTModel, build_model, load_dinov2_backbone
 from .postprocess import postprocess_instance
-from .serialization import load_model, load_raw, save_checkpoint, wrap_checkpoint
+from .serialization import (
+    load_model,
+    load_raw,
+    resolve_checkpoint,
+    save_checkpoint,
+    wrap_checkpoint,
+)
 
 __all__ = [
     "EOMT_CONFIGS",
@@ -25,6 +31,7 @@ __all__ = [
     "postprocess_instance",
     "load_model",
     "load_raw",
+    "resolve_checkpoint",
     "save_checkpoint",
     "wrap_checkpoint",
 ]

@@ -3,7 +3,8 @@
 EoMT emits mask-classification output (Mask2Former-style): per-query class logits
 ``(Q, C+1)`` and per-query mask logits ``(Q, h, w)``. We convert that to the
 instance contract — ``boxes`` / ``scores`` / ``classes`` / ``masks`` — by taking
-the best non-background class per query, thresholding, upsampling the masks to the
+the best non-background class per query, weighting its confidence by the mask's
+"objectness" (Mask2Former-style), thresholding, upsampling the masks to the
 original image, and deriving each box from its mask's extent (EoMT has no
 box-regression head).
 """
@@ -50,33 +51,51 @@ def postprocess_instance(
 
     Returns:
         ``{"num_detections", "boxes": (N,4), "scores": (N,), "classes": (N,),
-        "masks": (N,H,W)}``.
+        "masks": (N,H,W)}``. If the model has secondary heads, ``output`` also
+        carries ``"aux_queries_logits": {name: (1, Q, ns)}`` and the result gains
+        ``"aux": {name: {"ids": (N,), "probs": (N, ns)}}`` for the same kept queries.
     """
     mask_logits = output["masks_queries_logits"][0].float()  # (Q, h, w)
     class_logits = output["class_queries_logits"][0].float()  # (Q, C+1)
+    aux_logits = output.get("aux_queries_logits")  # {name: (1, Q, ns)} or None
 
     # Last column is the "no-object" class — drop it.
     scores_all = class_logits.softmax(dim=-1)[:, :-1]  # (Q, C)
-    scores, classes = scores_all.max(dim=-1)  # (Q,)
+    cls_scores, classes = scores_all.max(dim=-1)  # (Q,)
 
-    keep = scores >= conf_thres
+    # Mask2Former-style score: weight the class confidence by mask "objectness"
+    # (mean sigmoid over the binarized region), computed on the low-res logits.
+    # This ranks crisp, confident masks above diffuse ones and lifts mAP.
+    mask_prob = mask_logits.sigmoid()  # (Q, h, w)
+    binar = mask_prob > mask_thresh
+    mask_scores = (mask_prob * binar).flatten(1).sum(1) / (binar.flatten(1).sum(1) + 1e-6)
+    scores = cls_scores * mask_scores  # (Q,)
+
     orig_w, orig_h = original_size
-    if keep.sum() == 0:
-        return {
+    sel = (scores >= conf_thres).nonzero(as_tuple=True)[0]  # indices into Q
+    if sel.numel() == 0:
+        empty = {
             "num_detections": 0,
             "boxes": torch.zeros((0, 4)),
             "scores": torch.zeros((0,)),
             "classes": torch.zeros((0,), dtype=torch.long),
             "masks": torch.zeros((0, orig_h, orig_w), dtype=torch.bool),
         }
+        if aux_logits is not None:
+            empty["aux"] = {
+                name: {
+                    "ids": torch.zeros((0,), dtype=torch.long),
+                    "probs": torch.zeros((0, lg.shape[-1])),
+                }
+                for name, lg in aux_logits.items()
+            }
+        return empty
 
-    scores, classes = scores[keep], classes[keep]
-    mask_logits = mask_logits[keep]
+    if sel.numel() > max_det:
+        sel = sel[scores[sel].topk(max_det).indices]
 
-    if scores.numel() > max_det:
-        topk = scores.topk(max_det)
-        scores, classes = topk.values, classes[topk.indices]
-        mask_logits = mask_logits[topk.indices]
+    scores, classes = scores[sel], classes[sel]
+    mask_logits = mask_logits[sel]
 
     masks = F.interpolate(
         mask_logits.unsqueeze(0),
@@ -87,10 +106,16 @@ def postprocess_instance(
     masks = masks.sigmoid() > mask_thresh  # (N, H, W) bool
 
     boxes = boxes_from_masks(masks)
-    return {
+    result = {
         "num_detections": int(scores.numel()),
         "boxes": boxes,
         "scores": scores,
         "classes": classes.long(),
         "masks": masks,
     }
+    if aux_logits is not None:
+        result["aux"] = {}
+        for name, lg in aux_logits.items():
+            probs = lg[0].float().softmax(dim=-1)[sel]  # (N, ns)
+            result["aux"][name] = {"ids": probs.argmax(dim=-1), "probs": probs}
+    return result

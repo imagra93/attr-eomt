@@ -27,7 +27,8 @@ def build_train_transform(
     """Training transform: flip + random-resized-crop (scale jitter) + color jitter.
 
     Output image is a normalized ``float32`` ``(3, imgsz, imgsz)`` tensor; masks
-    are ``float32`` ``(N, imgsz, imgsz)`` in ``{0, 1}`` (nearest resampling).
+    stay ``uint8`` ``(N, imgsz, imgsz)`` in ``{0, 1}`` (nearest resampling) — the
+    dataset casts them to ``float32`` after dropping cropped-away instances.
     """
     tfs: list = [v2.RandomHorizontalFlip(p=flip_prob)]
     tfs.append(

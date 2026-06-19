@@ -17,7 +17,42 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
-from .config import DEFAULT_IMAGE_SIZE, EOMT_CONFIGS, PATCH_SIZE, build_eomt_config
+from .config import (
+    DEFAULT_IMAGE_SIZE,
+    EOMT_CONFIGS,
+    PATCH_SIZE,
+    AuxHeadSpec,
+    build_eomt_config,
+)
+
+
+def _patch_eomt_sample_point_for_amp() -> None:
+    """Make EoMT's PointRend sampler AMP-safe (idempotent module-level patch).
+
+    ``EomtHungarianMatcher`` and ``EomtLoss`` build point coordinates with
+    ``torch.rand(...)`` — fp32 — and feed them to ``grid_sample`` alongside the
+    mask logits, which are fp16 under ``torch.autocast``. ``grid_sample`` requires
+    the grid and the input to share a dtype, so a CUDA+AMP training step otherwise
+    fails with ``"expected scalar type Half but found Float"``. We wrap the
+    module-level ``sample_point`` once to cast the coordinates to the feature
+    dtype; the matcher/loss resolve the name at call time, so the one shim covers
+    every call site (internal loss and our re-run matcher in ``aux_cls``).
+    """
+    try:
+        from transformers.models.eomt import modeling_eomt as _m
+    except Exception:  # pragma: no cover - transformers internal layout changed
+        return
+    if getattr(_m, "_eomt_amp_sample_point_patched", False):
+        return
+    _orig = _m.sample_point
+
+    def _sample_point(input_features, point_coordinates, add_dim=False, **kwargs):
+        if point_coordinates.dtype != input_features.dtype:
+            point_coordinates = point_coordinates.to(input_features.dtype)
+        return _orig(input_features, point_coordinates, add_dim=add_dim, **kwargs)
+
+    _m.sample_point = _sample_point
+    _m._eomt_amp_sample_point_patched = True
 
 
 def build_model(
@@ -27,17 +62,26 @@ def build_model(
     imgsz: int = DEFAULT_IMAGE_SIZE,
     names: dict[int, str] | None = None,
     family: str = "instance",
+    aux_heads: list[AuxHeadSpec] | None = None,
 ) -> "EoMTModel":
     """Build an :class:`EoMTModel`.
 
     ``family`` is accepted for forward-compatibility (a detect/box-head family
     and a semantic family may be added later); only ``"instance"`` is supported.
+    ``aux_heads`` adds one secondary per-instance classifier per spec.
     """
     if family != "instance":
         raise NotImplementedError(
             f"family={family!r} is not implemented yet; only 'instance' is supported."
         )
-    return EoMTModel(size=size, nc=nc, image_size=imgsz, patch_size=PATCH_SIZE, names=names)
+    return EoMTModel(
+        size=size,
+        nc=nc,
+        image_size=imgsz,
+        patch_size=PATCH_SIZE,
+        names=names,
+        aux_heads=aux_heads,
+    )
 
 
 class EoMTModel(nn.Module):
@@ -54,10 +98,12 @@ class EoMTModel(nn.Module):
         image_size: int = 644,
         patch_size: int = PATCH_SIZE,
         names: dict[int, str] | None = None,
+        aux_heads: list[AuxHeadSpec] | None = None,
     ):
         super().__init__()
         from transformers import EomtForUniversalSegmentation
 
+        _patch_eomt_sample_point_for_amp()  # AMP-safe grid_sample (see fn docstring)
         self.size = size
         self.nc = nc
         self.image_size = image_size
@@ -69,23 +115,51 @@ class EoMTModel(nn.Module):
         self.config = config
         self.eomt = EomtForUniversalSegmentation(config)
 
+        # Secondary per-instance heads (attributes). Each reads the per-query
+        # embedding — the input to ``class_predictor`` — captured by a hook.
+        self.aux_specs: list[AuxHeadSpec] = list(aux_heads or [])
+        self.aux_heads = nn.ModuleDict(
+            {s.name: nn.Linear(config.hidden_size, s.num_classes) for s in self.aux_specs}
+        )
+        self._query_embed: torch.Tensor | None = None
+        if self.aux_heads:
+            self.eomt.class_predictor.register_forward_hook(self._capture_query_embed)
+
+    def _capture_query_embed(self, _module, inputs, _output):
+        # input to class_predictor is the per-query embedding [B, Q, hidden];
+        # the last call per forward is the final layer — exactly what we want.
+        self._query_embed = inputs[0]
+
     def forward(
         self,
         pixel_values: torch.Tensor,
         mask_labels: list[torch.Tensor] | None = None,
         class_labels: list[torch.Tensor] | None = None,
     ):
+        self._query_embed = None
         out = self.eomt(
             pixel_values=pixel_values,
             mask_labels=mask_labels,
             class_labels=class_labels,
         )
-        if mask_labels is not None and class_labels is not None:
-            return out.loss
-        return {
+        training = mask_labels is not None and class_labels is not None
+        result = {
             "masks_queries_logits": out.masks_queries_logits,
             "class_queries_logits": out.class_queries_logits,
         }
+        if self.aux_heads and self._query_embed is not None:
+            q = self._query_embed
+            result["query_embed"] = q
+            # Per-query logits over ALL queries are only consumed by postprocess at
+            # inference; in training the aux loss applies each head to the matched
+            # subset only, so skip the full-query application here.
+            if not training:
+                result["aux_queries_logits"] = {
+                    name: head(q) for name, head in self.aux_heads.items()
+                }
+        if training:
+            result["loss"] = out.loss
+        return result
 
 
 # ---------------------------------------------------------------------------

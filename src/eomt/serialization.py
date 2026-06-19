@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from .config import HIDDEN_TO_SIZE
+from .config import HIDDEN_TO_SIZE, aux_specs_from_meta, aux_specs_to_meta
 from .model import EoMTModel, build_model
 
 SCHEMA_VERSION = "1.0"
@@ -56,6 +56,7 @@ def wrap_checkpoint(
     names: dict[int, str] | list[str] | None = None,
     task: str = "instance",
     family: str = "eomt",
+    aux_heads: list | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
     """Build a metadata-wrapped checkpoint that :func:`load_model` can restore."""
@@ -69,6 +70,7 @@ def wrap_checkpoint(
         "nc": int(nc),
         "names": normalize_names(names, nc),
         "imgsz": int(imgsz),
+        "aux_heads": aux_specs_to_meta(aux_heads),
     }
     checkpoint.update({k: v for k, v in extra.items() if v is not None})
     return checkpoint
@@ -88,6 +90,31 @@ def load_raw(path: str | Path, *, map_location: Any = "cpu") -> dict[str, Any]:
     return torch.load(path, map_location=map_location, weights_only=False)
 
 
+def resolve_checkpoint(path: str | Path, *, prefer: str = "best") -> Path:
+    """Resolve a checkpoint path that may be a file **or** a run/weights folder.
+
+    A file is returned as-is. A directory is searched — itself and its
+    ``weights/`` subdir — for ``best.pt`` / ``last.pt``. ``prefer`` sets the
+    order: ``"best"`` for inference, ``"last"`` for resuming training. So
+    ``runs/train/eomt`` (or ``runs/train/eomt/weights``) resolves to the right
+    checkpoint without naming the file.
+    """
+    p = Path(path)
+    if p.is_file():
+        return p
+    if p.is_dir():
+        order = ("best.pt", "last.pt") if prefer == "best" else ("last.pt", "best.pt")
+        for d in (p, p / "weights"):
+            for fname in order:
+                cand = d / fname
+                if cand.is_file():
+                    return cand
+        raise FileNotFoundError(
+            f"no {' or '.join(order)} found under {p} or {p / 'weights'}"
+        )
+    raise FileNotFoundError(f"checkpoint path does not exist: {p}")
+
+
 def _resolve_device(device: str) -> torch.device:
     if device in ("", "auto"):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -95,7 +122,12 @@ def _resolve_device(device: str) -> torch.device:
 
 
 def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
-    """Rebuild an :class:`EoMTModel` from a wrapped checkpoint and load its weights."""
+    """Rebuild an :class:`EoMTModel` from a wrapped checkpoint and load its weights.
+
+    ``path`` may be a checkpoint file or a run/weights folder (``best.pt`` is
+    preferred); the model size is recovered from the checkpoint metadata.
+    """
+    path = resolve_checkpoint(path, prefer="best")
     ckpt = load_raw(path)
     if "model" not in ckpt:
         raise ValueError(f"{path} is not a wrapped EoMT checkpoint (no 'model' key).")
@@ -105,8 +137,9 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     nc = int(ckpt.get("nc") or _infer_nc(state))
     imgsz = int(ckpt.get("imgsz") or _infer_imgsz(state))
     names = ckpt.get("names")
+    aux_heads = aux_specs_from_meta(ckpt.get("aux_heads")) or _infer_aux_heads(state)
 
-    model = build_model(size, nc=nc, imgsz=imgsz, names=names)
+    model = build_model(size, nc=nc, imgsz=imgsz, names=names, aux_heads=aux_heads)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         warnings.warn(
@@ -134,6 +167,19 @@ def _infer_nc(state: dict) -> int:
         if key in state:
             return int(state[key].shape[0]) - 1  # drop the +1 null class
     raise ValueError("could not infer nc from state dict.")
+
+
+def _infer_aux_heads(state: dict) -> list:
+    """Recover aux-head specs from ``aux_heads.<name>.weight`` keys (names lost)."""
+    from .config import AuxHeadSpec
+
+    specs = []
+    for key, tensor in state.items():
+        for prefix in ("aux_heads.", "eomt_aux_heads."):
+            if key.startswith(prefix) and key.endswith(".weight"):
+                name = key[len(prefix) : -len(".weight")]
+                specs.append(AuxHeadSpec(name=name, num_classes=int(tensor.shape[0])))
+    return specs
 
 
 def _infer_imgsz(state: dict, patch_size: int = 14) -> int:

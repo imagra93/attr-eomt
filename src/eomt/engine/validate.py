@@ -140,3 +140,57 @@ def evaluate(
     if also_bbox:
         metrics.update(_cocoeval(val_ds.coco, bbox_results, val_ds.ids, "bbox", verbose))
     return metrics
+
+
+@torch.no_grad()
+def aux_evaluate(
+    model,
+    val_seg_ds,
+    *,
+    device,
+    batch_size: int = 4,
+    num_workers: int = 4,
+    amp: bool = False,
+    verbose: bool = True,
+) -> dict[str, float]:
+    """Held-out matched-query accuracy per secondary head.
+
+    ``val_seg_ds`` is a :class:`~eomt.data.coco.CocoInstanceSeg` over the val split
+    (deterministic val transform, sharing train's attribute id map). Runs the model
+    mask-free, matches predictions to GT with EoMT's matcher, and reports top-1
+    accuracy on matched queries (ignoring ``-100`` labels). Returns
+    ``{name: accuracy}`` (NaN for a head with no matched, non-ignored queries).
+    """
+    from ..aux_cls import aux_accuracy
+    from ..data import collate_train
+
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    model.eval()
+    loader = DataLoader(
+        val_seg_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_train,
+        pin_memory=True,
+    )
+    hits = {s.name: 0 for s in val_seg_ds.aux_specs}
+    tot = {s.name: 0 for s in val_seg_ds.aux_specs}
+    use_amp = amp and device.type == "cuda"
+
+    for pixel_values, mask_labels, class_labels, aux_labels in tqdm(
+        loader, desc="val-aux", unit="batch", leave=False, disable=not verbose
+    ):
+        pixel_values = pixel_values.to(device)
+        mask_labels = [m.to(device) for m in mask_labels]
+        class_labels = [c.to(device) for c in class_labels]
+        aux_labels = {k: [t.to(device) for t in v] for k, v in aux_labels.items()}
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            out = model(pixel_values)
+        for name, (hit, t) in aux_accuracy(
+            model, out, mask_labels, class_labels, aux_labels
+        ).items():
+            hits[name] += hit
+            tot[name] += t
+
+    return {n: (hits[n] / tot[n] if tot[n] else float("nan")) for n in hits}

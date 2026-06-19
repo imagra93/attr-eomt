@@ -8,11 +8,31 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 import typer
 
 app = typer.Typer(add_completion=False, help="libre-eomt: EoMT instance segmentation.")
+
+
+def _run_args(resume_path: str) -> dict:
+    """Best-effort read of a run's ``args.yaml`` from a resume target.
+
+    ``resume_path`` may be the run folder, its ``weights/`` subdir, or a ``.pt``
+    inside either — we walk up to find the ``args.yaml`` train() wrote.
+    """
+    import yaml
+
+    p = Path(resume_path)
+    for d in (p, p.parent, p.parent.parent):
+        f = d / "args.yaml"
+        try:
+            if f.is_file():
+                return yaml.safe_load(f.read_text()) or {}
+        except OSError:
+            pass
+    return {}
 
 
 @app.command()
@@ -30,6 +50,19 @@ def train(
     weight_decay: float = typer.Option(0.05),
     backbone_lr_mult: float = typer.Option(0.1),
     warmup_epochs: float = typer.Option(1.0),
+    mask_anneal: bool = typer.Option(True, help="Anneal masked attention off (EoMT recipe)."),
+    mask_anneal_start: float = typer.Option(0.0, help="Anneal start, fraction of training."),
+    mask_anneal_end: float = typer.Option(0.9, help="Anneal end (mask-free after), fraction."),
+    aux_w: float = typer.Option(1.0, help="Weight for secondary attribute head losses."),
+    aux_w_warmup: float = typer.Option(
+        0.0, help="Ramp aux loss weight 0->1 over this fraction of training (0=off)."
+    ),
+    aux_w_head: Optional[str] = typer.Option(
+        None, help="Per-head aux weights, e.g. 'laterality=0.5,severity=2.0'."
+    ),
+    aux_class_weights: bool = typer.Option(
+        False, help="Inverse-sqrt-frequency CE weights per aux head (imbalance)."
+    ),
     clip_norm: float = typer.Option(0.01),
     workers: int = typer.Option(4),
     device: str = typer.Option("auto"),
@@ -39,7 +72,9 @@ def train(
     name: str = typer.Option("eomt"),
     val_interval: int = typer.Option(1),
     logger: str = typer.Option("none", help="none | tensorboard | wandb."),
-    resume: Optional[str] = typer.Option(None, help="Resume from a last.pt checkpoint."),
+    resume: Optional[str] = typer.Option(
+        None, help="Resume from a checkpoint or a run/weights folder (uses last.pt)."
+    ),
 ):
     """Fine-tune EoMT on a COCO-format dataset."""
     from .data import load_data_config
@@ -52,8 +87,30 @@ def train(
         tj = tj or cfg["train_json"]
         vi = vi or cfg["val_images"]
         vj = vj or cfg["val_json"]
+    if resume and not (ti and tj):
+        # Recover the dataset paths recorded in the resumed run's args.yaml.
+        run_cfg = _run_args(resume)
+        ti = ti or run_cfg.get("train_images")
+        tj = tj or run_cfg.get("train_json")
+        vi = vi or run_cfg.get("val_images")
+        vj = vj or run_cfg.get("val_json")
     if not (ti and tj):
-        raise typer.BadParameter("Provide --data or --train-images/--train-json.")
+        raise typer.BadParameter(
+            "Provide --data or --train-images/--train-json "
+            "(or --resume a run with an args.yaml that records them)."
+        )
+
+    per_head = None
+    if aux_w_head:
+        per_head = {}
+        for part in aux_w_head.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            key, sep, val = part.partition("=")
+            if not sep:
+                raise typer.BadParameter(f"--aux-w-head expects 'name=weight', got {part!r}.")
+            per_head[key.strip()] = float(val)
 
     result = run_train(
         train_images=ti,
@@ -68,6 +125,13 @@ def train(
         weight_decay=weight_decay,
         backbone_lr_mult=backbone_lr_mult,
         warmup_epochs=warmup_epochs,
+        mask_anneal=mask_anneal,
+        mask_anneal_start=mask_anneal_start,
+        mask_anneal_end=mask_anneal_end,
+        aux_w=aux_w,
+        aux_w_warmup=aux_w_warmup,
+        aux_w_per_head=per_head,
+        aux_class_weights=aux_class_weights,
         clip_norm=clip_norm,
         workers=workers,
         device=device,
@@ -79,12 +143,17 @@ def train(
         logger=logger,
         resume=resume,
     )
-    typer.echo(f"[done] best segm mAP={result['best_metric']:.4f}; weights in {result['weights_dir']}")
+    if result["best_metric"] >= 0:
+        typer.echo(
+            f"[done] best segm mAP={result['best_metric']:.4f}; weights in {result['weights_dir']}"
+        )
+    else:
+        typer.echo(f"[done] no validation set; weights in {result['weights_dir']}")
 
 
 @app.command()
 def val(
-    weights: str = typer.Option(..., help="Path to a trained checkpoint."),
+    weights: str = typer.Option(..., help="Checkpoint .pt or a run/weights folder."),
     data: Optional[str] = typer.Option(None, help="Dataset YAML."),
     val_images: Optional[str] = typer.Option(None),
     val_json: Optional[str] = typer.Option(None),
@@ -120,7 +189,7 @@ def val(
 
 @app.command()
 def predict(
-    weights: str = typer.Option(..., help="Path to a trained checkpoint."),
+    weights: str = typer.Option(..., help="Checkpoint .pt or a run/weights folder."),
     source: str = typer.Option(..., help="Image file or directory."),
     out: str = typer.Option("runs/predict", help="Output directory."),
     conf_thres: float = typer.Option(0.3),

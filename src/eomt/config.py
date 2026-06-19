@@ -20,12 +20,43 @@ DINOv2-with-registers patch grid loads 1:1 with no kernel interpolation
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 #: Default square input size (patch-14 aligned: 644 = 14 x 46).
 DEFAULT_IMAGE_SIZE = 644
 #: DINOv2 / EoMT patch size.
 PATCH_SIZE = 14
+
+
+@dataclass
+class AuxHeadSpec:
+    """One secondary per-instance classifier ("attribute") riding on EoMT.
+
+    ``name`` keys the head everywhere (model ``ModuleDict``, COCO ``attributes``
+    field, checkpoint metadata). ``names`` maps the contiguous ``0..num_classes-1``
+    ids to human labels. Several specs ⇒ several independent heads.
+    """
+
+    name: str
+    num_classes: int
+    names: dict[int, str] = field(default_factory=dict)
+
+
+def aux_specs_to_meta(specs: list[AuxHeadSpec] | None) -> list[dict]:
+    """Serialize aux-head specs for a checkpoint."""
+    return [
+        {"name": s.name, "num_classes": int(s.num_classes), "names": dict(s.names)}
+        for s in (specs or [])
+    ]
+
+
+def aux_specs_from_meta(meta: list[dict] | None) -> list[AuxHeadSpec]:
+    """Rebuild aux-head specs from checkpoint metadata."""
+    out: list[AuxHeadSpec] = []
+    for d in meta or []:
+        names = {int(k): str(v) for k, v in (d.get("names") or {}).items()}
+        out.append(AuxHeadSpec(str(d["name"]), int(d["num_classes"]), names))
+    return out
 
 
 @dataclass(frozen=True)

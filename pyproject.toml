@@ -38,7 +38,7 @@ dev = ["pytest>=7.0"]
 eomt = "eomt.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/your-org/libre-eomt"
+Homepage = "https://github.com/imagra93/libre-eomt"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/eomt"]
