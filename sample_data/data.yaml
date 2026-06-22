@@ -1,0 +1,34 @@
+# Minimal example dataset for libre-eomt.
+#
+# Same schema as configs/coco.yaml. Paths are relative to `path` (which is itself
+# relative to THIS file, or absolute). `path: .` therefore means "this folder".
+#
+# Everything the model needs is auto-discovered from the COCO JSONs below:
+#   - the primary classes (`nc`) from `categories`
+#   - any secondary per-instance classification heads from the (optional)
+#     top-level `attributes` list + per-annotation `attributes` maps
+# so there are NO class counts or head definitions to maintain here.
+#
+# Layout:
+#   data/sample_dataset/
+#     data.yaml                          <- this file
+#     annotations/instances_train.json   <- tiny COCO + attributes (see below)
+#     annotations/instances_val.json
+#     images/train/*.jpg                 <- your images (NOT shipped here)
+#     images/val/*.jpg
+#
+# The JSONs demonstrate the attributes extension that powers the secondary heads:
+# a top-level `attributes` list (one entry per head, each with its own label
+# vocabulary) and a per-annotation `attributes: {head: id}` map. Raw ids are
+# remapped to a contiguous 0..n-1 per head, so non-contiguous ids (e.g. grade
+# 10/20) are fine. A dataset with NO `attributes` is plain instance segmentation.
+#
+# The attribute names used here (`ripeness`, `grade`) are only examples — use
+# whatever attributes your task needs, and as many heads as you like.
+
+path: .
+train_images: images/train
+train_json:   annotations/instances_train.json
+val_images:   images/val
+val_json:     annotations/instances_val.json
+download: false

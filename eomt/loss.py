@@ -13,7 +13,7 @@ deviations are:
   single-process (no ``PartialState`` is initialised). Re-add a reduce if DDP is
   introduced.
 
-The matcher is exposed as ``NativeEomtLoss.matcher`` with the exact
+The matcher is exposed as ``EoMTLoss.matcher`` with the exact
 ``(masks_queries_logits, class_queries_logits, mask_labels, class_labels)`` ->
 list-of-(src, tgt) signature that :func:`eomt.aux_cls.match_queries` calls.
 """
@@ -73,7 +73,7 @@ def sigmoid_cross_entropy_loss(inputs: Tensor, labels: Tensor, num_masks: int) -
     return cross_entropy_loss.mean(1).sum() / num_masks
 
 
-class NativeHungarianMatcher(nn.Module):
+class HungarianMatcher(nn.Module):
     """1-to-1 assignment between queries and GT masks via class + mask + dice cost."""
 
     def __init__(
@@ -126,7 +126,7 @@ class NativeHungarianMatcher(nn.Module):
         ]
 
 
-class NativeEomtLoss(nn.Module):
+class EoMTLoss(nn.Module):
     """EoMT mask-classification loss (class CE + point-sampled mask BCE + dice)."""
 
     def __init__(self, config, weight_dict: dict[str, float]):
@@ -143,7 +143,7 @@ class NativeEomtLoss(nn.Module):
         self.oversample_ratio = config.oversample_ratio
         self.importance_sample_ratio = config.importance_sample_ratio
 
-        self.matcher = NativeHungarianMatcher(
+        self.matcher = HungarianMatcher(
             cost_class=config.class_weight,
             cost_dice=config.dice_weight,
             cost_mask=config.mask_weight,

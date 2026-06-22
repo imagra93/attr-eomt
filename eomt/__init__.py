@@ -2,16 +2,21 @@
 
 Public API:
 
-    >>> from eomt import build_model, load_model, load_dinov2_backbone
-    >>> model = build_model("s", nc=80)        # build architecture
-    >>> load_dinov2_backbone(model)            # init encoder from DINOv2
-    >>> seg = load_model("runs/train/eomt")    # reload from a run folder (size auto-detected)
+    >>> from eomt import EoMT
+    >>> model = EoMT("l")                      # fresh model (DINOv2 backbone)
+    >>> model.train(data="coco", epochs=50)    # COCO auto-downloads if missing
+    >>> model = EoMT("runs/train/eomt-l")      # reload a run (everything auto-detected)
+    >>> results = model.predict("images/", plot=True)
+
+Lower-level building blocks (``build_model`` / ``load_model`` / ``EoMTModel`` /
+``EoMTEncoder``) remain available for advanced use.
 """
 
 from __future__ import annotations
 
+from .api import EoMT
 from .config import EOMT_CONFIGS, SIZES, build_eomt_config
-from .model import EoMTModel, build_model, load_dinov2_backbone
+from .model import EoMTEncoder, EoMTModel, build_model, load_dinov2_backbone
 from .postprocess import postprocess_instance
 from .serialization import (
     load_model,
@@ -22,10 +27,12 @@ from .serialization import (
 )
 
 __all__ = [
+    "EoMT",
     "EOMT_CONFIGS",
     "SIZES",
     "build_eomt_config",
     "EoMTModel",
+    "EoMTEncoder",
     "build_model",
     "load_dinov2_backbone",
     "postprocess_instance",

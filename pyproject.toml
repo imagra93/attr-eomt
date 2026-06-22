@@ -28,21 +28,17 @@ dependencies = [
     "tqdm>=4.65.0",
     "PyYAML>=6.0",
     "requests>=2.25.0",
-    "typer>=0.9.0",
 ]
 
 [project.optional-dependencies]
 logging = ["tensorboard>=2.10", "wandb>=0.15"]
 dev = ["pytest>=7.0"]
 
-[project.scripts]
-eomt = "eomt.cli:app"
-
 [project.urls]
 Homepage = "https://github.com/imagra93/libre-eomt"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/eomt"]
+packages = ["eomt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
