@@ -25,9 +25,6 @@ datasets/
 data/coco/
 scripts/sample_images/
 
-# Private, domain-specific project (vehicle parts / laterality) — kept off GitHub
-parts-project/
-
 # Editor / OS
 .idea/
 .vscode/
