@@ -104,6 +104,40 @@ SIZES = tuple(EOMT_CONFIGS.keys())
 #: Encoder hidden_size -> size code (used to detect size from a checkpoint).
 HIDDEN_TO_SIZE = {cfg.hidden_size: code for code, cfg in EOMT_CONFIGS.items()}
 
+#: Segmentation-loss / criterion hyper-parameters exposed for tuning. Values are
+#: the upstream (Mask2Former/EoMT) defaults — passing the defaults reproduces the
+#: previous behaviour. ``build_eomt_config`` did NOT previously forward these, so
+#: every build silently reset them to these defaults; they are now threaded and
+#: persisted in the checkpoint so a tuned objective survives reload.
+DEFAULT_LOSS_WEIGHTS: dict = {
+    "no_object_weight": 0.1,
+    "class_weight": 2.0,
+    "mask_weight": 5.0,
+    "dice_weight": 5.0,
+    "train_num_points": 12544,
+    "oversample_ratio": 3.0,
+    "importance_sample_ratio": 0.75,
+}
+
+
+def normalize_loss_weights(lw: dict | None) -> dict:
+    """Fill a loss-weight dict with defaults, rejecting unknown keys.
+
+    ``None`` values fall back to the default (so partial dicts work). Raises on
+    keys that are not real criterion params to catch typos early.
+    """
+    out = dict(DEFAULT_LOSS_WEIGHTS)
+    if lw:
+        unknown = set(lw) - set(out)
+        if unknown:
+            raise ValueError(
+                f"unknown loss_weights keys {sorted(unknown)}; "
+                f"valid keys are {sorted(out)}."
+            )
+        out.update({k: v for k, v in lw.items() if v is not None})
+    out["train_num_points"] = int(out["train_num_points"])
+    return out
+
 
 def build_eomt_config(
     size: str,
@@ -112,6 +146,14 @@ def build_eomt_config(
     image_size: int = DEFAULT_IMAGE_SIZE,
     patch_size: int = PATCH_SIZE,
     names: dict[int, str] | None = None,
+    num_upscale_blocks: int | None = None,
+    no_object_weight: float = 0.1,
+    class_weight: float = 2.0,
+    mask_weight: float = 5.0,
+    dice_weight: float = 5.0,
+    train_num_points: int = 12544,
+    oversample_ratio: float = 3.0,
+    importance_sample_ratio: float = 0.75,
 ):
     """Build a ``transformers.EomtConfig`` for the given size code.
 
@@ -121,6 +163,16 @@ def build_eomt_config(
         image_size: Square input size; must be divisible by ``patch_size``.
         patch_size: Patch size (14 for DINOv2-with-registers).
         names: Optional ``{class_index: name}`` mapping for ``id2label``.
+        num_upscale_blocks: Mask-head upsampling blocks (``None`` = size preset
+            default, 2). Each block doubles the mask-logit resolution; raising it
+            sharpens small/thin masks but changes the ``upscale_block`` weight
+            shapes (a 2-block checkpoint cannot warm-start a 3-block head 1:1).
+        no_object_weight: CE weight on the null class for unmatched queries; lower
+            ⇒ the model fires more queries (higher recall / more detections).
+        class_weight / mask_weight / dice_weight: matcher + loss weights for the
+            classification, per-pixel mask BCE and (scale-invariant) dice terms.
+        train_num_points / oversample_ratio / importance_sample_ratio: PointRend
+            sampling for the mask loss; more points ⇒ sharper boundaries.
     """
     from transformers import EomtConfig
 
@@ -144,9 +196,18 @@ def build_eomt_config(
         num_queries=cfg.num_queries,
         num_blocks=cfg.num_blocks,
         num_register_tokens=cfg.num_register_tokens,
-        num_upscale_blocks=cfg.num_upscale_blocks,
+        num_upscale_blocks=(
+            cfg.num_upscale_blocks if num_upscale_blocks is None else int(num_upscale_blocks)
+        ),
         image_size=image_size,
         patch_size=patch_size,
         id2label=id2label,
         label2id=label2id,
+        no_object_weight=no_object_weight,
+        class_weight=class_weight,
+        mask_weight=mask_weight,
+        dice_weight=dice_weight,
+        train_num_points=int(train_num_points),
+        oversample_ratio=oversample_ratio,
+        importance_sample_ratio=importance_sample_ratio,
     )

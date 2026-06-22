@@ -2,6 +2,6 @@
 
 from .predict import predict
 from .train import train
-from .validate import evaluate
+from .validate import evaluate, sweep
 
-__all__ = ["train", "evaluate", "predict"]
+__all__ = ["train", "evaluate", "predict", "sweep"]

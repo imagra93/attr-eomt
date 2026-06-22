@@ -26,6 +26,7 @@ from ..aux_cls import (
     gate_indices,
     match_queries,
 )
+from ..config import normalize_loss_weights
 from ..data import CocoInstanceSeg, CocoValImages, collate_train
 from ..data.transforms import build_val_transform
 from ..ema import ModelEMA, _unwrap
@@ -294,10 +295,27 @@ def train(
     aux_head_layers: int = 2,
     aux_head_hidden: int | None = None,
     aux_head_dropout: float = 0.0,
+    no_object_weight: float = 0.1,
+    class_weight: float = 2.0,
+    mask_weight: float = 5.0,
+    dice_weight: float = 5.0,
+    train_num_points: int = 12544,
+    oversample_ratio: float = 3.0,
+    importance_sample_ratio: float = 0.75,
+    num_upscale_blocks: int | None = None,
     logger: str = "none",
     resume: str | None = None,
+    init_weights: str | None = None,
 ) -> dict:
-    """Fine-tune an EoMT instance-segmentation model on a COCO-format dataset."""
+    """Fine-tune an EoMT instance-segmentation model on a COCO-format dataset.
+
+    ``resume`` continues a run (restores epoch, optimizer, LR schedule, EMA, best).
+    ``init_weights`` is a *warm start* (fine-tune): it loads only the model weights
+    from a checkpoint and then trains from epoch 0 with a fresh optimizer, LR
+    schedule and EMA — use it to retrain with changed hyper-parameters (e.g.
+    ``flip_prob=0``) while keeping the learned weights. The two are mutually
+    exclusive.
+    """
     if imgsz % 14:
         raise ValueError(f"imgsz={imgsz} must be divisible by 14 (DINOv2 grid).")
 
@@ -330,6 +348,11 @@ def train(
     # Resume may point at a checkpoint file OR a run/weights folder. Resolve it
     # and recover the model size/imgsz from its metadata BEFORE building the model
     # so the architecture matches the saved weights regardless of --size.
+    if resume and init_weights:
+        raise ValueError(
+            "pass either --resume (continue a run) or --weights (warm-start a fresh "
+            "run from a checkpoint), not both."
+        )
     resume_ckpt = None
     if resume:
         resume_path = resolve_checkpoint(resume, prefer="last")
@@ -338,6 +361,21 @@ def train(
         if resume_ckpt.get("imgsz"):
             imgsz = int(resume_ckpt["imgsz"])
         print(f"[resume] checkpoint {resume_path} (size={size}, imgsz={imgsz})")
+
+    # Warm start (fine-tune): recover the architecture from the checkpoint here so
+    # the model is built to match, but the trainer state (epoch/optimizer/EMA/best)
+    # is NOT restored below — training begins fresh at epoch 0.
+    init_ckpt = None
+    if init_weights:
+        init_path = resolve_checkpoint(init_weights, prefer="best")
+        init_ckpt = load_raw(init_path)
+        size = init_ckpt.get("size", size)
+        if init_ckpt.get("imgsz"):
+            imgsz = int(init_ckpt["imgsz"])
+        print(
+            f"[finetune] warm-start weights from {init_path} (size={size}, imgsz={imgsz}); "
+            "fresh optimizer/LR schedule/EMA, training from epoch 0."
+        )
 
     # Run directory. Default the name to ``eomt-<size>`` so different sizes don't
     # overwrite each other; resolved after resume so it tracks the checkpoint's size.
@@ -358,6 +396,32 @@ def train(
     }
     if resume_ckpt is not None:
         aux_head_arch = resume_ckpt.get("aux_head_arch") or {"layers": 1}
+    elif init_ckpt is not None:
+        aux_head_arch = init_ckpt.get("aux_head_arch") or {"layers": 1}
+
+    # Segmentation-loss weights + mask-head depth. New runs use the CLI flags.
+    # Resuming MUST keep the checkpoint's objective and head shape (an inconsistent
+    # objective or upscale depth would invalidate the optimizer/EMA state and break
+    # the 1:1 weight load). Warm-starting (fine-tune) keeps the CLI loss weights —
+    # the whole point is to retrain with a tuned objective — but inherits the
+    # checkpoint's num_upscale_blocks because it is architecture-bound (the saved
+    # upscale_block tensors must match the rebuilt head).
+    loss_weights = normalize_loss_weights(
+        {
+            "no_object_weight": no_object_weight,
+            "class_weight": class_weight,
+            "mask_weight": mask_weight,
+            "dice_weight": dice_weight,
+            "train_num_points": train_num_points,
+            "oversample_ratio": oversample_ratio,
+            "importance_sample_ratio": importance_sample_ratio,
+        }
+    )
+    if resume_ckpt is not None:
+        loss_weights = normalize_loss_weights(resume_ckpt.get("loss_weights"))
+        num_upscale_blocks = resume_ckpt.get("num_upscale_blocks", num_upscale_blocks)
+    elif init_ckpt is not None and init_ckpt.get("num_upscale_blocks") is not None:
+        num_upscale_blocks = int(init_ckpt["num_upscale_blocks"])
 
     # --- data ---
     train_ds = CocoInstanceSeg(
@@ -455,13 +519,23 @@ def train(
             "aux_class_gate": aux_class_gate,
             "aux_head_arch": aux_head_arch,
             "aux_heads": {s.name: s.num_classes for s in aux_specs},
+            "loss_weights": loss_weights,
+            "num_upscale_blocks": num_upscale_blocks,
         },
     )
 
     # --- model ---
     model = build_model(
-        size, nc=nc, imgsz=imgsz, names=names, aux_heads=aux_specs, aux_head_arch=aux_head_arch
+        size,
+        nc=nc,
+        imgsz=imgsz,
+        names=names,
+        aux_heads=aux_specs,
+        aux_head_arch=aux_head_arch,
+        loss_weights=loss_weights,
+        num_upscale_blocks=num_upscale_blocks,
     ).to(dev)
+    print(f"[model] loss weights: {loss_weights}; upscale blocks: {model.num_upscale_blocks}")
     if aux_specs:
         print(f"[model] aux head arch: {model.aux_head_arch}")
     start_epoch, best_metric = 0, -1.0
@@ -474,6 +548,14 @@ def train(
         start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
         best_metric = float(resume_ckpt.get("best_metric", -1.0))
         print(f"[resume] at epoch {start_epoch} (best segm mAP {best_metric:.4f})")
+    elif init_ckpt is not None:
+        # Warm start: load weights only. Optimizer/EMA/epoch/best stay fresh, so the
+        # LR schedule and EMA restart from these weights at epoch 0.
+        missing, unexpected = model.load_state_dict(init_ckpt["model"], strict=False)
+        print(
+            f"[finetune] loaded warm-start weights ({len(missing)} missing / "
+            f"{len(unexpected)} unexpected keys); training from epoch 0."
+        )
     elif pretrained:
         load_dinov2_backbone(model)
         model.to(dev)
@@ -521,6 +603,8 @@ def train(
             aux_heads=aux_specs,
             aux_head_arch=aux_head_arch,
             letterbox=letterbox,
+            loss_weights=loss_weights,
+            num_upscale_blocks=core.num_upscale_blocks,
             **extra,
         )
         save_checkpoint(ckpt, path)

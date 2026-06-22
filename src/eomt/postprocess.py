@@ -61,6 +61,7 @@ def postprocess_instance(
     *,
     max_det: int = 100,
     mask_thresh: float = 0.5,
+    min_mask_area: float = 0.0,
     preprocess_meta: dict | None = None,
     **_: object,
 ) -> dict:
@@ -73,6 +74,9 @@ def postprocess_instance(
         original_size: ``(width, height)`` of the source image.
         max_det: cap on returned instances (highest scoring first).
         mask_thresh: sigmoid threshold for binarizing masks.
+        min_mask_area: drop binarized masks smaller than this many pixels (in the
+            original image). ``0`` (default) keeps every non-empty mask — raise it
+            to suppress speck false-positives on small-object data.
         preprocess_meta: letterbox/stretch metadata from
             :func:`eomt.preprocess.preprocess_numpy`; when it marks a letterbox the
             padding is cropped before resizing masks back to the original size.
@@ -127,6 +131,12 @@ def postprocess_instance(
 
     masks = _masks_to_original(mask_logits, orig_h, orig_w, preprocess_meta)
     masks = masks.sigmoid() > mask_thresh  # (N, H, W) bool
+
+    # Drop tiny masks (speck false-positives) at the original resolution. Keep the
+    # selection indices ``sel`` aligned so the aux heads index the same instances.
+    if min_mask_area > 0:
+        keep = masks.flatten(1).sum(1) >= min_mask_area
+        scores, classes, masks, sel = scores[keep], classes[keep], masks[keep], sel[keep]
 
     boxes = boxes_from_masks(masks)
     result = {

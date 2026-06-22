@@ -1,14 +1,16 @@
 """EoMT architecture wrapper and DINOv2 backbone initialization.
 
-``EoMTModel`` is a thin ``nn.Module`` around HuggingFace's
-``EomtForUniversalSegmentation``. Its forward returns the HF segmentation loss
-during training (class CE + mask CE + dice, computed inside the HF model with
-Hungarian matching, PointRend point sampling and per-layer auxiliary losses) and
+``EoMTModel`` is a thin ``nn.Module`` around the pure-PyTorch
+:class:`~eomt.native.model.NativeEoMT` (a checkpoint-compatible reimplementation
+of HuggingFace's ``EomtForUniversalSegmentation``). Its forward returns the
+segmentation loss during training (class CE + mask CE + dice, computed with
+Hungarian matching, PointRend point sampling and per-layer deep supervision) and
 the raw query logits dict at inference.
 
 ``load_dinov2_backbone`` initializes the ViT encoder from pretrained
 DINOv2-with-registers weights; the mask/class prediction head is left random and
-learned during training.
+learned during training. The native model's submodule names mirror the HF model
+exactly, so existing checkpoints (and the DINOv2 key remap below) load unchanged.
 """
 
 from __future__ import annotations
@@ -23,36 +25,9 @@ from .config import (
     PATCH_SIZE,
     AuxHeadSpec,
     build_eomt_config,
+    normalize_loss_weights,
 )
-
-
-def _patch_eomt_sample_point_for_amp() -> None:
-    """Make EoMT's PointRend sampler AMP-safe (idempotent module-level patch).
-
-    ``EomtHungarianMatcher`` and ``EomtLoss`` build point coordinates with
-    ``torch.rand(...)`` — fp32 — and feed them to ``grid_sample`` alongside the
-    mask logits, which are fp16 under ``torch.autocast``. ``grid_sample`` requires
-    the grid and the input to share a dtype, so a CUDA+AMP training step otherwise
-    fails with ``"expected scalar type Half but found Float"``. We wrap the
-    module-level ``sample_point`` once to cast the coordinates to the feature
-    dtype; the matcher/loss resolve the name at call time, so the one shim covers
-    every call site (internal loss and our re-run matcher in ``aux_cls``).
-    """
-    try:
-        from transformers.models.eomt import modeling_eomt as _m
-    except Exception:  # pragma: no cover - transformers internal layout changed
-        return
-    if getattr(_m, "_eomt_amp_sample_point_patched", False):
-        return
-    _orig = _m.sample_point
-
-    def _sample_point(input_features, point_coordinates, add_dim=False, **kwargs):
-        if point_coordinates.dtype != input_features.dtype:
-            point_coordinates = point_coordinates.to(input_features.dtype)
-        return _orig(input_features, point_coordinates, add_dim=add_dim, **kwargs)
-
-    _m.sample_point = _sample_point
-    _m._eomt_amp_sample_point_patched = True
+from .native.model import NativeEoMT
 
 
 #: Default secondary-head architecture for new runs: a small 2-layer MLP.
@@ -102,6 +77,8 @@ def build_model(
     family: str = "instance",
     aux_heads: list[AuxHeadSpec] | None = None,
     aux_head_arch: dict | None = None,
+    loss_weights: dict | None = None,
+    num_upscale_blocks: int | None = None,
 ) -> "EoMTModel":
     """Build an :class:`EoMTModel`.
 
@@ -109,6 +86,9 @@ def build_model(
     and a semantic family may be added later); only ``"instance"`` is supported.
     ``aux_heads`` adds one secondary per-instance classifier per spec;
     ``aux_head_arch`` sets their shared network shape (see ``_build_aux_head``).
+    ``loss_weights`` overrides the segmentation-loss/criterion weights (see
+    ``normalize_loss_weights``); ``num_upscale_blocks`` overrides the mask-head
+    upsampling depth (``None`` = size preset default).
     """
     if family != "instance":
         raise NotImplementedError(
@@ -122,6 +102,8 @@ def build_model(
         names=names,
         aux_heads=aux_heads,
         aux_head_arch=aux_head_arch,
+        loss_weights=loss_weights,
+        num_upscale_blocks=num_upscale_blocks,
     )
 
 
@@ -141,21 +123,31 @@ class EoMTModel(nn.Module):
         names: dict[int, str] | None = None,
         aux_heads: list[AuxHeadSpec] | None = None,
         aux_head_arch: dict | None = None,
+        loss_weights: dict | None = None,
+        num_upscale_blocks: int | None = None,
     ):
         super().__init__()
-        from transformers import EomtForUniversalSegmentation
-
-        _patch_eomt_sample_point_for_amp()  # AMP-safe grid_sample (see fn docstring)
         self.size = size
         self.nc = nc
         self.image_size = image_size
         self.patch_size = patch_size
         self.names = names
+        # Segmentation-loss weights and mask-head depth, persisted in the checkpoint
+        # so a tuned objective / head shape is rebuilt identically on reload.
+        self.loss_weights = normalize_loss_weights(loss_weights)
         config = build_eomt_config(
-            size, nc=nc, image_size=image_size, patch_size=patch_size, names=names
+            size,
+            nc=nc,
+            image_size=image_size,
+            patch_size=patch_size,
+            names=names,
+            num_upscale_blocks=num_upscale_blocks,
+            **self.loss_weights,
         )
         self.config = config
-        self.eomt = EomtForUniversalSegmentation(config)
+        # Effective upscale depth (resolved from the preset when not overridden).
+        self.num_upscale_blocks = int(config.num_upscale_blocks)
+        self.eomt = NativeEoMT(config)
 
         # Secondary per-instance heads (attributes). Each reads the per-query
         # embedding — the input to ``class_predictor`` — captured by a hook.

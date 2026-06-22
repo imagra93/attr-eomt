@@ -55,6 +55,9 @@ eomt train --data configs/coco.yaml --size s --epochs 50 --batch 4 --device cuda
 # Validate a checkpoint (COCO segm + bbox mAP)
 eomt val --weights runs/train/eomt/weights/best.pt --data configs/coco.yaml
 
+# Sweep inference knobs (conf/mask threshold, max_det, min area) — no retraining
+eomt sweep --weights runs/train/eomt/weights/best.pt --data configs/coco.yaml
+
 # Render predictions on an image or a folder
 eomt predict --weights best.pt --source path/to/imgs --out runs/predict
 
@@ -82,6 +85,7 @@ Useful training knobs (full list via `eomt train --help`):
 | `--mask-anneal / --no-mask-anneal` | on | anneal masked attention off over training (EoMT recipe, see below) |
 | `--mask-anneal-start` / `--mask-anneal-end` | `0.0` / `0.9` | fractions of training over which masked attention is linearly annealed `1 → 0` |
 | `--aux-w` | `1.0` | weight on the summed secondary-head loss (see below) |
+| `--weights` | none | **warm-start / fine-tune** from a checkpoint: load its weights, then train fresh from epoch 0 with a new optimizer/schedule/EMA — vs `--resume`, which *continues* a run |
 
 ## Secondary per-instance classification
 
@@ -97,9 +101,45 @@ space (which would wreck Hungarian matching and thin out per-class statistics).
 Because EoMT is NMS-free, two overlapping same-class instances stay two distinct
 queries; the attribute head separates them from their embeddings.
 
-> The examples below (`typology`, `severity`, …) are **illustrative only** — a
-> head is just a named set of mutually exclusive labels. Define whatever
-> attributes your dataset needs.
+> The attribute names used in this README (`ripeness`, `grade`, …) are
+> **illustrative only** — a head is just a named set of mutually exclusive
+> labels. Define whatever attributes your dataset needs.
+
+### Example: a bowl of fruit
+
+One model segments each fruit (primary classes `apple` / `banana` / `orange` /
+`pear`) and, for **every** detection, reads off two **independent** attribute
+heads — `ripeness` (`unripe` / `turning` / `ripe`) and a quality `grade`
+(`A` / `B`). The renderer prints the primary class + score on the first row and
+each attribute + its confidence on the row beneath it.
+
+![A bowl of fruit; each box labelled with its fruit class plus a ripeness and a grade](docs/examples/example_1.png)
+
+`ripeness` and `grade` are *orthogonal* — they vary independently — which is
+exactly the case that's awkward to fold into the primary class space: a
+`fruit × ripeness × grade` product would wreck Hungarian matching and thin out
+per-class statistics. And because EoMT is **NMS-free**, the two apples (one ripe,
+one unripe) and the two oranges stay four distinct queries — each gets its own
+`ripeness` and `grade` read from its query embedding.
+
+```jsonc
+"attributes": [
+  {"name": "ripeness", "categories": [{"id": 0, "name": "unripe"},
+                                      {"id": 1, "name": "turning"},
+                                      {"id": 2, "name": "ripe"}]},
+  {"name": "grade",    "categories": [{"id": 0, "name": "A"},
+                                      {"id": 1, "name": "B"}]}
+]
+// per annotation, alongside the usual category_id / segmentation:
+{"category_id": 1, "segmentation": [...], "attributes": {"ripeness": 2, "grade": 0}}
+```
+
+> The image above is a **simulation**: a stock photo with hand-placed detections
+> fed through the package's own renderer
+> ([`eomt.visualize.draw_instances`](src/eomt/visualize.py)) to show the output
+> format — not the predictions of a trained model. The same pattern fits any
+> "class **plus** per-instance sub-labels" task: **retail shelves → product +
+> facing**, **cells / leaves → type + health**, **apparel → garment + pattern**.
 
 ### How it works
 
@@ -128,19 +168,19 @@ Two additions to a standard COCO file:
 
 ```jsonc
 {
-  "categories": [ {"id": 3, "name": "..."}, {"id": 7, "name": "..."} ],
+  "categories": [ {"id": 1, "name": "apple"}, {"id": 2, "name": "banana"} ],
 
   "attributes": [                                       // NEW, top-level: per-head vocab(s)
-    {"name": "typology", "categories": [{"id": 0, "name": "scratch"},
-                                        {"id": 1, "name": "dent"}]},
-    {"name": "severity", "categories": [{"id": 10, "name": "low"},
-                                        {"id": 20, "name": "high"}]}
+    {"name": "ripeness", "categories": [{"id": 0, "name": "unripe"},
+                                        {"id": 1, "name": "ripe"}]},
+    {"name": "grade",    "categories": [{"id": 10, "name": "A"},
+                                        {"id": 20, "name": "B"}]}
   ],
 
   "annotations": [
-    { "id": 1, "image_id": 42, "category_id": 3,
+    { "id": 1, "image_id": 42, "category_id": 1,
       "segmentation": [...], "bbox": [...], "area": 1234, "iscrowd": 0,
-      "attributes": {"typology": 1, "severity": 20} }    // NEW, per instance: {head: raw_id}
+      "attributes": {"ripeness": 1, "grade": 20} }       // NEW, per instance: {head: raw_id}
   ]
 }
 ```
@@ -188,6 +228,13 @@ the legacy behaviour is one override away.
   `--llrd 1.0` reproduces the legacy flat `--backbone-lr-mult`.
 - **Throughput.** TF32 + cudnn autotuner on by default; `--compile` and
   `--seed` are available.
+- **Tunable objective.** The matcher/loss weights (`--class-weight`,
+  `--mask-weight`, `--dice-weight`, `--no-object-weight`), PointRend sampling
+  (`--train-num-points`) and mask-head depth (`--num-upscale-blocks`) are flags,
+  persisted in the checkpoint so a tuned objective rebuilds on reload. After
+  training, `eomt sweep` tunes the *inference* knobs (confidence/mask thresholds,
+  `--max-det`, min mask area) over the val set — sharing one forward per batch —
+  without retraining.
 
 Resuming a run (`--resume <run|ckpt>`) restores the epoch, optimizer, EMA, and
 `best_metric`, and recovers the dataset paths and architecture from the run's

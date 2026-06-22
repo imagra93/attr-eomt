@@ -59,6 +59,8 @@ def wrap_checkpoint(
     aux_heads: list | None = None,
     aux_head_arch: dict | None = None,
     letterbox: bool = False,
+    loss_weights: dict | None = None,
+    num_upscale_blocks: int | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
     """Build a metadata-wrapped checkpoint that :func:`load_model` can restore.
@@ -66,6 +68,11 @@ def wrap_checkpoint(
     ``aux_head_arch`` records the secondary-head network shape (``layers`` /
     ``hidden`` / ``dropout``) so an MLP head is rebuilt identically on reload —
     without it a non-linear head would be silently dropped by ``strict=False``.
+    ``loss_weights`` records the segmentation-loss/criterion weights so a tuned
+    objective is rebuilt on reload (the criterion is built once from the config, so
+    a bare reload would otherwise reset them to defaults). ``num_upscale_blocks``
+    records the mask-head depth, which is load-bearing for the ``upscale_block``
+    weight shapes.
     """
     checkpoint: dict[str, Any] = {
         "model": state_dict,
@@ -82,6 +89,10 @@ def wrap_checkpoint(
     }
     if aux_heads and aux_head_arch is not None:
         checkpoint["aux_head_arch"] = dict(aux_head_arch)
+    if loss_weights is not None:
+        checkpoint["loss_weights"] = dict(loss_weights)
+    if num_upscale_blocks is not None:
+        checkpoint["num_upscale_blocks"] = int(num_upscale_blocks)
     checkpoint.update({k: v for k, v in extra.items() if v is not None})
     return checkpoint
 
@@ -151,9 +162,21 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     # Rebuild the exact secondary-head shape. Checkpoints written before aux_head_arch
     # existed only ever had single Linear heads, so default to that for them.
     aux_head_arch = ckpt.get("aux_head_arch") or ({"layers": 1} if aux_heads else None)
+    # Restore the tuned criterion + mask-head depth. ``num_upscale_blocks`` changes
+    # the ``upscale_block`` weight shapes, so it must match the saved tensors for a
+    # clean load — recover it from the state dict when the metadata predates it.
+    loss_weights = ckpt.get("loss_weights")
+    num_upscale_blocks = ckpt.get("num_upscale_blocks") or _infer_num_upscale_blocks(state)
 
     model = build_model(
-        size, nc=nc, imgsz=imgsz, names=names, aux_heads=aux_heads, aux_head_arch=aux_head_arch
+        size,
+        nc=nc,
+        imgsz=imgsz,
+        names=names,
+        aux_heads=aux_heads,
+        aux_head_arch=aux_head_arch,
+        loss_weights=loss_weights,
+        num_upscale_blocks=num_upscale_blocks,
     )
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
@@ -203,6 +226,24 @@ def _infer_aux_heads(state: dict) -> list:
                     continue
                 specs.append(AuxHeadSpec(name=name, num_classes=int(tensor.shape[0])))
     return specs
+
+
+def _infer_num_upscale_blocks(state: dict) -> int | None:
+    """Recover the mask-head upscale depth by counting ``upscale_block.block.<i>`` indices.
+
+    Returns ``None`` when no upscale-block keys are present (let the size preset
+    default apply). Tolerates the ``eomt.`` prefix.
+    """
+    idxs = set()
+    for key in state:
+        for prefix in ("eomt.upscale_block.block.", "upscale_block.block."):
+            if key.startswith(prefix):
+                rest = key[len(prefix) :]
+                head = rest.split(".", 1)[0]
+                if head.isdigit():
+                    idxs.add(int(head))
+                break
+    return (max(idxs) + 1) if idxs else None
 
 
 def _infer_imgsz(state: dict, patch_size: int = 14) -> int:

@@ -73,6 +73,8 @@ def evaluate(
     num_workers: int = 4,
     conf_thres: float = 0.0,
     max_det: int = 100,
+    mask_thresh: float = 0.5,
+    min_mask_area: float = 0.0,
     amp: bool = False,
     also_bbox: bool = True,
     verbose: bool = True,
@@ -113,6 +115,8 @@ def evaluate(
                 conf_thres,
                 (orig_w, orig_h),
                 max_det=max_det,
+                mask_thresh=mask_thresh,
+                min_mask_area=min_mask_area,
                 preprocess_meta=meta,
             )
             n = res["num_detections"]
@@ -143,6 +147,102 @@ def evaluate(
     if also_bbox:
         metrics.update(_cocoeval(val_ds.coco, bbox_results, val_ds.ids, "bbox", verbose))
     return metrics
+
+
+@torch.no_grad()
+def sweep(
+    model,
+    val_ds,
+    *,
+    device,
+    grid: list[dict],
+    batch_size: int = 4,
+    num_workers: int = 4,
+    amp: bool = False,
+    also_bbox: bool = False,
+    verbose: bool = True,
+) -> list[dict]:
+    """Sweep postprocessing knobs over ``val_ds``, sharing one forward per batch.
+
+    ``grid`` is a list of knob dicts, each with any of ``conf_thres`` / ``mask_thresh``
+    / ``max_det`` / ``min_mask_area`` (missing keys take the postprocess defaults).
+    The model runs **once per batch**; every grid point re-runs only the (cheap)
+    postprocess + COCO encoding on the shared logits, so the expensive forward is
+    not repeated. Returns one row per grid point: ``{**knobs, **segm_metrics}``
+    (plus ``bbox/*`` when ``also_bbox``), in the same order as ``grid``.
+    """
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    model.eval()
+    use_amp = amp and device.type == "cuda"
+    contig2cat = val_ds.contig2cat
+
+    loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_val,
+        pin_memory=True,
+    )
+
+    # One result accumulator per grid point.
+    segm_results: list[list[dict]] = [[] for _ in grid]
+    bbox_results: list[list[dict]] = [[] for _ in grid]
+
+    for pixel_values, image_ids, sizes, metas in tqdm(
+        loader, desc="sweep", unit="batch", leave=False, disable=not verbose
+    ):
+        pixel_values = pixel_values.to(device)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            out = model(pixel_values)
+        mql = out["masks_queries_logits"]
+        cql = out["class_queries_logits"]
+
+        for b, (img_id, (orig_w, orig_h), meta) in enumerate(zip(image_ids, sizes, metas)):
+            single = {
+                "masks_queries_logits": mql[b : b + 1],
+                "class_queries_logits": cql[b : b + 1],
+            }
+            for gi, knobs in enumerate(grid):
+                res = postprocess_instance(
+                    single,
+                    knobs.get("conf_thres", 0.0),
+                    (orig_w, orig_h),
+                    max_det=int(knobs.get("max_det", 100)),
+                    mask_thresh=float(knobs.get("mask_thresh", 0.5)),
+                    min_mask_area=float(knobs.get("min_mask_area", 0.0)),
+                    preprocess_meta=meta,
+                )
+                for i in range(res["num_detections"]):
+                    cat_id = int(contig2cat[int(res["classes"][i])])
+                    score = float(res["scores"][i])
+                    segm_results[gi].append(
+                        {
+                            "image_id": int(img_id),
+                            "category_id": cat_id,
+                            "segmentation": _encode_mask(res["masks"][i].cpu().numpy()),
+                            "score": score,
+                        }
+                    )
+                    if also_bbox:
+                        x1, y1, x2, y2 = [float(v) for v in res["boxes"][i].tolist()]
+                        bbox_results[gi].append(
+                            {
+                                "image_id": int(img_id),
+                                "category_id": cat_id,
+                                "bbox": [x1, y1, x2 - x1, y2 - y1],
+                                "score": score,
+                            }
+                        )
+
+    rows: list[dict] = []
+    for gi, knobs in enumerate(grid):
+        row = dict(knobs)
+        row.update(_cocoeval(val_ds.coco, segm_results[gi], val_ds.ids, "segm", verbose=False))
+        if also_bbox:
+            row.update(_cocoeval(val_ds.coco, bbox_results[gi], val_ds.ids, "bbox", verbose=False))
+        rows.append(row)
+    return rows
 
 
 @torch.no_grad()

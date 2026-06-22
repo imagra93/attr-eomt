@@ -4,6 +4,11 @@
 # COCO is auto-downloaded by configs/coco.yaml if missing. Each run lands in
 # runs/train/eomt_<size>/ with weights/best.pt + weights/last.pt.
 #
+# Horizontal flips are ON (--flip-prob 0.5, the Mask2Former/EoMT default): plain
+# COCO has no per-instance left/right attribute, so flipping is safe and helps.
+# (For the vehicle-parts/laterality dataset use scripts/train_parts_large.sh,
+# which sets --flip-prob 0.)
+#
 # Usage:
 #   scripts/train_all_coco.sh                 # train s, b, l with defaults
 #   SIZES="s l" scripts/train_all_coco.sh     # subset of sizes
@@ -33,6 +38,7 @@ for size in $SIZES; do
     --size "$size" \
     --epochs "$EPOCHS" \
     --batch "${BATCH[$size]}" \
+    --flip-prob 0.5 \
     --device "$DEVICE" \
     --project "$PROJECT" \
     --name "eomt_${size}" \
