@@ -22,6 +22,10 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", default="coco", help="Dataset YAML path or alias ('coco' auto-downloads).")
     p.add_argument("--size", default="l", choices=["s", "b", "l"], help="Model size.")
+    p.add_argument(
+        "--task", default="instance", choices=["instance", "detect"],
+        help="Head family: 'instance' (mask segmentation) or 'detect' (boxes only).",
+    )
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch", type=int, default=4, help="Micro-batch size (per optimizer micro-step).")
     p.add_argument("--imgsz", type=int, default=644, help="Square input size (divisible by 14).")
@@ -34,13 +38,15 @@ def main() -> None:
     model = EoMT(args.weights or args.resume or args.size, device=args.device)
     result = model.train(
         data=args.data,
+        family=args.task,
         epochs=args.epochs,
         batch=args.batch,
         imgsz=args.imgsz,
         resume=bool(args.resume),
     )
     if result["best_metric"] >= 0:
-        print(f"[done] best segm mAP={result['best_metric']:.4f}; weights in {result['weights_dir']}")
+        metric = "bbox mAP" if args.task == "detect" else "segm mAP"
+        print(f"[done] best {metric}={result['best_metric']:.4f}; weights in {result['weights_dir']}")
     else:
         print(f"[done] weights in {result['weights_dir']}")
 

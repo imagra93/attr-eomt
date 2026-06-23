@@ -232,9 +232,29 @@ def test_gate_indices_iou_and_class():
     assert gate_indices(out, idx, mask_labels, class_labels, iou_thr=0.0, require_class=False) is idx
 
 
-def test_build_model_rejects_unimplemented_family():
-    with pytest.raises(NotImplementedError):
-        build_model("s", nc=NC, family="detect")
+def test_build_model_rejects_unknown_family():
+    with pytest.raises(ValueError):
+        build_model("s", nc=NC, family="banana")
+
+
+def test_detect_family_forward_and_loss():
+    """The detect family emits per-query boxes in [0,1] and a finite training loss."""
+    model = build_model("s", nc=NC, imgsz=224, family="detect")
+    assert model.family == "detect"
+    x = torch.randn(2, 3, 224, 224)
+    model.eval()
+    with torch.no_grad():
+        out = model(x)
+    boxes = out["pred_boxes"]
+    assert boxes.shape == (2, model.config.num_queries, 4)
+    assert float(boxes.min()) >= 0.0 and float(boxes.max()) <= 1.0
+    assert "masks_queries_logits" not in out
+
+    box_labels = [torch.rand(2, 4) * 0.5 + 0.25, torch.rand(1, 4) * 0.5 + 0.25]
+    class_labels = [torch.tensor([0, 1]), torch.tensor([2])]
+    model.train()
+    out = model(x, box_labels=box_labels, class_labels=class_labels)
+    assert torch.isfinite(out["loss"])
 
 
 # --- training-recipe improvements -------------------------------------------

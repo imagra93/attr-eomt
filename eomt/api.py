@@ -24,6 +24,7 @@ import torch
 from .config import SIZES
 from .data import CocoValImages, load_data_config
 from .engine import evaluate as _evaluate
+from .engine import evaluate_detection as _evaluate_detection
 from .engine import predict as _predict
 from .engine import train as _train
 from .model import build_model, load_dinov2_backbone
@@ -133,7 +134,11 @@ class EoMT:
     # -------------------------------------------------------------------- val
     def val(self, data: str | Path = "coco", *, batch: int = 4, workers: int = 4,
             conf_thres: float = 0.0, max_det: int = 100, letterbox: bool | None = None, **kw) -> dict:
-        """Evaluate on a dataset's val split, returning COCO segm/bbox mAP metrics."""
+        """Evaluate on a dataset's val split, returning COCO mAP metrics.
+
+        Segmentation models report ``segm/*`` (+ ``bbox/*``); detection
+        (``family="detect"``) models report ``bbox/*`` only.
+        """
         cfg = _resolve_data(data)
         if not (cfg["val_images"] and cfg["val_json"]):
             raise ValueError(f"dataset {data!r} has no val split (val_images/val_json).")
@@ -142,7 +147,8 @@ class EoMT:
         dev = next(model.parameters()).device
         lb = letterbox if letterbox is not None else bool(getattr(model, "preprocess_letterbox", False))
         val_ds = CocoValImages(cfg["val_images"], cfg["val_json"], imgsz=int(model.image_size), letterbox=lb)
-        return _evaluate(
+        eval_fn = _evaluate_detection if getattr(model, "family", "instance") == "detect" else _evaluate
+        return eval_fn(
             model, val_ds, device=dev, batch_size=batch, num_workers=workers,
             conf_thres=conf_thres, max_det=max_det, **kw,
         )
@@ -168,6 +174,7 @@ class EoMT:
         ckpt = wrap_checkpoint(
             m.state_dict(),
             size=m.size, nc=m.nc, imgsz=m.image_size, names=m.names,
+            task=getattr(m, "family", "instance"),
             aux_heads=m.aux_specs, aux_head_arch=m.aux_head_arch,
             letterbox=bool(getattr(m, "preprocess_letterbox", False)),
             loss_weights=m.loss_weights, num_upscale_blocks=m.num_upscale_blocks,

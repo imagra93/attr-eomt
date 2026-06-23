@@ -158,6 +158,9 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     nc = int(ckpt.get("nc") or _infer_nc(state))
     imgsz = int(ckpt.get("imgsz") or _infer_imgsz(state))
     names = ckpt.get("names")
+    # Head family ("instance" | "detect") is recorded in ``task``; fall back to the
+    # state dict (a box head has ``eomt.box_head.*`` keys, masks have ``eomt.mask_head.*``).
+    family = ckpt.get("task") or _infer_family(state)
     aux_heads = aux_specs_from_meta(ckpt.get("aux_heads")) or _infer_aux_heads(state)
     # Rebuild the exact secondary-head shape. Checkpoints written before aux_head_arch
     # existed only ever had single Linear heads, so default to that for them.
@@ -173,6 +176,7 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
         nc=nc,
         imgsz=imgsz,
         names=names,
+        family=family,
         aux_heads=aux_heads,
         aux_head_arch=aux_head_arch,
         loss_weights=loss_weights,
@@ -201,6 +205,13 @@ def _infer_size(state: dict) -> str:
             if size:
                 return size
     raise ValueError("could not infer model size from state dict.")
+
+
+def _infer_family(state: dict) -> str:
+    """Recover the head family from the state dict: box head -> detect, else instance."""
+    if any(k.startswith(("eomt.box_head.", "box_head.")) for k in state):
+        return "detect"
+    return "instance"
 
 
 def _infer_nc(state: dict) -> int:

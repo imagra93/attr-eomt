@@ -17,10 +17,16 @@ import torch.nn.functional as F  # noqa: N812
 
 
 @torch.no_grad()
-def match_queries(model, out: dict, mask_labels, class_labels):
-    """Hungarian query→GT indices from EoMT's matcher (list of ``(src, tgt)``)."""
+def match_queries(model, out: dict, geom_labels, class_labels):
+    """Hungarian query→GT indices from EoMT's matcher (list of ``(src, tgt)``).
+
+    ``geom_labels`` is the GT geometry for the model's family — instance masks for the
+    ``"instance"`` family, normalized ``cxcywh`` boxes for ``"detect"``. The right
+    matcher (mask-cost or box-cost) is selected by what the model emitted in ``out``.
+    """
+    geom = out["pred_boxes"] if "pred_boxes" in out else out["masks_queries_logits"]
     return model.eomt.criterion.matcher(
-        out["masks_queries_logits"], out["class_queries_logits"], mask_labels, class_labels
+        geom, out["class_queries_logits"], geom_labels, class_labels
     )
 
 
@@ -42,7 +48,7 @@ def _gather_matched(out: dict, indices):
 def gate_indices(
     out: dict,
     indices,
-    mask_labels,
+    geom_labels,
     class_labels,
     *,
     iou_thr: float = 0.5,
@@ -50,21 +56,22 @@ def gate_indices(
 ):
     """Keep only well-localized (and optionally correctly-classified) matched pairs.
 
-    The Hungarian matcher assigns *every* GT a query, even one whose predicted mask
-    barely overlaps it (common early in training). For attribute supervision we want
-    queries that actually localize the instance, so we drop matched ``(src, tgt)``
-    pairs where the predicted-mask↔GT-mask IoU is ``< iou_thr``. With ``require_class``
-    we also drop pairs whose predicted primary class ≠ the GT class. Returns the same
-    ``[(src, tgt), ...]`` structure with each pair filtered (possibly to empty).
+    The Hungarian matcher assigns *every* GT a query, even one whose prediction barely
+    overlaps it (common early in training). For attribute supervision we want queries
+    that actually localize the instance, so we drop matched ``(src, tgt)`` pairs whose
+    predicted↔GT IoU is ``< iou_thr`` (mask IoU for the instance family, box IoU for
+    detect). With ``require_class`` we also drop pairs whose predicted primary class ≠
+    the GT class. Returns the same ``[(src, tgt), ...]`` structure with each pair
+    filtered (possibly to empty).
 
     A no-op (returns ``indices`` unchanged) when ``iou_thr <= 0`` and not
     ``require_class`` — i.e. the pre-gate behaviour.
     """
     if iou_thr <= 0 and not require_class:
         return indices
-    masks = out["masks_queries_logits"]  # [B, Q, h, w]
+    is_detect = "pred_boxes" in out
     cls = out["class_queries_logits"]  # [B, Q, C+1]
-    dev = masks.device
+    dev = cls.device
     gated = []
     for b, (src, tgt) in enumerate(indices):
         src = src.to(dev)
@@ -74,21 +81,31 @@ def gate_indices(
             continue
         keep = torch.ones(src.numel(), dtype=torch.bool, device=dev)
         if iou_thr > 0:
-            pm = masks[b, src].sigmoid() > 0.5  # [n, h, w]
-            gm = mask_labels[b][tgt].to(dev).float()  # [n, H, W] in {0, 1}
-            if gm.shape[-2:] != pm.shape[-2:]:
-                gm = F.interpolate(
-                    gm.unsqueeze(1), size=pm.shape[-2:], mode="nearest"
-                ).squeeze(1)
-            gm = gm > 0.5
-            inter = (pm & gm).flatten(1).sum(1).float()
-            union = (pm | gm).flatten(1).sum(1).float().clamp(min=1.0)
-            keep &= (inter / union) >= iou_thr
+            keep &= _localization_iou(out, b, src, tgt, geom_labels, is_detect, dev) >= iou_thr
         if require_class:
             pred_cls = cls[b, src].argmax(-1)
             keep &= pred_cls == class_labels[b][tgt].to(dev)
         gated.append((src[keep], tgt[keep]))
     return gated
+
+
+def _localization_iou(out, b, src, tgt, geom_labels, is_detect, dev):
+    """Per-pair predicted↔GT IoU for the matched queries (box IoU or mask IoU)."""
+    if is_detect:
+        from .box_loss import box_cxcywh_to_xyxy, box_iou
+
+        pred = box_cxcywh_to_xyxy(out["pred_boxes"][b, src].to(dev))  # [n, 4]
+        gt = box_cxcywh_to_xyxy(geom_labels[b][tgt].to(dev).float())  # [n, 4]
+        return box_iou(pred, gt)[0].diagonal()  # per-matched-pair IoU
+    masks = out["masks_queries_logits"]  # [B, Q, h, w]
+    pm = masks[b, src].sigmoid() > 0.5  # [n, h, w]
+    gm = geom_labels[b][tgt].to(dev).float()  # [n, H, W] in {0, 1}
+    if gm.shape[-2:] != pm.shape[-2:]:
+        gm = F.interpolate(gm.unsqueeze(1), size=pm.shape[-2:], mode="nearest").squeeze(1)
+    gm = gm > 0.5
+    inter = (pm & gm).flatten(1).sum(1).float()
+    union = (pm | gm).flatten(1).sum(1).float().clamp(min=1.0)
+    return inter / union
 
 
 def aux_loss(

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..postprocess import postprocess_instance
+from ..postprocess import postprocess_detection, postprocess_instance
 from ..preprocess import preprocess_numpy
 from ..serialization import load_model
 from ..visualize import draw_instances
@@ -36,11 +36,20 @@ def predict_image(
     mask_thresh: float = 0.5,
     letterbox: bool = True,
 ) -> dict:
-    """Run the model on one PIL image and return a ``postprocess_instance`` dict."""
+    """Run the model on one PIL image and return a postprocess dict.
+
+    Returns a box-only :func:`~eomt.postprocess.postprocess_detection` dict for
+    ``family="detect"`` models, else a :func:`~eomt.postprocess.postprocess_instance`
+    dict (with masks).
+    """
     orig_w, orig_h = image.size
     chw, meta = preprocess_numpy(np.array(image.convert("RGB")), imgsz, letterbox=letterbox)
     tensor = torch.from_numpy(chw).unsqueeze(0).to(device)
     out = model(tensor)
+    if getattr(model, "family", "instance") == "detect":
+        return postprocess_detection(
+            out, conf_thres, (orig_w, orig_h), max_det=max_det, preprocess_meta=meta,
+        )
     return postprocess_instance(
         out, conf_thres, (orig_w, orig_h), max_det=max_det,
         mask_thresh=mask_thresh, preprocess_meta=meta,

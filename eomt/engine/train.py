@@ -27,13 +27,13 @@ from ..aux_cls import (
     match_queries,
 )
 from ..config import normalize_loss_weights
-from ..data import CocoInstanceSeg, CocoValImages, collate_train
+from ..data import CocoDetection, CocoInstanceSeg, CocoValImages, collate_train
 from ..data.transforms import build_val_transform
 from ..ema import ModelEMA, _unwrap
 from ..model import build_model, load_dinov2_backbone
 from ..plotting import plot_aux_per_class, plot_metrics_csv
 from ..serialization import load_raw, resolve_checkpoint, save_checkpoint, wrap_checkpoint
-from .validate import _SEGM_KEYS, aux_evaluate, evaluate
+from .validate import _SEGM_KEYS, aux_evaluate, evaluate, evaluate_detection
 
 _ENCODER_PREFIXES = ("eomt.embeddings", "eomt.layers", "eomt.layernorm")
 # Parameters excluded from weight decay regardless of group: all 1-D tensors
@@ -250,6 +250,7 @@ def train(
     val_images: str | None = None,
     val_json: str | None = None,
     size: str = "l",
+    family: str = "instance",
     imgsz: int = 644,
     epochs: int = 50,
     batch: int = 4,
@@ -302,6 +303,8 @@ def train(
     train_num_points: int = 12544,
     oversample_ratio: float = 3.0,
     importance_sample_ratio: float = 0.75,
+    l1_weight: float = 5.0,
+    giou_weight: float = 2.0,
     num_upscale_blocks: int | None = None,
     logger: str = "none",
     resume: str | None = None,
@@ -358,9 +361,10 @@ def train(
         resume_path = resolve_checkpoint(resume, prefer="last")
         resume_ckpt = load_raw(resume_path)
         size = resume_ckpt.get("size", size)
+        family = resume_ckpt.get("task", family)
         if resume_ckpt.get("imgsz"):
             imgsz = int(resume_ckpt["imgsz"])
-        print(f"[resume] checkpoint {resume_path} (size={size}, imgsz={imgsz})")
+        print(f"[resume] checkpoint {resume_path} (size={size}, family={family}, imgsz={imgsz})")
 
     # Warm start (fine-tune): recover the architecture from the checkpoint here so
     # the model is built to match, but the trainer state (epoch/optimizer/EMA/best)
@@ -370,6 +374,7 @@ def train(
         init_path = resolve_checkpoint(init_weights, prefer="best")
         init_ckpt = load_raw(init_path)
         size = init_ckpt.get("size", size)
+        family = init_ckpt.get("task", family)
         if init_ckpt.get("imgsz"):
             imgsz = int(init_ckpt["imgsz"])
         print(
@@ -406,8 +411,19 @@ def train(
     # the whole point is to retrain with a tuned objective — but inherits the
     # checkpoint's num_upscale_blocks because it is architecture-bound (the saved
     # upscale_block tensors must match the rebuilt head).
-    loss_weights = normalize_loss_weights(
-        {
+    is_detect = family == "detect"
+    if is_detect:
+        # Box head has no masks to focus attention on — masked-attention annealing
+        # is inert; force it off so the (instance-only) buffer logic is skipped.
+        mask_anneal = False
+        cli_loss_weights = {
+            "no_object_weight": no_object_weight,
+            "class_weight": class_weight,
+            "l1_weight": l1_weight,
+            "giou_weight": giou_weight,
+        }
+    else:
+        cli_loss_weights = {
             "no_object_weight": no_object_weight,
             "class_weight": class_weight,
             "mask_weight": mask_weight,
@@ -416,15 +432,16 @@ def train(
             "oversample_ratio": oversample_ratio,
             "importance_sample_ratio": importance_sample_ratio,
         }
-    )
+    loss_weights = normalize_loss_weights(cli_loss_weights, family=family)
     if resume_ckpt is not None:
-        loss_weights = normalize_loss_weights(resume_ckpt.get("loss_weights"))
+        loss_weights = normalize_loss_weights(resume_ckpt.get("loss_weights"), family=family)
         num_upscale_blocks = resume_ckpt.get("num_upscale_blocks", num_upscale_blocks)
     elif init_ckpt is not None and init_ckpt.get("num_upscale_blocks") is not None:
         num_upscale_blocks = int(init_ckpt["num_upscale_blocks"])
 
     # --- data ---
-    train_ds = CocoInstanceSeg(
+    Dataset = CocoDetection if is_detect else CocoInstanceSeg
+    train_ds = Dataset(
         train_images,
         train_json,
         imgsz=imgsz,
@@ -457,10 +474,10 @@ def train(
     if val_images and val_json:
         val_ds = CocoValImages(val_images, val_json, imgsz=imgsz, letterbox=letterbox)
         print(f"[data] val:   {len(val_ds)} images")
-        # Held-out aux accuracy needs GT masks/attrs in the train id space: a
-        # deterministic (no-crop) seg view of the val split, sharing train's maps.
+        # Held-out aux accuracy needs GT geometry/attrs in the train id space: a
+        # deterministic (no-crop) view of the val split, sharing train's maps.
         if aux_specs:
-            val_seg_ds = CocoInstanceSeg(
+            val_seg_ds = Dataset(
                 val_images,
                 val_json,
                 imgsz=imgsz,
@@ -476,6 +493,7 @@ def train(
         run_dir / "args.yaml",
         {
             "size": size,
+            "family": family,
             "imgsz": imgsz,
             "nc": nc,
             "train_images": train_images,
@@ -530,6 +548,7 @@ def train(
         nc=nc,
         imgsz=imgsz,
         names=names,
+        family=family,
         aux_heads=aux_specs,
         aux_head_arch=aux_head_arch,
         loss_weights=loss_weights,
@@ -599,7 +618,7 @@ def train(
             nc=nc,
             imgsz=imgsz,
             names=names,
-            task="instance",
+            task=family,
             aux_heads=aux_specs,
             aux_head_arch=aux_head_arch,
             letterbox=letterbox,
@@ -613,7 +632,8 @@ def train(
     csv_fields = ["epoch", "train/loss"]
     csv_fields += [f"train/aux_acc/{s.name}" for s in aux_specs]
     if val_ds is not None:
-        csv_fields += [f"val/segm/{k}" for k in _SEGM_KEYS]
+        if not is_detect:
+            csv_fields += [f"val/segm/{k}" for k in _SEGM_KEYS]
         csv_fields += [f"val/bbox/{k}" for k in _SEGM_KEYS]
         csv_fields += [f"val/aux_acc/{s.name}" for s in aux_specs]
     csv_log = _CsvLogger(run_dir / "metrics.csv", csv_fields)
@@ -632,7 +652,7 @@ def train(
         # per-primary-class aux accuracy (only accumulated as the no-val fallback)
         aux_pc: dict[str, dict[int, list[int]]] = {s.name: {} for s in aux_specs}
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs - 1}", unit="batch")
-        for step, (pixel_values, mask_labels, class_labels, aux_labels) in enumerate(pbar):
+        for step, (pixel_values, geom_labels, class_labels, aux_labels) in enumerate(pbar):
             it = epoch * iters_per_epoch + step
             factor = _lr_factor(it, total_iters, warmup_iters, warmup_start_factor, min_lr_ratio)
             for g in optimizer.param_groups:
@@ -643,7 +663,7 @@ def train(
                 core.eomt.attn_mask_probs.fill_(p)
 
             pixel_values = pixel_values.to(dev)
-            mask_labels = [m.to(dev) for m in mask_labels]
+            geom_labels = [g.to(dev) for g in geom_labels]
             class_labels = [c.to(dev) for c in class_labels]
             aux_labels = {k: [t.to(dev) for t in v] for k, v in aux_labels.items()}
 
@@ -653,20 +673,23 @@ def train(
             if step % accum_steps == 0:
                 optimizer.zero_grad(set_to_none=True)
             aux_gated = None
+            # ``geom_labels`` carries instance masks (instance family) or normalized
+            # cxcywh boxes (detect family); route it to the matching forward kwarg.
+            geom_kw = {"box_labels": geom_labels} if is_detect else {"mask_labels": geom_labels}
             with torch.amp.autocast("cuda", enabled=amp and dev.type == "cuda"):
-                out = model(pixel_values, mask_labels=mask_labels, class_labels=class_labels)
+                out = model(pixel_values, class_labels=class_labels, **geom_kw)
                 loss = out["loss"]
                 if aux_specs:
                     # Match once per step, then gate to well-localized (IoU) and
                     # correctly-classified queries so the attribute trains only on
                     # instances the detector actually got right. Reuse for accuracy.
-                    aux_indices = match_queries(model, out, mask_labels, class_labels)
+                    aux_indices = match_queries(model, out, geom_labels, class_labels)
                     aux_gated = gate_indices(
-                        out, aux_indices, mask_labels, class_labels,
+                        out, aux_indices, geom_labels, class_labels,
                         iou_thr=aux_iou_gate, require_class=aux_class_gate,
                     )
                     a_loss, _ = aux_loss(
-                        model, out, mask_labels, class_labels, aux_labels,
+                        model, out, geom_labels, class_labels, aux_labels,
                         weights=aux_w_per_head, indices=aux_gated,
                         class_weights=aux_class_weight,
                     )
@@ -684,17 +707,17 @@ def train(
 
             if aux_specs:
                 for name, (hit, tot) in aux_accuracy(
-                    model, out, mask_labels, class_labels, aux_labels, indices=aux_gated
+                    model, out, geom_labels, class_labels, aux_labels, indices=aux_gated
                 ).items():
                     aux_hits[name] += hit
                     aux_tot[name] += tot
                 if track_pc_train:  # per-primary diagnostic when there is no val set
                     iou_only = gate_indices(
-                        out, aux_indices, mask_labels, class_labels,
+                        out, aux_indices, geom_labels, class_labels,
                         iou_thr=aux_iou_gate, require_class=False,
                     )
                     for name, buckets in aux_accuracy_by_primary(
-                        model, out, mask_labels, class_labels, aux_labels, indices=iou_only
+                        model, out, geom_labels, class_labels, aux_labels, indices=iou_only
                     ).items():
                         for cls_id, (c, t) in buckets.items():
                             acc = aux_pc[name].setdefault(cls_id, [0, 0])
@@ -744,22 +767,27 @@ def train(
         metrics = {}
         epoch_aux_pc: dict[str, dict[int, tuple[int, int]]] | None = None
         if val_ds is not None and (epoch + 1) % val_interval == 0:
-            metrics = evaluate(
-                eval_model,
-                val_ds,
-                device=dev,
-                batch_size=batch,
-                num_workers=workers,
-                conf_thres=conf_thres,
-                max_det=max_det,
-                amp=amp,
-                verbose=True,
-            )
-            print(
-                f"[epoch {epoch}] segm mAP {metrics.get('segm/mAP', 0):.4f} "
-                f"mAP50 {metrics.get('segm/mAP50', 0):.4f} "
-                f"bbox mAP {metrics.get('bbox/mAP', 0):.4f}"
-            )
+            if is_detect:
+                metrics = evaluate_detection(
+                    eval_model, val_ds, device=dev, batch_size=batch,
+                    num_workers=workers, conf_thres=conf_thres, max_det=max_det,
+                    amp=amp, verbose=True,
+                )
+                print(
+                    f"[epoch {epoch}] bbox mAP {metrics.get('bbox/mAP', 0):.4f} "
+                    f"mAP50 {metrics.get('bbox/mAP50', 0):.4f}"
+                )
+            else:
+                metrics = evaluate(
+                    eval_model, val_ds, device=dev, batch_size=batch,
+                    num_workers=workers, conf_thres=conf_thres, max_det=max_det,
+                    amp=amp, verbose=True,
+                )
+                print(
+                    f"[epoch {epoch}] segm mAP {metrics.get('segm/mAP', 0):.4f} "
+                    f"mAP50 {metrics.get('segm/mAP50', 0):.4f} "
+                    f"bbox mAP {metrics.get('bbox/mAP', 0):.4f}"
+                )
             if val_seg_ds is not None:  # held-out matched-query accuracy per head
                 val_aux, epoch_aux_pc = aux_evaluate(
                     eval_model, val_seg_ds, device=dev, batch_size=batch,
@@ -778,11 +806,12 @@ def train(
         # last.pt holds the live weights + trainer state (optimizer/EMA) for resume;
         # best.pt holds the eval weights (EMA when enabled) for inference.
         _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True)
-        cur = metrics.get("segm/mAP", None)
+        best_key = "bbox/mAP" if is_detect else "segm/mAP"
+        cur = metrics.get(best_key, None)
         if cur is not None and cur > best_metric:
             best_metric = cur
             _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False)
-            print(f"[epoch {epoch}] new best segm mAP {best_metric:.4f} -> best.pt")
+            print(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
 
         # --- per-epoch metrics row (missing values -> nan) ---
         row = {"epoch": epoch, "train/loss": epoch_loss}
