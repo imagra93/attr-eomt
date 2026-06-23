@@ -1,0 +1,37 @@
+{
+  "info": {"description": "attr-eomt sample dataset (val) - schema demo only"},
+  "images": [
+    {"id": 1, "file_name": "img_0101.jpg", "width": 100, "height": 100}
+  ],
+  "categories": [
+    {"id": 1, "name": "apple"},
+    {"id": 2, "name": "banana"},
+    {"id": 3, "name": "orange"},
+    {"id": 4, "name": "pear"}
+  ],
+  "attributes": [
+    {"name": "ripeness", "categories": [
+      {"id": 0, "name": "unripe"},
+      {"id": 1, "name": "turning"},
+      {"id": 2, "name": "ripe"}
+    ]},
+    {"name": "grade", "categories": [
+      {"id": 10, "name": "A"},
+      {"id": 20, "name": "B"}
+    ]}
+  ],
+  "annotations": [
+    {
+      "id": 1, "image_id": 1, "category_id": 4, "iscrowd": 0,
+      "bbox": [15, 15, 35, 35], "area": 1225,
+      "segmentation": [[15, 15, 50, 15, 50, 50, 15, 50]],
+      "attributes": {"ripeness": 2, "grade": 10}
+    },
+    {
+      "id": 2, "image_id": 1, "category_id": 3, "iscrowd": 0,
+      "bbox": [60, 55, 25, 30], "area": 750,
+      "segmentation": [[60, 55, 85, 55, 85, 85, 60, 85]],
+      "attributes": {"ripeness": 1, "grade": 20}
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-"""CPU, no-network smoke tests for the libre-eomt package."""
+"""CPU, no-network smoke tests for the attr-eomt package."""
 
 from __future__ import annotations
 
@@ -355,6 +355,70 @@ def test_letterbox_inverse_crops_content_not_padding():
     pos_padding[:, 5:, :] = 10.0  # active only in the padding region
     out2 = _masks_to_original(pos_padding, 10, 40, meta)
     assert not (out2.sigmoid() > 0.5).any()  # padding is cropped away
+
+
+def test_loss_weights_thread_into_criterion():
+    """Tuned loss weights / num_upscale_blocks reach the HF criterion and mask head."""
+    lw = {"no_object_weight": 0.05, "dice_weight": 8.0, "train_num_points": 24576}
+    model = build_model("s", nc=NC, imgsz=IMGSZ, loss_weights=lw, num_upscale_blocks=3)
+    crit = model.eomt.criterion
+    assert float(crit.eos_coef) == 0.05
+    assert float(crit.empty_weight[-1]) == pytest.approx(0.05)
+    assert crit.num_points == 24576
+    assert crit.matcher.cost_dice == 8.0
+    assert model.eomt.weight_dict["loss_dice"] == 8.0
+    assert model.num_upscale_blocks == 3
+    n_blocks = len([k for k in model.state_dict()
+                    if k.startswith("eomt.upscale_block.block.") and k.endswith(".conv1.weight")])
+    assert n_blocks == 3
+    # Unknown keys are rejected early.
+    with pytest.raises(ValueError):
+        build_model("s", nc=NC, imgsz=IMGSZ, loss_weights={"bogus": 1.0})
+
+
+def test_loss_weights_checkpoint_roundtrip(tmp_path):
+    """A tuned objective + non-default mask-head depth rebuilds identically on reload."""
+    import warnings
+
+    from eomt.serialization import load_model, save_checkpoint, wrap_checkpoint
+
+    lw = {"no_object_weight": 0.05, "dice_weight": 8.0, "train_num_points": 24576}
+    model = build_model("s", nc=NC, imgsz=IMGSZ, loss_weights=lw, num_upscale_blocks=3).eval()
+    ckpt = wrap_checkpoint(
+        model.state_dict(), size="s", nc=NC, imgsz=IMGSZ,
+        loss_weights=model.loss_weights, num_upscale_blocks=model.num_upscale_blocks,
+    )
+    assert ckpt["loss_weights"]["no_object_weight"] == 0.05
+    assert ckpt["num_upscale_blocks"] == 3
+    path = tmp_path / "m.pt"
+    save_checkpoint(ckpt, path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loaded = load_model(path, device="cpu")
+    msgs = [str(w.message) for w in caught]
+    assert not any("missing" in m or "unexpected" in m for m in msgs), msgs
+    crit = loaded.eomt.criterion
+    assert float(crit.eos_coef) == 0.05 and crit.num_points == 24576
+    assert crit.matcher.cost_dice == 8.0 and loaded.num_upscale_blocks == 3
+
+
+def test_old_checkpoint_without_loss_metadata_loads(tmp_path):
+    """A checkpoint predating loss_weights/num_upscale_blocks loads cleanly (defaults + inferred)."""
+    import warnings
+
+    from eomt.serialization import _infer_num_upscale_blocks, load_model, save_checkpoint
+
+    model = build_model("s", nc=NC, imgsz=IMGSZ).eval()
+    sd = model.state_dict()
+    assert _infer_num_upscale_blocks(sd) == 2
+    save_checkpoint({"model": sd, "size": "s", "nc": NC, "imgsz": IMGSZ}, tmp_path / "old.pt")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loaded = load_model(tmp_path / "old.pt", device="cpu")
+    msgs = [str(w.message) for w in caught]
+    assert not any("missing" in m or "unexpected" in m for m in msgs), msgs
+    assert float(loaded.eomt.criterion.eos_coef) == 0.1  # default restored
+    assert loaded.num_upscale_blocks == 2
 
 
 def test_checkpoint_stores_letterbox_mode(tmp_path):
