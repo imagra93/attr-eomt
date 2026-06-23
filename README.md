@@ -1,4 +1,4 @@
-# libre-eomt
+# attr-eomt
 
 Standalone **EoMT** (Encoder-only Mask Transformer) for **instance segmentation**,
 with one feature that sets it apart: **secondary per-instance classification heads**
@@ -6,6 +6,9 @@ with one feature that sets it apart: **secondary per-instance classification hea
 **one or several independent attributes for every detected instance** — and they
 train and infer for free on top of segmentation, without inflating the primary
 class space.
+
+The name reflects exactly that: **attr-eomt** is EoMT extended with per-instance
+**attr**ibute heads.
 
 EoMT itself is a DINOv2-with-registers ViT whose last few transformer blocks are
 augmented with learnable queries producing mask-classification output

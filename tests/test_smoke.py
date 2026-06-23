@@ -1,4 +1,4 @@
-"""CPU, no-network smoke tests for the libre-eomt package."""
+"""CPU, no-network smoke tests for the attr-eomt package."""
 
 from __future__ import annotations
 

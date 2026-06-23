@@ -23,7 +23,7 @@ SCHEMA_VERSION = "1.0"
 def get_version() -> str:
     """Return the installed package version, with an editable-install fallback."""
     try:
-        return version("libre-eomt")
+        return version("attr-eomt")
     except PackageNotFoundError:
         return "0.0.0.dev0"
 

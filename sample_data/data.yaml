@@ -1,4 +1,4 @@
-# Minimal example dataset for libre-eomt.
+# Minimal example dataset for attr-eomt.
 #
 # Same schema as configs/coco.yaml. Paths are relative to `path` (which is itself
 # relative to THIS file, or absolute). `path: .` therefore means "this folder".

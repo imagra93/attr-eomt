@@ -1,6 +1,6 @@
 # Sample dataset
 
-A tiny, illustrative COCO-format dataset showing how libre-eomt reads data —
+A tiny, illustrative COCO-format dataset showing how attr-eomt reads data —
 including the **secondary per-instance classification** (attributes) extension.
 
 ```

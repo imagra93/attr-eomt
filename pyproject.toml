@@ -3,13 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "libre-eomt"
+name = "attr-eomt"
 version = "0.1.0"
 description = "Standalone EoMT (Encoder-only Mask Transformer) for instance segmentation, with DINOv2 init, COCO training/validation and inference."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-authors = [{ name = "libre-eomt contributors" }]
+authors = [{ name = "attr-eomt contributors" }]
 keywords = ["eomt", "dinov2", "instance-segmentation", "transformers", "coco"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -35,7 +35,7 @@ logging = ["tensorboard>=2.10", "wandb>=0.15"]
 dev = ["pytest>=7.0"]
 
 [project.urls]
-Homepage = "https://github.com/imagra93/libre-eomt"
+Homepage = "https://github.com/imagra93/attr-eomt"
 
 [tool.hatch.build.targets.wheel]
 packages = ["eomt"]

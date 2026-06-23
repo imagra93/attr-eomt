@@ -227,7 +227,7 @@ class _Logger:
             import wandb
 
             self.writer = wandb
-            wandb.init(project="libre-eomt", name=run_name, dir=str(logdir))
+            wandb.init(project="attr-eomt", name=run_name, dir=str(logdir))
 
     def log(self, scalars: dict, step: int):
         if self.kind == "tensorboard" and self.writer is not None:

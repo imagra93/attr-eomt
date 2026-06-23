@@ -1,4 +1,4 @@
-"""libre-eomt: standalone EoMT instance segmentation.
+"""attr-eomt: standalone EoMT instance segmentation.
 
 Public API:
 
@@ -46,6 +46,6 @@ __all__ = [
 try:  # pragma: no cover
     from importlib.metadata import PackageNotFoundError, version
 
-    __version__ = version("libre-eomt")
+    __version__ = version("attr-eomt")
 except PackageNotFoundError:  # pragma: no cover
     __version__ = "0.0.0.dev0"

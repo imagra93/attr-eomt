@@ -1,5 +1,5 @@
 {
-  "info": {"description": "libre-eomt sample dataset (val) - schema demo only"},
+  "info": {"description": "attr-eomt sample dataset (val) - schema demo only"},
   "images": [
     {"id": 1, "file_name": "img_0101.jpg", "width": 100, "height": 100}
   ],
