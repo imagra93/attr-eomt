@@ -1,4 +1,4 @@
-# libre-eomt
+# deep-eomt
 
 Standalone **EoMT** (Encoder-only Mask Transformer) for **instance segmentation**,
 extracted into a small installable package. It builds the architecture in three
