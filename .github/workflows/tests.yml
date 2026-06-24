@@ -20,13 +20,13 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+      - name: Create venv on Python ${{ matrix.python-version }}
+        run: uv venv --python ${{ matrix.python-version }}
 
       - name: Install project (CPU torch)
         env:
           UV_TORCH_BACKEND: cpu
-        run: uv pip install --system -e ".[dev]"
+        run: uv pip install -e ".[dev]"
 
       - name: Run tests
-        run: pytest -q
+        run: uv run --no-sync pytest -q
