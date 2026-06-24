@@ -344,6 +344,8 @@ class CocoValImages(Dataset):
         imgsz: int = 644,
         *,
         letterbox: bool = True,
+        mean=None,
+        std=None,
         attributes: list[str] | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
     ):
@@ -352,6 +354,8 @@ class CocoValImages(Dataset):
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
         self.letterbox = letterbox
+        self.mean = mean
+        self.std = std
         self.coco = COCO(str(json_file))
         self.cat2contig, self.contig2cat, self.names, self.num_classes = (
             _build_category_maps(self.coco)
@@ -373,7 +377,9 @@ class CocoValImages(Dataset):
         info = self.coco.loadImgs(img_id)[0]
         img = Image.open(self.img_dir / info["file_name"]).convert("RGB")
         orig_w, orig_h = img.size
-        chw, meta = preprocess_numpy(np.array(img), self.imgsz, letterbox=self.letterbox)
+        chw, meta = preprocess_numpy(
+            np.array(img), self.imgsz, letterbox=self.letterbox, mean=self.mean, std=self.std,
+        )
         return torch.from_numpy(chw), int(img_id), orig_w, orig_h, meta
 
 

@@ -19,16 +19,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import torch
-
 from .config import SIZES
 from .data import CocoValImages, load_data_config
+from .device import resolve_device
 from .engine import evaluate as _evaluate
 from .engine import evaluate_detection as _evaluate_detection
 from .engine import predict as _predict
 from .engine import train as _train
 from .model import build_model, load_dinov2_backbone
-from .serialization import is_hf_ref, load_model, save_checkpoint, wrap_checkpoint
+from .serialization import (
+    format_summary,
+    is_hf_ref,
+    load_model,
+    save_checkpoint,
+    summarize_checkpoint,
+    wrap_checkpoint,
+)
 
 #: Named dataset aliases that resolve to a bundled YAML config.
 _DATASET_ALIASES = {"coco": "configs/coco.yaml"}
@@ -160,9 +166,7 @@ class EoMT:
             self._model = build_model(self.size, **self._build_kwargs)
             if self._pretrained:
                 load_dinov2_backbone(self._model)
-            dev = "cuda" if (self.device in ("", "auto") and torch.cuda.is_available()) else \
-                ("cpu" if self.device in ("", "auto") else self.device)
-            self._model = self._model.to(dev).eval()
+            self._model = self._model.to(resolve_device(self.device)).eval()
         return self._model
 
     # ------------------------------------------------------------------ train
@@ -213,7 +217,10 @@ class EoMT:
         model = self.model
         dev = next(model.parameters()).device
         lb = letterbox if letterbox is not None else bool(getattr(model, "preprocess_letterbox", False))
-        val_ds = CocoValImages(cfg["val_images"], cfg["val_json"], imgsz=int(model.image_size), letterbox=lb)
+        val_ds = CocoValImages(
+            cfg["val_images"], cfg["val_json"], imgsz=int(model.image_size), letterbox=lb,
+            mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None),
+        )
         eval_fn = _evaluate_detection if getattr(model, "family", "instance") == "detect" else _evaluate
         return eval_fn(
             model, val_ds, device=dev, batch_size=batch, num_workers=workers,
@@ -245,8 +252,25 @@ class EoMT:
             aux_heads=m.aux_specs, aux_head_arch=m.aux_head_arch,
             letterbox=bool(getattr(m, "preprocess_letterbox", False)),
             loss_weights=m.loss_weights, num_upscale_blocks=m.num_upscale_blocks,
+            norm_mean=getattr(m, "pixel_mean", None), norm_std=getattr(m, "pixel_std", None),
+            patch_size=getattr(m, "patch_size", None),
         )
         save_checkpoint(ckpt, path)
+
+    # ------------------------------------------------------------------- info
+    def info(self, *, verbose: bool = True) -> dict:
+        """Summarize this model's checkpoint metadata (and optionally print it).
+
+        Requires the model to have been loaded from a checkpoint (``EoMT(path)``);
+        for a size-initialized model there is no checkpoint yet — call :meth:`save`
+        first. Returns the :func:`~eomt.serialization.summarize_checkpoint` dict.
+        """
+        if self._ckpt is None:
+            raise ValueError("info() needs a checkpoint-backed model; save() one first.")
+        summary = summarize_checkpoint(self._ckpt)
+        if verbose:
+            print(format_summary(summary))
+        return summary
 
     def __repr__(self) -> str:
         src = f"ckpt={self._ckpt!r}" if self._ckpt else f"size={self.size!r}"

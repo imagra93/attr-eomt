@@ -15,7 +15,9 @@ from typing import Any
 import torch
 
 from .config import HIDDEN_TO_SIZE, aux_specs_from_meta, aux_specs_to_meta
+from .device import resolve_device
 from .model import EoMTModel, build_model
+from .preprocess import IMAGENET_MEAN, IMAGENET_STD
 
 SCHEMA_VERSION = "1.0"
 
@@ -61,6 +63,9 @@ def wrap_checkpoint(
     letterbox: bool = False,
     loss_weights: dict | None = None,
     num_upscale_blocks: int | None = None,
+    norm_mean: Any = None,
+    norm_std: Any = None,
+    patch_size: int | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
     """Build a metadata-wrapped checkpoint that :func:`load_model` can restore.
@@ -85,6 +90,11 @@ def wrap_checkpoint(
         "names": normalize_names(names, nc),
         "imgsz": int(imgsz),
         "letterbox": bool(letterbox),
+        "patch_size": int(patch_size) if patch_size is not None else 14,
+        # Pixel normalization travels with the checkpoint so preprocessing is fully
+        # reproducible from the file alone (defaults to ImageNet).
+        "norm_mean": [float(x) for x in (norm_mean if norm_mean is not None else IMAGENET_MEAN)],
+        "norm_std": [float(x) for x in (norm_std if norm_std is not None else IMAGENET_STD)],
         "aux_heads": aux_specs_to_meta(aux_heads),
     }
     if aux_heads and aux_head_arch is not None:
@@ -174,12 +184,6 @@ def resolve_checkpoint(path: str | Path, *, prefer: str = "best") -> Path:
     raise FileNotFoundError(f"checkpoint path does not exist: {p}")
 
 
-def _resolve_device(device: str) -> torch.device:
-    if device in ("", "auto"):
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device)
-
-
 def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     """Rebuild an :class:`EoMTModel` from a wrapped checkpoint and load its weights.
 
@@ -230,7 +234,10 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     # Record the preprocessing mode the model was trained with so val/predict
     # match it (older checkpoints predate this flag → legacy stretch resize).
     model.preprocess_letterbox = bool(ckpt.get("letterbox", False))
-    return model.to(_resolve_device(device)).eval()
+    # Restore normalization (legacy checkpoints predate it → keep the ImageNet default).
+    model.pixel_mean = tuple(float(x) for x in ckpt.get("norm_mean", model.pixel_mean))
+    model.pixel_std = tuple(float(x) for x in ckpt.get("norm_std", model.pixel_std))
+    return model.to(resolve_device(device)).eval()
 
 
 # --- best-effort inference of metadata from a bare state dict ---------------
@@ -306,3 +313,91 @@ def _infer_imgsz(state: dict, patch_size: int = 14) -> int:
             grid = int(math.isqrt(int(state[key].shape[0])))
             return grid * patch_size
     raise ValueError("could not infer imgsz from state dict.")
+
+
+# --- checkpoint inspection --------------------------------------------------
+
+
+def summarize_checkpoint(path: str | Path) -> dict[str, Any]:
+    """Return a human-oriented summary of a checkpoint's metadata.
+
+    Accepts a checkpoint file, a run/weights folder, or a ``hf://`` ref (resolved
+    via :func:`resolve_checkpoint`). Metadata absent from older checkpoints is
+    inferred from the state dict where possible.
+    """
+    resolved = resolve_checkpoint(path, prefer="best")
+    ckpt = load_raw(resolved)
+    state = ckpt.get("model", ckpt)
+    summary: dict[str, Any] = {
+        "path": str(resolved),
+        "file_mb": round(resolved.stat().st_size / 1e6, 1),
+        "num_tensors": len(state),
+        "schema_version": ckpt.get("schema_version"),
+        "eomt_version": ckpt.get("eomt_version"),
+        "size": ckpt.get("size") or _try(lambda: _infer_size(state)),
+        "task": ckpt.get("task") or _try(lambda: _infer_family(state)),
+        "nc": ckpt.get("nc") or _try(lambda: _infer_nc(state)),
+        "imgsz": ckpt.get("imgsz") or _try(lambda: _infer_imgsz(state)),
+        "patch_size": ckpt.get("patch_size", 14),
+        "letterbox": ckpt.get("letterbox"),
+        "norm_mean": ckpt.get("norm_mean", list(IMAGENET_MEAN)),
+        "norm_std": ckpt.get("norm_std", list(IMAGENET_STD)),
+        "names": ckpt.get("names"),
+        "aux_heads": ckpt.get("aux_heads"),
+        "loss_weights": ckpt.get("loss_weights"),
+        "num_upscale_blocks": ckpt.get("num_upscale_blocks"),
+        # Training state (only present in last.pt).
+        "epoch": ckpt.get("epoch"),
+        "best_metric": ckpt.get("best_metric"),
+        "has_optimizer": "optimizer" in ckpt,
+        "has_ema": "ema" in ckpt,
+    }
+    return summary
+
+
+def _try(fn):
+    """Best-effort metadata inference; ``None`` if it can't be recovered."""
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+def format_summary(summary: dict[str, Any]) -> str:
+    """Pretty-print a :func:`summarize_checkpoint` dict as an aligned block."""
+    names = summary.get("names") or {}
+    if isinstance(names, dict):
+        names_items = sorted(names.items(), key=lambda kv: int(kv[0]))
+        names_str = ", ".join(f"{k}:{v}" for k, v in names_items)
+    else:
+        names_str = ", ".join(map(str, names))
+    if len(names_str) > 200:
+        names_str = names_str[:197] + "..."
+
+    mean = ", ".join(f"{x:.3f}" for x in summary.get("norm_mean") or [])
+    std = ", ".join(f"{x:.3f}" for x in summary.get("norm_std") or [])
+    aux = summary.get("aux_heads") or []
+    aux_str = ", ".join(
+        f"{a.get('name')}({a.get('num_classes')})" for a in aux
+    ) if aux else "none"
+
+    lines = [
+        f"checkpoint : {summary['path']}",
+        f"  file     : {summary['file_mb']} MB, {summary['num_tensors']} tensors"
+        f" (schema {summary.get('schema_version')}, eomt {summary.get('eomt_version')})",
+        f"  model    : eomt-{summary.get('size')}  task={summary.get('task')}"
+        f"  nc={summary.get('nc')}",
+        f"  input    : imgsz={summary.get('imgsz')}  patch={summary.get('patch_size')}"
+        f"  letterbox={summary.get('letterbox')}",
+        f"  norm     : mean=[{mean}]  std=[{std}]",
+        f"  aux heads: {aux_str}",
+        f"  classes  : {names_str or '(none)'}",
+    ]
+    if summary.get("epoch") is not None or summary.get("has_optimizer"):
+        bm = summary.get("best_metric")
+        bm_str = f"{bm:.4f}" if isinstance(bm, (int, float)) else str(bm)
+        lines.append(
+            f"  training : epoch={summary.get('epoch')}  best_metric={bm_str}"
+            f"  optimizer={summary.get('has_optimizer')}  ema={summary.get('has_ema')}"
+        )
+    return "\n".join(lines)
