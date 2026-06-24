@@ -59,14 +59,15 @@ def draw_instances(
         aux_names: optional ``{head: {id: name}}`` mapping for attribute labels.
     """
     img = np.array(image.convert("RGB")).astype(np.float32)
-    masks = result["masks"]
+    masks = result.get("masks")  # absent for detection (box) models
     boxes = result["boxes"]
     scores = result["scores"]
     classes = result["classes"]
 
-    n = int(masks.shape[0]) if isinstance(masks, torch.Tensor) else 0
-    # Composite colored masks.
-    for i in range(n):
+    have_masks = isinstance(masks, torch.Tensor)
+    n = int(masks.shape[0]) if have_masks else int(result.get("num_detections", len(boxes)))
+    # Composite colored masks (skipped when the model emits boxes only).
+    for i in range(n) if have_masks else ():
         m = masks[i].cpu().numpy().astype(bool)
         if not m.any():
             continue

@@ -119,23 +119,40 @@ DEFAULT_LOSS_WEIGHTS: dict = {
     "importance_sample_ratio": 0.75,
 }
 
+#: Detection (box-head) criterion weights. The shared ``no_object_weight`` /
+#: ``class_weight`` keep the same meaning as for masks; the mask/dice terms are
+#: replaced by DETR's box ``l1_weight`` and ``giou_weight`` (see :mod:`eomt.box_loss`).
+DETECT_LOSS_WEIGHTS: dict = {
+    "no_object_weight": 0.1,
+    "class_weight": 2.0,
+    "l1_weight": 5.0,
+    "giou_weight": 2.0,
+}
 
-def normalize_loss_weights(lw: dict | None) -> dict:
-    """Fill a loss-weight dict with defaults, rejecting unknown keys.
 
-    ``None`` values fall back to the default (so partial dicts work). Raises on
-    keys that are not real criterion params to catch typos early.
+def _loss_weight_defaults(family: str) -> dict:
+    return DETECT_LOSS_WEIGHTS if family == "detect" else DEFAULT_LOSS_WEIGHTS
+
+
+def normalize_loss_weights(lw: dict | None, family: str = "instance") -> dict:
+    """Fill a loss-weight dict with defaults for ``family``, rejecting unknown keys.
+
+    ``None`` values fall back to the default (so partial dicts work). Raises on keys
+    that are not real criterion params for the family to catch typos early. The
+    ``"instance"`` family validates against the mask/dice keys; ``"detect"`` against
+    the box L1/GIoU keys.
     """
-    out = dict(DEFAULT_LOSS_WEIGHTS)
+    out = dict(_loss_weight_defaults(family))
     if lw:
         unknown = set(lw) - set(out)
         if unknown:
             raise ValueError(
-                f"unknown loss_weights keys {sorted(unknown)}; "
+                f"unknown loss_weights keys {sorted(unknown)} for family {family!r}; "
                 f"valid keys are {sorted(out)}."
             )
         out.update({k: v for k, v in lw.items() if v is not None})
-    out["train_num_points"] = int(out["train_num_points"])
+    if "train_num_points" in out:
+        out["train_num_points"] = int(out["train_num_points"])
     return out
 
 

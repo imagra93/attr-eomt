@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..data import collate_val
-from ..postprocess import postprocess_instance
+from ..postprocess import postprocess_detection, postprocess_instance
 
 #: COCOeval.stats index -> metric name.
 _SEGM_KEYS = [
@@ -147,6 +147,72 @@ def evaluate(
     if also_bbox:
         metrics.update(_cocoeval(val_ds.coco, bbox_results, val_ds.ids, "bbox", verbose))
     return metrics
+
+
+@torch.no_grad()
+def evaluate_detection(
+    model,
+    val_ds,
+    *,
+    device,
+    batch_size: int = 4,
+    num_workers: int = 4,
+    conf_thres: float = 0.0,
+    max_det: int = 100,
+    amp: bool = False,
+    verbose: bool = True,
+) -> dict[str, float]:
+    """Evaluate a ``family="detect"`` model on ``val_ds`` -> COCO **bbox** metrics.
+
+    Mirrors :func:`evaluate` but reads the box head (``pred_boxes``) via
+    :func:`~eomt.postprocess.postprocess_detection` and scores only ``bbox`` mAP
+    (there are no masks). Returns a metrics dict keyed ``bbox/<metric>``.
+    """
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    model.eval()
+    use_amp = amp and device.type == "cuda"
+    contig2cat = val_ds.contig2cat
+
+    loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_val,
+        pin_memory=True,
+    )
+
+    bbox_results: list[dict] = []
+    for pixel_values, image_ids, sizes, metas in tqdm(
+        loader, desc="val", unit="batch", leave=False, disable=not verbose
+    ):
+        pixel_values = pixel_values.to(device)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            out = model(pixel_values)
+        pb = out["pred_boxes"]
+        cql = out["class_queries_logits"]
+
+        for b, (img_id, (orig_w, orig_h), meta) in enumerate(zip(image_ids, sizes, metas)):
+            res = postprocess_detection(
+                {"pred_boxes": pb[b : b + 1], "class_queries_logits": cql[b : b + 1]},
+                conf_thres,
+                (orig_w, orig_h),
+                max_det=max_det,
+                preprocess_meta=meta,
+            )
+            for i in range(res["num_detections"]):
+                cat_id = int(contig2cat[int(res["classes"][i])])
+                x1, y1, x2, y2 = [float(v) for v in res["boxes"][i].tolist()]
+                bbox_results.append(
+                    {
+                        "image_id": int(img_id),
+                        "category_id": cat_id,
+                        "bbox": [x1, y1, x2 - x1, y2 - y1],
+                        "score": float(res["scores"][i]),
+                    }
+                )
+
+    return _cocoeval(val_ds.coco, bbox_results, val_ds.ids, "bbox", verbose)
 
 
 @torch.no_grad()

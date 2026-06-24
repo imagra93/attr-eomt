@@ -131,7 +131,42 @@ Default input is a patch-14-aligned square (`644 = 14 × 46`) so DINOv2 weights 
 ## Install
 
 ```bash
-pip install -e .              # add [logging] for tensorboard/wandb, [dev] for pytest
+pip install attr-eomt                  # from PyPI
+pip install "attr-eomt[logging]"       # + tensorboard/wandb
+```
+
+Or from source (editable, for development):
+
+```bash
+pip install -e ".[dev]"                # [dev] adds pytest/build/twine
+```
+
+## Pretrained weights
+
+Checkpoints are hosted on the **Hugging Face Hub**, not bundled in the wheel.
+Load one in a single line — it downloads once and is cached for later runs:
+
+```python
+from eomt import EoMT
+
+model = EoMT.from_pretrained("imagra93/eomt-l-coco")   # downloads + caches
+results = model.predict("images/", plot=True)
+```
+
+Equivalently, an `hf://` reference works anywhere a checkpoint path is accepted:
+
+```python
+EoMT("hf://imagra93/eomt-l-coco/model.pt").val(data="coco")
+```
+
+`from_pretrained` accepts `filename=` (which checkpoint in the repo, default
+`model.pt`), `revision=` (branch/tag/commit) and `device=`.
+
+To publish your own trained weights to the Hub (creates the repo if needed; needs
+`huggingface-cli login` or `HF_TOKEN`):
+
+```python
+EoMT("runs/train/eomt-l").push_to_hub("your-username/eomt-l-coco")   # private by default
 ```
 
 ## Quickstart

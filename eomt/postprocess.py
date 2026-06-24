@@ -54,6 +54,105 @@ def _masks_to_original(mask_logits, orig_h, orig_w, preprocess_meta):
     )[0]
 
 
+def boxes_to_original(
+    boxes_cxcywh: torch.Tensor, orig_h: int, orig_w: int, preprocess_meta: dict | None
+) -> torch.Tensor:
+    """Map normalized ``cxcywh`` box preds (square input space) to ``xyxy`` original pixels.
+
+    Inverts :func:`eomt.preprocess.preprocess_numpy` exactly as :func:`_masks_to_original`
+    does for masks: for **letterbox** the boxes are scaled to the square canvas, then the
+    top-left content region is rescaled to the original size (padding is bottom/right, so
+    box origins need no shift); for **stretch** the normalized coords map straight onto the
+    original dimensions.
+    """
+    from .box_loss import box_cxcywh_to_xyxy
+
+    xyxy = box_cxcywh_to_xyxy(boxes_cxcywh).clone()  # normalized [0,1]
+    if preprocess_meta and preprocess_meta.get("letterbox"):
+        size = int(preprocess_meta["input_size"])
+        ch, cw = (int(v) for v in preprocess_meta["content_hw"])
+        xyxy *= size  # -> square-canvas pixels
+        xyxy[:, [0, 2]] *= orig_w / cw
+        xyxy[:, [1, 3]] *= orig_h / ch
+    else:
+        xyxy[:, [0, 2]] *= orig_w
+        xyxy[:, [1, 3]] *= orig_h
+    xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clamp(0, orig_w)
+    xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clamp(0, orig_h)
+    return xyxy
+
+
+def postprocess_detection(
+    output: dict,
+    conf_thres: float,
+    original_size: tuple[int, int],
+    *,
+    max_det: int = 100,
+    preprocess_meta: dict | None = None,
+    **_: object,
+) -> dict:
+    """Convert raw EoMT **detection** output to the canonical instance dict (no masks).
+
+    Args:
+        output: ``{"pred_boxes": (1, Q, 4) normalized cxcywh,
+                   "class_queries_logits": (1, Q, C+1)}``.
+        conf_thres: minimum class confidence to keep a query.
+        original_size: ``(width, height)`` of the source image.
+        max_det: cap on returned detections (highest scoring first).
+        preprocess_meta: letterbox/stretch metadata from
+            :func:`eomt.preprocess.preprocess_numpy` (used to map boxes back).
+
+    Returns:
+        ``{"num_detections", "boxes": (N,4) xyxy original px, "scores": (N,),
+        "classes": (N,)}``. If the model has secondary heads, ``output`` also carries
+        ``"aux_queries_logits": {name: (1, Q, ns)}`` and the result gains
+        ``"aux": {name: {"ids": (N,), "probs": (N, ns)}}`` for the same kept queries.
+    """
+    pred_boxes = output["pred_boxes"][0].float()  # (Q, 4) cxcywh in [0,1]
+    class_logits = output["class_queries_logits"][0].float()  # (Q, C+1)
+    aux_logits = output.get("aux_queries_logits")
+
+    scores_all = class_logits.softmax(dim=-1)[:, :-1]  # drop null class -> (Q, C)
+    scores, classes = scores_all.max(dim=-1)  # (Q,)
+
+    orig_w, orig_h = original_size
+    sel = (scores >= conf_thres).nonzero(as_tuple=True)[0]
+    if sel.numel() == 0:
+        empty = {
+            "num_detections": 0,
+            "boxes": torch.zeros((0, 4)),
+            "scores": torch.zeros((0,)),
+            "classes": torch.zeros((0,), dtype=torch.long),
+        }
+        if aux_logits is not None:
+            empty["aux"] = {
+                name: {
+                    "ids": torch.zeros((0,), dtype=torch.long),
+                    "probs": torch.zeros((0, lg.shape[-1])),
+                }
+                for name, lg in aux_logits.items()
+            }
+        return empty
+
+    if sel.numel() > max_det:
+        sel = sel[scores[sel].topk(max_det).indices]
+
+    scores, classes = scores[sel], classes[sel]
+    boxes = boxes_to_original(pred_boxes[sel], orig_h, orig_w, preprocess_meta)
+    result = {
+        "num_detections": int(scores.numel()),
+        "boxes": boxes,
+        "scores": scores,
+        "classes": classes.long(),
+    }
+    if aux_logits is not None:
+        result["aux"] = {}
+        for name, lg in aux_logits.items():
+            probs = lg[0].float().softmax(dim=-1)[sel]  # (N, ns)
+            result["aux"][name] = {"ids": probs.argmax(dim=-1), "probs": probs}
+    return result
+
+
 def postprocess_instance(
     output: dict,
     conf_thres: float,

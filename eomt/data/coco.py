@@ -199,6 +199,137 @@ class CocoInstanceSeg(Dataset):
         return image_t, masks_t.float(), class_t, attr_t
 
 
+class CocoDetection(Dataset):
+    """COCO object detection -> ``(pixel_values, boxes, class_labels, attrs)``.
+
+    The detection counterpart to :class:`CocoInstanceSeg` for ``family="detect"``.
+    Each item is an augmented, ImageNet-normalized square tensor plus per-instance
+    **normalized ``cxcywh`` boxes** ``(num_inst, 4)`` in ``[0, 1]`` (relative to the
+    square input) and their contiguous class ids. Boxes ride the **same** transforms
+    as masks via ``tv_tensors.BoundingBoxes``, so LSJ/flip/crop apply identically.
+
+    .. warning::
+        Horizontal flip swaps left/right, which **corrupts laterality-style aux
+        labels** exactly as it does for the seg dataset. Train laterality detection
+        runs with ``flip_prob=0`` (see ``scripts/train_parts_large.sh``).
+    """
+
+    def __init__(
+        self,
+        img_dir: str | Path,
+        json_file: str | Path,
+        imgsz: int = 644,
+        *,
+        transform=None,
+        flip_prob: float = 0.5,
+        min_scale: float = 0.1,
+        max_scale: float = 2.0,
+        attributes: list[str] | bool = True,
+        shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
+    ):
+        from pycocotools.coco import COCO
+
+        self.img_dir = Path(img_dir)
+        self.imgsz = imgsz
+        self.coco = COCO(str(json_file))
+        self.cat2contig, self.contig2cat, self.names, self.num_classes = (
+            _build_category_maps(self.coco)
+        )
+        if shared_aux is not None:
+            self.aux_specs, self._attr_id_maps = shared_aux
+        else:
+            only = None if attributes is True else ([] if attributes is False else attributes)
+            self.aux_specs, self._attr_id_maps = (
+                ([], {}) if only == [] else _build_attribute_maps(self.coco, only=only)
+            )
+        self.ids = [
+            i
+            for i in self.coco.getImgIds()
+            if len(self.coco.getAnnIds(imgIds=i, iscrowd=False)) > 0
+        ]
+        self.transform = transform or build_train_transform(
+            imgsz, flip_prob=flip_prob, min_scale=min_scale, max_scale=max_scale
+        )
+        self._fallback_transform = build_val_transform(imgsz)
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def _norm_cxcywh(self, boxes_xyxy: torch.Tensor) -> torch.Tensor:
+        """``xyxy`` pixel boxes -> normalized ``cxcywh`` in ``[0, 1]``; clamp to canvas."""
+        b = boxes_xyxy.clamp(min=0, max=self.imgsz)
+        w = (b[:, 2] - b[:, 0]).clamp(min=0)
+        h = (b[:, 3] - b[:, 1]).clamp(min=0)
+        cx = b[:, 0] + 0.5 * w
+        cy = b[:, 1] + 0.5 * h
+        return torch.stack([cx, cy, w, h], dim=1) / self.imgsz
+
+    def __getitem__(self, idx: int):
+        from torchvision import tv_tensors
+
+        img_id = self.ids[idx]
+        info = self.coco.loadImgs(img_id)[0]
+        img = Image.open(self.img_dir / info["file_name"]).convert("RGB")
+
+        anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id, iscrowd=False))
+        boxes, classes = [], []
+        attrs: dict[str, list[int]] = {s.name: [] for s in self.aux_specs}
+        for ann in anns:
+            x, y, w, h = ann["bbox"]  # COCO xywh, absolute pixels
+            if w <= 0 or h <= 0:
+                continue
+            boxes.append([x, y, x + w, y + h])  # xyxy
+            classes.append(self.cat2contig[ann["category_id"]])
+            ann_attrs = ann.get("attributes", {})
+            for spec in self.aux_specs:
+                raw = ann_attrs.get(spec.name)
+                attrs[spec.name].append(self._attr_id_maps[spec.name].get(raw, -100))
+
+        H, W = img.height, img.width
+        image_tv = tv_tensors.Image(
+            torch.from_numpy(np.array(img)).permute(2, 0, 1)  # (3, H, W) uint8
+        )
+        if boxes:
+            boxes_tv = tv_tensors.BoundingBoxes(
+                torch.tensor(boxes, dtype=torch.float32),
+                format=tv_tensors.BoundingBoxFormat.XYXY,
+                canvas_size=(H, W),
+            )
+            class_t = torch.tensor(classes, dtype=torch.long)
+            attr_t = {k: torch.tensor(v, dtype=torch.long) for k, v in attrs.items()}
+        else:  # should not happen (filtered), but stay safe
+            boxes_tv = tv_tensors.BoundingBoxes(
+                torch.zeros((1, 4), dtype=torch.float32),
+                format=tv_tensors.BoundingBoxFormat.XYXY,
+                canvas_size=(H, W),
+            )
+            class_t = torch.zeros((1,), dtype=torch.long)
+            attr_t = {s.name: torch.full((1,), -100, dtype=torch.long) for s in self.aux_specs}
+
+        # Apply augmentation; if a crop removes every box, retry, then fall back to a
+        # plain resize that preserves them (mirrors CocoInstanceSeg).
+        image_t = boxes_t = keep = None
+        for _ in range(3):
+            image_t, boxes_t = self.transform(image_tv, boxes_tv)
+            boxes_t = torch.as_tensor(boxes_t)
+            keep = ((boxes_t[:, 2] - boxes_t[:, 0]) > 1) & ((boxes_t[:, 3] - boxes_t[:, 1]) > 1)
+            if keep.any():
+                break
+        else:
+            image_t, boxes_t = self._fallback_transform(image_tv, boxes_tv)
+            boxes_t = torch.as_tensor(boxes_t)
+            keep = ((boxes_t[:, 2] - boxes_t[:, 0]) > 1) & ((boxes_t[:, 3] - boxes_t[:, 1]) > 1)
+
+        boxes_t, class_t = boxes_t[keep], class_t[keep]
+        attr_t = {k: v[keep] for k, v in attr_t.items()}
+        if boxes_t.shape[0] == 0:  # pathological -> single empty placeholder
+            boxes_t = torch.tensor([[0.0, 0.0, float(self.imgsz), float(self.imgsz)]])
+            class_t = torch.zeros((1,), dtype=torch.long)
+            attr_t = {s.name: torch.full((1,), -100, dtype=torch.long) for s in self.aux_specs}
+
+        return image_t, self._norm_cxcywh(boxes_t), class_t, attr_t
+
+
 class CocoValImages(Dataset):
     """COCO images for evaluation -> ``(pixel_values, image_id, orig_w, orig_h)``.
 

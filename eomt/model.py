@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
+from .box_loss import DetectionLoss
 from .config import (
     DEFAULT_IMAGE_SIZE,
     EOMT_CONFIGS,
@@ -40,6 +41,10 @@ from .config import (
 )
 from .loss import EoMTLoss
 
+#: Supported task families. ``"instance"`` is the original mask-classification head;
+#: ``"detect"`` swaps the mask head for a DETR-style box-regression head.
+FAMILIES = ("instance", "detect")
+
 
 # ---------------------------------------------------------------------------
 # EoMT architecture (pure PyTorch; submodule names mirror the HF model exactly)
@@ -48,11 +53,16 @@ from .loss import EoMTLoss
 
 @dataclass
 class EoMTOutput:
-    """Minimal output object; attribute access mirrors the HF dataclass."""
+    """Minimal output object; attribute access mirrors the HF dataclass.
+
+    ``masks_queries_logits`` is populated for the ``"instance"`` family;
+    ``pred_boxes`` (per-query normalized ``cxcywh``) for the ``"detect"`` family.
+    """
 
     loss: torch.Tensor | None = None
     class_queries_logits: torch.Tensor | None = None
     masks_queries_logits: torch.Tensor | None = None
+    pred_boxes: torch.Tensor | None = None
     last_hidden_state: torch.Tensor | None = None
 
 
@@ -228,28 +238,69 @@ class MaskHead(nn.Module):
         return self.fc3(hidden_states)
 
 
-class EoMTEncoder(nn.Module):
-    """Pure-PyTorch ``EomtForUniversalSegmentation`` (forward + loss)."""
+class BoxHead(nn.Module):
+    """DETR-style box-regression head: per-query MLP -> sigmoid ``(cx, cy, w, h)``.
+
+    Reads the same per-query embedding the mask head does and emits a normalized
+    ``cxcywh`` box in ``[0, 1]`` (relative to the square model input). A 3-layer MLP
+    (mirrors :class:`MaskHead`'s depth); the final layer maps to 4.
+    """
 
     def __init__(self, config):
         super().__init__()
+        h = config.hidden_size
+        self.fc1 = nn.Linear(h, h)
+        self.fc2 = nn.Linear(h, h)
+        self.fc3 = nn.Linear(h, 4)
+        self.activation = _act(config.hidden_act)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.activation(self.fc1(hidden_states))
+        hidden_states = self.activation(self.fc2(hidden_states))
+        return self.fc3(hidden_states).sigmoid()
+
+
+class EoMTEncoder(nn.Module):
+    """Pure-PyTorch ``EomtForUniversalSegmentation`` (forward + loss).
+
+    ``family="instance"`` is the original mask-classification head (mask + class).
+    ``family="detect"`` swaps the mask head for a :class:`BoxHead` and the mask/dice
+    criterion for :class:`~eomt.box_loss.DetectionLoss`; masked attention is not used
+    (there is no predicted mask to focus on), so the last blocks do full attention.
+    """
+
+    def __init__(self, config, family: str = "instance"):
+        super().__init__()
         self.config = config
+        self.family = family
         self.num_hidden_layers = config.num_hidden_layers
         self.embeddings = Embeddings(config)
         self.layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.query = nn.Embedding(config.num_queries, config.hidden_size)
         self.layers = nn.ModuleList([Layer(config) for _ in range(config.num_hidden_layers)])
-        self.upscale_block = ScaleBlock(config)
-        self.mask_head = MaskHead(config)
         self.class_predictor = nn.Linear(config.hidden_size, config.num_labels + 1)
-
         self.grid_size = (config.image_size // config.patch_size, config.image_size // config.patch_size)
-        self.weight_dict: dict[str, float] = {
-            "loss_cross_entropy": config.class_weight,
-            "loss_mask": config.mask_weight,
-            "loss_dice": config.dice_weight,
-        }
-        self.criterion = EoMTLoss(config=config, weight_dict=self.weight_dict)
+
+        if family == "detect":
+            # Box head only; no mask head / upscale block, so no unused params are
+            # saved into the checkpoint. ``l1_weight``/``giou_weight`` are stashed on
+            # the config by ``EoMTModel`` (EomtConfig has no box-weight fields).
+            self.box_head = BoxHead(config)
+            self.weight_dict = {
+                "loss_cross_entropy": config.class_weight,
+                "loss_bbox": float(getattr(config, "l1_weight", 5.0)),
+                "loss_giou": float(getattr(config, "giou_weight", 2.0)),
+            }
+            self.criterion = DetectionLoss(config=config, weight_dict=self.weight_dict)
+        else:
+            self.upscale_block = ScaleBlock(config)
+            self.mask_head = MaskHead(config)
+            self.weight_dict = {
+                "loss_cross_entropy": config.class_weight,
+                "loss_mask": config.mask_weight,
+                "loss_dice": config.dice_weight,
+            }
+            self.criterion = EoMTLoss(config=config, weight_dict=self.weight_dict)
         self.register_buffer("attn_mask_probs", torch.ones(config.num_blocks))
 
     # --- loss plumbing (mirrors HF get_loss_dict / get_loss) ----------------
@@ -274,11 +325,17 @@ class EoMTEncoder(nn.Module):
     # --- prediction heads (mirrors HF predict) ------------------------------
 
     def predict(self, logits: torch.Tensor):
+        """Per-query heads. Returns ``(geometry, class_logits)``: mask logits
+        ``(B, Q, h, w)`` for the instance family, box preds ``(B, Q, 4)`` for detect.
+        """
         num_queries = self.config.num_queries
-        num_prefix = self.embeddings.num_prefix_tokens
         query_tokens = logits[:, :num_queries, :]
         class_logits = self.class_predictor(query_tokens)
 
+        if self.family == "detect":
+            return self.box_head(query_tokens), class_logits
+
+        num_prefix = self.embeddings.num_prefix_tokens
         prefix_tokens = logits[:, num_queries + num_prefix :, :]
         prefix_tokens = prefix_tokens.transpose(1, 2)
         prefix_tokens = prefix_tokens.reshape(prefix_tokens.shape[0], -1, *self.grid_size)
@@ -318,9 +375,14 @@ class EoMTEncoder(nn.Module):
         pixel_values: torch.Tensor,
         mask_labels: list[torch.Tensor] | None = None,
         class_labels: list[torch.Tensor] | None = None,
+        box_labels: list[torch.Tensor] | None = None,
     ) -> EoMTOutput:
-        masks_per_layer, class_per_layer = (), ()
+        # Per-layer geometry (mask logits or box preds) for deep supervision.
+        geom_per_layer, class_per_layer = (), ()
         attention_mask = None
+        is_detect = self.family == "detect"
+        # GT geometry for this family: boxes for detect, masks for instance.
+        geom_labels = box_labels if is_detect else mask_labels
 
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")
@@ -337,12 +399,19 @@ class EoMTEncoder(nn.Module):
                 hidden_states = torch.cat((query, hidden_states), dim=1)
 
             block_idx = idx - self.num_hidden_layers + self.config.num_blocks
-            if idx >= self.num_hidden_layers - self.config.num_blocks and (
-                self.training or self.attn_mask_probs[block_idx] > 0
-            ):
+            in_query_blocks = idx >= self.num_hidden_layers - self.config.num_blocks
+            if is_detect:
+                # Deep supervision: predict per query-block during training. No masked
+                # attention (no masks to focus on) — queries do full attention.
+                if in_query_blocks and self.training:
+                    norm_hidden_states = self.layernorm(hidden_states)
+                    geom, cls = self.predict(norm_hidden_states)
+                    geom_per_layer += (geom,)
+                    class_per_layer += (cls,)
+            elif in_query_blocks and (self.training or self.attn_mask_probs[block_idx] > 0):
                 norm_hidden_states = self.layernorm(hidden_states)
                 masks_queries_logits, class_queries_logits = self.predict(norm_hidden_states)
-                masks_per_layer += (masks_queries_logits,)
+                geom_per_layer += (masks_queries_logits,)
                 class_per_layer += (class_queries_logits,)
                 attention_mask = self._build_attention_mask(
                     hidden_states, masks_queries_logits, self.attn_mask_probs[block_idx]
@@ -351,19 +420,20 @@ class EoMTEncoder(nn.Module):
             hidden_states = layer_module(hidden_states, attention_mask)
 
         sequence_output = self.layernorm(hidden_states)
-        masks_queries_logits, class_queries_logits = self.predict(sequence_output)
-        masks_per_layer += (masks_queries_logits,)
+        geom_final, class_queries_logits = self.predict(sequence_output)
+        geom_per_layer += (geom_final,)
         class_per_layer += (class_queries_logits,)
 
         loss = None
-        if mask_labels is not None and class_labels is not None:
+        if geom_labels is not None and class_labels is not None:
             loss = 0.0
-            for m, c in zip(masks_per_layer, class_per_layer):
-                loss = loss + self.get_loss(self.get_loss_dict(m, c, mask_labels, class_labels))
+            for g, c in zip(geom_per_layer, class_per_layer):
+                loss = loss + self.get_loss(self.get_loss_dict(g, c, geom_labels, class_labels))
 
         return EoMTOutput(
             loss=loss,
-            masks_queries_logits=masks_queries_logits,
+            masks_queries_logits=None if is_detect else geom_final,
+            pred_boxes=geom_final if is_detect else None,
             class_queries_logits=class_queries_logits,
             last_hidden_state=sequence_output,
         )
@@ -426,24 +496,23 @@ def build_model(
 ) -> "EoMTModel":
     """Build an :class:`EoMTModel`.
 
-    ``family`` is accepted for forward-compatibility (a detect/box-head family
-    and a semantic family may be added later); only ``"instance"`` is supported.
-    ``aux_heads`` adds one secondary per-instance classifier per spec;
-    ``aux_head_arch`` sets their shared network shape (see ``_build_aux_head``).
-    ``loss_weights`` overrides the segmentation-loss/criterion weights (see
+    ``family`` selects the prediction head: ``"instance"`` (mask + class, the
+    default) or ``"detect"`` (DETR-style box + class). ``aux_heads`` adds one
+    secondary per-instance classifier per spec; ``aux_head_arch`` sets their shared
+    network shape (see ``_build_aux_head``). ``loss_weights`` overrides the
+    criterion weights (mask/dice for instance, L1/GIoU for detect — see
     ``normalize_loss_weights``); ``num_upscale_blocks`` overrides the mask-head
-    upsampling depth (``None`` = size preset default).
+    upsampling depth (instance only; ``None`` = size preset default).
     """
-    if family != "instance":
-        raise NotImplementedError(
-            f"family={family!r} is not implemented yet; only 'instance' is supported."
-        )
+    if family not in FAMILIES:
+        raise ValueError(f"family={family!r} is not one of {FAMILIES}.")
     return EoMTModel(
         size=size,
         nc=nc,
         image_size=imgsz,
         patch_size=PATCH_SIZE,
         names=names,
+        family=family,
         aux_heads=aux_heads,
         aux_head_arch=aux_head_arch,
         loss_weights=loss_weights,
@@ -465,6 +534,7 @@ class EoMTModel(nn.Module):
         image_size: int = 644,
         patch_size: int = PATCH_SIZE,
         names: dict[int, str] | None = None,
+        family: str = "instance",
         aux_heads: list[AuxHeadSpec] | None = None,
         aux_head_arch: dict | None = None,
         loss_weights: dict | None = None,
@@ -476,9 +546,18 @@ class EoMTModel(nn.Module):
         self.image_size = image_size
         self.patch_size = patch_size
         self.names = names
-        # Segmentation-loss weights and mask-head depth, persisted in the checkpoint
-        # so a tuned objective / head shape is rebuilt identically on reload.
-        self.loss_weights = normalize_loss_weights(loss_weights)
+        self.family = family
+        # Criterion weights and mask-head depth, persisted in the checkpoint so a
+        # tuned objective / head shape is rebuilt identically on reload. The valid
+        # keys depend on the family (mask/dice vs box L1/GIoU).
+        self.loss_weights = normalize_loss_weights(loss_weights, family=family)
+        # ``build_eomt_config`` only knows the mask/dice + shared keys; pass those
+        # through and keep mask/dice at their defaults for detect (unused there).
+        cfg_weights = {
+            k: v for k, v in self.loss_weights.items()
+            if k in ("no_object_weight", "class_weight", "mask_weight", "dice_weight",
+                     "train_num_points", "oversample_ratio", "importance_sample_ratio")
+        }
         config = build_eomt_config(
             size,
             nc=nc,
@@ -486,12 +565,17 @@ class EoMTModel(nn.Module):
             patch_size=patch_size,
             names=names,
             num_upscale_blocks=num_upscale_blocks,
-            **self.loss_weights,
+            **cfg_weights,
         )
+        # Box-loss weights have no EomtConfig field; stash them on the config so
+        # ``EoMTEncoder`` (which only receives the config) can read them.
+        if family == "detect":
+            config.l1_weight = float(self.loss_weights["l1_weight"])
+            config.giou_weight = float(self.loss_weights["giou_weight"])
         self.config = config
         # Effective upscale depth (resolved from the preset when not overridden).
         self.num_upscale_blocks = int(config.num_upscale_blocks)
-        self.eomt = EoMTEncoder(config)
+        self.eomt = EoMTEncoder(config, family=family)
 
         # Secondary per-instance heads (attributes). Each reads the per-query
         # embedding — the input to ``class_predictor`` — captured by a hook.
@@ -519,18 +603,27 @@ class EoMTModel(nn.Module):
         pixel_values: torch.Tensor,
         mask_labels: list[torch.Tensor] | None = None,
         class_labels: list[torch.Tensor] | None = None,
+        box_labels: list[torch.Tensor] | None = None,
     ):
         self._query_embed = None
         out = self.eomt(
             pixel_values=pixel_values,
             mask_labels=mask_labels,
             class_labels=class_labels,
+            box_labels=box_labels,
         )
-        training = mask_labels is not None and class_labels is not None
-        result = {
-            "masks_queries_logits": out.masks_queries_logits,
-            "class_queries_logits": out.class_queries_logits,
-        }
+        geom_labels = box_labels if self.family == "detect" else mask_labels
+        training = geom_labels is not None and class_labels is not None
+        if self.family == "detect":
+            result = {
+                "pred_boxes": out.pred_boxes,
+                "class_queries_logits": out.class_queries_logits,
+            }
+        else:
+            result = {
+                "masks_queries_logits": out.masks_queries_logits,
+                "class_queries_logits": out.class_queries_logits,
+            }
         if self.aux_heads and self._query_embed is not None:
             q = self._query_embed
             result["query_embed"] = q
