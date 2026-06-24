@@ -8,14 +8,15 @@ name: publish
 on:
   release:
     types: [published]
+  workflow_dispatch:        # allow manual runs (e.g. re-publishing an existing release)
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v6
       - name: Build sdist + wheel
         run: uv build
       - name: Check metadata
