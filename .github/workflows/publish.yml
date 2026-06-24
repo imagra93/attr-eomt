@@ -1,0 +1,40 @@
+name: publish
+
+# Builds the package and publishes to PyPI when a GitHub Release is published.
+# Uses PyPI Trusted Publishing (OIDC) — no API token stored as a secret.
+# One-time setup on PyPI: project Settings -> Publishing -> add a trusted publisher
+#   owner: imagra93   repo: attr-eomt   workflow: publish.yml   environment: pypi
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Check metadata
+        run: uvx twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
