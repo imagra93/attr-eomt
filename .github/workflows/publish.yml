@@ -40,3 +40,9 @@ jobs:
           path: dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Publishing runs via a reusable workflow_call from release.yml. The OIDC
+          # token authenticates fine (matches the publish.yml trusted publisher), but
+          # PEP 740 attestations carry the *top-level* workflow identity (release.yml),
+          # which PyPI rejects against the publish.yml trusted publisher. Disable them.
+          attestations: false
