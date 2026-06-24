@@ -18,13 +18,16 @@ from .api import EoMT
 from .config import EOMT_CONFIGS, SIZES, build_eomt_config
 from .model import EoMTEncoder, EoMTModel, build_model, load_dinov2_backbone
 from .postprocess import postprocess_instance
+from .device import resolve_device
 from .serialization import (
     download_from_hub,
+    format_summary,
     is_hf_ref,
     load_model,
     load_raw,
     resolve_checkpoint,
     save_checkpoint,
+    summarize_checkpoint,
     wrap_checkpoint,
 )
 
@@ -43,8 +46,11 @@ __all__ = [
     "resolve_checkpoint",
     "save_checkpoint",
     "wrap_checkpoint",
+    "summarize_checkpoint",
+    "format_summary",
     "download_from_hub",
     "is_hf_ref",
+    "resolve_device",
 ]
 
 try:  # pragma: no cover

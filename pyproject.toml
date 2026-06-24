@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "attr-eomt"
-version = "0.1.0"
+version = "0.1.1"
 description = "Standalone EoMT (Encoder-only Mask Transformer) for instance segmentation, with DINOv2 init, COCO training/validation and inference."
 readme = "README.md"
 requires-python = ">=3.10"

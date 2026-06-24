@@ -40,6 +40,7 @@ from .config import (
     normalize_loss_weights,
 )
 from .loss import EoMTLoss
+from .preprocess import IMAGENET_MEAN, IMAGENET_STD
 
 #: Supported task families. ``"instance"`` is the original mask-classification head;
 #: ``"detect"`` swaps the mask head for a DETR-style box-regression head.
@@ -547,6 +548,10 @@ class EoMTModel(nn.Module):
         self.patch_size = patch_size
         self.names = names
         self.family = family
+        # Pixel normalization (ImageNet by default), persisted in the checkpoint so
+        # eval/predict reproduce preprocessing from the file alone.
+        self.pixel_mean: tuple[float, float, float] = tuple(float(x) for x in IMAGENET_MEAN)
+        self.pixel_std: tuple[float, float, float] = tuple(float(x) for x in IMAGENET_STD)
         # Criterion weights and mask-head depth, persisted in the checkpoint so a
         # tuned objective / head shape is rebuilt identically on reload. The valid
         # keys depend on the family (mask/dice vs box L1/GIoU).

@@ -32,6 +32,7 @@ from ..data.transforms import build_val_transform
 from ..ema import ModelEMA, _unwrap
 from ..model import build_model, load_dinov2_backbone
 from ..plotting import plot_aux_per_class, plot_metrics_csv
+from ..device import resolve_device
 from ..serialization import load_raw, resolve_checkpoint, save_checkpoint, wrap_checkpoint
 from .validate import _SEGM_KEYS, aux_evaluate, evaluate, evaluate_detection
 
@@ -40,12 +41,6 @@ _ENCODER_PREFIXES = ("eomt.embeddings", "eomt.layers", "eomt.layernorm")
 # (LayerNorm weights, every bias) plus token/positional embeddings — the standard
 # ViT fine-tuning policy (decaying these hurts).
 _NO_DECAY_TOKENS = ("position_embeddings", "cls_token", "register_tokens")
-
-
-def _resolve_device(device: str) -> torch.device:
-    if device in ("", "auto"):
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device)
 
 
 def _seed_everything(seed: int) -> None:
@@ -325,7 +320,7 @@ def train(
     if seed is not None:
         _seed_everything(seed)
 
-    dev = _resolve_device(device)
+    dev = resolve_device(device)
 
     # Speed knobs (no accuracy cost): TF32 matmul/conv on Ampere+, and cudnn
     # autotuner — safe because the input is a fixed-size square every step.
@@ -570,7 +565,19 @@ def train(
     elif init_ckpt is not None:
         # Warm start: load weights only. Optimizer/EMA/epoch/best stay fresh, so the
         # LR schedule and EMA restart from these weights at epoch 0.
-        missing, unexpected = model.load_state_dict(init_ckpt["model"], strict=False)
+        #
+        # "Lazy" load: drop any checkpoint tensor whose shape doesn't match the current
+        # model so weights from a different num-classes (e.g. an 81-class COCO detect
+        # head into a 2-class fuel head) still transfer the backbone/queries/decoder.
+        # ``strict=False`` skips missing/unexpected keys but NOT shape mismatches, which
+        # would otherwise raise; those skipped tensors keep their fresh init.
+        cur = model.state_dict()
+        ckpt_sd = init_ckpt["model"]
+        filtered = {k: v for k, v in ckpt_sd.items() if k in cur and cur[k].shape == v.shape}
+        skipped = [k for k, v in ckpt_sd.items() if k in cur and cur[k].shape != v.shape]
+        missing, unexpected = model.load_state_dict(filtered, strict=False)
+        if skipped:
+            print(f"[finetune] re-initialized {len(skipped)} shape-mismatched tensors: {skipped}")
         print(
             f"[finetune] loaded warm-start weights ({len(missing)} missing / "
             f"{len(unexpected)} unexpected keys); training from epoch 0."
@@ -624,6 +631,9 @@ def train(
             letterbox=letterbox,
             loss_weights=loss_weights,
             num_upscale_blocks=core.num_upscale_blocks,
+            norm_mean=getattr(core, "pixel_mean", None),
+            norm_std=getattr(core, "pixel_std", None),
+            patch_size=getattr(core, "patch_size", None),
             **extra,
         )
         save_checkpoint(ckpt, path)

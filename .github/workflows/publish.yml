@@ -9,6 +9,7 @@ on:
   release:
     types: [published]
   workflow_dispatch:        # allow manual runs (e.g. re-publishing an existing release)
+  workflow_call:            # called by release.yml after it cuts a Release on a version bump
 
 jobs:
   build:

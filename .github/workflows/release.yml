@@ -1,0 +1,79 @@
+name: release
+
+# Cut a GitHub Release and publish to PyPI when the version in pyproject.toml is
+# bumped and merged to main. The pyproject version is the single source of truth:
+# if no Release exists for it yet, this workflow runs the tests, creates the Release
+# (auto-generated notes), then publishes to PyPI by reusing publish.yml.
+#
+# To ship a new version:
+#   1. In your PR, bump `version = "X.Y.Z"` in pyproject.toml.
+#   2. Merge to main. That's it — this workflow tags vX.Y.Z and publishes.
+# Pushes that don't change the version are no-ops (the Release already exists).
+#
+# Publishing is delegated to publish.yml via `workflow_call` (not the release event),
+# so no PAT is needed: a Release created by GITHUB_TOKEN would not trigger publish.yml
+# on its own. The PyPI trusted-publisher config stays `workflow: publish.yml` because
+# publish.yml is still the workflow that performs the upload.
+
+on:
+  push:
+    branches: [main]
+    paths: ["pyproject.toml"]    # only consider commits that could change the version
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      should_release: ${{ steps.v.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read version and check for an existing Release
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$VERSION is already released — nothing to do."
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$VERSION has no Release yet — releasing."
+          fi
+
+  # Gate the release on the full test matrix (reusable tests.yml).
+  test:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    needs: [check, test]
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write    # create the tag + GitHub Release
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --generate-notes \
+            --target "$GITHUB_SHA"
+
+  publish:
+    needs: [check, release]
+    if: needs.check.outputs.should_release == 'true'
+    permissions:
+      id-token: write    # PyPI Trusted Publishing (OIDC)
+      contents: read
+    uses: ./.github/workflows/publish.yml
