@@ -28,14 +28,16 @@ from .engine import evaluate_detection as _evaluate_detection
 from .engine import predict as _predict
 from .engine import train as _train
 from .model import build_model, load_dinov2_backbone
-from .serialization import load_model, save_checkpoint, wrap_checkpoint
+from .serialization import is_hf_ref, load_model, save_checkpoint, wrap_checkpoint
 
 #: Named dataset aliases that resolve to a bundled YAML config.
 _DATASET_ALIASES = {"coco": "configs/coco.yaml"}
 
 
 def _looks_like_checkpoint(spec: str | Path) -> bool:
-    """True if ``spec`` points at a checkpoint file or a run/weights folder."""
+    """True if ``spec`` points at a checkpoint file, a run/weights folder, or a Hub ref."""
+    if is_hf_ref(spec):
+        return True
     p = Path(spec)
     if p.suffix == ".pt":
         return True
@@ -84,6 +86,71 @@ class EoMT:
             raise ValueError(
                 f"{model!r} is neither a known size {tuple(SIZES)} nor an existing checkpoint."
             )
+
+    # ----------------------------------------------------------- huggingface
+    @classmethod
+    def from_pretrained(
+        cls,
+        repo_id: str,
+        *,
+        filename: str = "model.pt",
+        revision: str | None = None,
+        device: str = "auto",
+    ) -> "EoMT":
+        """Load a model from a Hugging Face Hub repo (downloaded once, then cached).
+
+            model = EoMT.from_pretrained("imagra93/eomt-l-coco")
+
+        Equivalent to ``EoMT("hf://<repo_id>/<filename>")``. ``revision`` pins a
+        branch, tag or commit; ``filename`` selects the checkpoint inside the repo.
+        """
+        ref = f"hf://{repo_id}/{filename}"
+        self = cls.__new__(cls)
+        self.device = device
+        self._pretrained = True
+        self._build_kwargs = {}
+        # Resolve via the Hub (cached) and load, recording the ref for repr.
+        from .serialization import download_from_hub
+        local = download_from_hub(ref, revision=revision)
+        self._model = load_model(local, device=device)
+        self._ckpt = ref
+        self.size = self._model.size
+        return self
+
+    def push_to_hub(
+        self,
+        repo_id: str,
+        *,
+        filename: str = "model.pt",
+        private: bool = True,
+        commit_message: str = "Upload EoMT checkpoint",
+    ) -> str:
+        """Upload this model's weights to a Hugging Face Hub repo (created if absent).
+
+        Writes a self-describing checkpoint (same format as :meth:`save`) and
+        uploads it as ``filename``. Returns the repo URL. Requires a Hub token
+        (``huggingface-cli login`` or ``HF_TOKEN``). Defaults to a **private** repo.
+        """
+        try:
+            from huggingface_hub import HfApi
+        except ImportError as e:  # pragma: no cover
+            raise ImportError("push_to_hub needs 'huggingface_hub' (pip install huggingface_hub).") from e
+
+        import tempfile
+
+        api = HfApi()
+        api.create_repo(repo_id, repo_type="model", private=private, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / filename
+            self.save(local)
+            api.upload_file(
+                path_or_fileobj=str(local),
+                path_in_repo=filename,
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=commit_message,
+            )
+        return f"https://huggingface.co/{repo_id}"
 
     # ------------------------------------------------------------------ model
     @property

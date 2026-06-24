@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Standalone EoMT (Encoder-only Mask Transformer) for instance segmentation, with DINOv2 init, COCO training/validation and inference."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "attr-eomt contributors" }]
 keywords = ["eomt", "dinov2", "instance-segmentation", "transformers", "coco"]
 classifiers = [
@@ -28,14 +29,17 @@ dependencies = [
     "tqdm>=4.65.0",
     "PyYAML>=6.0",
     "requests>=2.25.0",
+    "huggingface_hub>=0.23.0",
 ]
 
 [project.optional-dependencies]
 logging = ["tensorboard>=2.10", "wandb>=0.15"]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "build>=1.0", "twine>=5.0"]
 
 [project.urls]
 Homepage = "https://github.com/imagra93/attr-eomt"
+Repository = "https://github.com/imagra93/attr-eomt"
+Issues = "https://github.com/imagra93/attr-eomt/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["eomt"]

@@ -111,15 +111,53 @@ def load_raw(path: str | Path, *, map_location: Any = "cpu") -> dict[str, Any]:
     return torch.load(path, map_location=map_location, weights_only=False)
 
 
-def resolve_checkpoint(path: str | Path, *, prefer: str = "best") -> Path:
-    """Resolve a checkpoint path that may be a file **or** a run/weights folder.
+#: Default checkpoint filename used for Hugging Face Hub repos when none is given.
+HF_DEFAULT_FILENAME = "model.pt"
 
-    A file is returned as-is. A directory is searched — itself and its
-    ``weights/`` subdir — for ``best.pt`` / ``last.pt``. ``prefer`` sets the
-    order: ``"best"`` for inference, ``"last"`` for resuming training. So
-    ``runs/train/eomt`` (or ``runs/train/eomt/weights``) resolves to the right
-    checkpoint without naming the file.
+
+def is_hf_ref(spec: str | Path) -> bool:
+    """True if ``spec`` is a Hugging Face Hub reference (``hf://owner/repo[/file]``)."""
+    return str(spec).startswith("hf://")
+
+
+def download_from_hub(ref: str | Path, *, revision: str | None = None) -> Path:
+    """Download a checkpoint from the Hugging Face Hub and return its local cached path.
+
+    ``ref`` is ``hf://<owner>/<repo>`` (resolves to :data:`HF_DEFAULT_FILENAME`) or
+    ``hf://<owner>/<repo>/<path/to/file.pt>`` for a specific file. The download is
+    cached by ``huggingface_hub``, so repeated loads don't re-fetch.
     """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "loading weights from the Hugging Face Hub needs 'huggingface_hub' "
+            "(pip install huggingface_hub)."
+        ) from e
+
+    body = str(ref)[len("hf://"):].strip("/")
+    parts = body.split("/")
+    if len(parts) < 2:
+        raise ValueError(
+            f"invalid hf reference {ref!r}; expected 'hf://<owner>/<repo>[/<file>]'."
+        )
+    repo_id = "/".join(parts[:2])
+    filename = "/".join(parts[2:]) or HF_DEFAULT_FILENAME
+    return Path(hf_hub_download(repo_id=repo_id, filename=filename, revision=revision))
+
+
+def resolve_checkpoint(path: str | Path, *, prefer: str = "best") -> Path:
+    """Resolve a checkpoint path that may be a file, a run/weights folder, or a Hub ref.
+
+    A ``hf://owner/repo[/file]`` reference is downloaded from the Hugging Face Hub
+    (cached) and the local path returned. A file is returned as-is. A directory is
+    searched — itself and its ``weights/`` subdir — for ``best.pt`` / ``last.pt``.
+    ``prefer`` sets the order: ``"best"`` for inference, ``"last"`` for resuming
+    training. So ``runs/train/eomt`` (or ``runs/train/eomt/weights``) resolves to
+    the right checkpoint without naming the file.
+    """
+    if is_hf_ref(path):
+        return download_from_hub(path)
     p = Path(path)
     if p.is_file():
         return p

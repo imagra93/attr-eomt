@@ -19,6 +19,8 @@ from .config import EOMT_CONFIGS, SIZES, build_eomt_config
 from .model import EoMTEncoder, EoMTModel, build_model, load_dinov2_backbone
 from .postprocess import postprocess_instance
 from .serialization import (
+    download_from_hub,
+    is_hf_ref,
     load_model,
     load_raw,
     resolve_checkpoint,
@@ -41,6 +43,8 @@ __all__ = [
     "resolve_checkpoint",
     "save_checkpoint",
     "wrap_checkpoint",
+    "download_from_hub",
+    "is_hf_ref",
 ]
 
 try:  # pragma: no cover
