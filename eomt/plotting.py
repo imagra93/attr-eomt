@@ -67,7 +67,13 @@ def _plot_series(ax, x, cols, keys_labels, title, ylabel):
 
 
 def plot_metrics_csv(csv_path, out_png) -> None:
-    """Render the run's metrics history to ``out_png`` (overwrites)."""
+    """Render the run's metrics history to ``out_png`` (overwrites).
+
+    The mAP panels follow the run's primary task: segmentation runs have
+    ``val/segm/*`` columns and are plotted as segm mAP; detection runs only ever
+    write ``val/bbox/*`` (see the trainer's CSV header), so those are plotted as
+    bbox mAP instead — otherwise a detect run would show two empty segm panels.
+    """
     csv_path, out_png = Path(csv_path), Path(out_png)
     fields, cols = _read_csv(csv_path)
     if "epoch" not in cols or not cols["epoch"]:
@@ -75,20 +81,24 @@ def plot_metrics_csv(csv_path, out_png) -> None:
     x = cols["epoch"]
     plt = _use_agg()
 
+    # Primary eval task: segm when present (instance), else bbox (detect).
+    task = "segm" if any(f.startswith("val/segm/") for f in fields) else "bbox"
+
     aux_keys = [k for k in fields if k.startswith(("train/aux_acc/", "val/aux_acc/"))]
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     _plot_series(axes[0, 0], x, cols, [("train/loss", "train loss")], "Loss", "loss")
     _plot_series(
         axes[0, 1], x, cols,
-        [("val/segm/mAP", "mAP"), ("val/segm/mAP50", "mAP50"), ("val/segm/mAP75", "mAP75")],
-        "Val segm mAP", "mAP",
+        [(f"val/{task}/mAP", "mAP"), (f"val/{task}/mAP50", "mAP50"),
+         (f"val/{task}/mAP75", "mAP75")],
+        f"Val {task} mAP", "mAP",
     )
     _plot_series(
         axes[1, 0], x, cols,
-        [("val/segm/mAP_small", "small"), ("val/segm/mAP_medium", "medium"),
-         ("val/segm/mAP_large", "large")],
-        "Val segm mAP by size", "mAP",
+        [(f"val/{task}/mAP_small", "small"), (f"val/{task}/mAP_medium", "medium"),
+         (f"val/{task}/mAP_large", "large")],
+        f"Val {task} mAP by size", "mAP",
     )
     if aux_keys:
         _plot_series(

@@ -30,6 +30,7 @@ def main() -> None:
     p.add_argument("--batch", type=int, default=4, help="Micro-batch size (per optimizer micro-step).")
     p.add_argument("--imgsz", type=int, default=644, help="Square input size (divisible by 14).")
     p.add_argument("--device", default="auto")
+    p.add_argument("--name", default=None, help="Run name (default: eomt-{size}).")
     p.add_argument("--weights", default=None, help="Init from a checkpoint/run to fine-tune (warm start).")
     p.add_argument("--resume", default=None, help="Resume a run from a checkpoint/run folder.")
     args = p.parse_args()
@@ -42,6 +43,7 @@ def main() -> None:
         epochs=args.epochs,
         batch=args.batch,
         imgsz=args.imgsz,
+        name=args.name,
         resume=bool(args.resume),
     )
     if result["best_metric"] >= 0:
