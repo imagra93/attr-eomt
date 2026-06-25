@@ -95,6 +95,33 @@ post-processing automatically. Everything below applies identically to both.
 
 Default input is a patch-14-aligned square (`644 = 14 × 46`) so DINOv2 weights load 1:1.
 
+### Compute & inference speed
+
+Measured on a single **NVIDIA GeForce RTX 5090**, `644 × 644` input, batch size 1.
+GFLOPs are multiply-accumulates at that resolution (attention included); latency /
+throughput are the median over 50 runs after warm-up, under `torch.amp.autocast`
+(fp16) — the package's own inference path.
+
+**`instance` family** (masks + boxes + class):
+
+| size | params | GFLOPs | latency (fp16) | throughput (fp16) | throughput (fp32) |
+|------|--------|--------|----------------|-------------------|-------------------|
+| `s`  | 24.0 M | 128    | 8.4 ms         | 119 img/s         | 70 img/s          |
+| `b`  | 93.9 M | 430    | 17.4 ms        | 58 img/s          | 32 img/s          |
+| `l`  | 317 M  | 1144   | 30.2 ms        | 33 img/s          | 15 img/s          |
+
+**`detect` family** (boxes + class, no mask head):
+
+| size | params | GFLOPs | latency (fp16) | throughput (fp16) | throughput (fp32) |
+|------|--------|--------|----------------|-------------------|-------------------|
+| `s`  | 22.7 M | 89     | 2.9 ms         | 348 img/s         | 120 img/s         |
+| `b`  | 88.6 M | 276    | 5.3 ms         | 190 img/s         | 60 img/s          |
+| `l`  | 308 M  | 881    | 13.6 ms        | 74 img/s          | 21 img/s          |
+
+Dropping the mask-upsampling head makes `detect` substantially lighter and ~1.3–3×
+faster. Figures are for the detector itself (backbone + queries + heads); the
+attribute heads add a thin linear/MLP per head and are negligible by design.
+
 ---
 
 ## ⭐ Method — factorizing the label space
