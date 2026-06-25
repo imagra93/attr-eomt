@@ -1,8 +1,11 @@
 """Device resolution shared across train / val / predict.
 
-``resolve_device("auto")`` returns CUDA when available — picking the GPU with the
-most free memory when several are present (handy when ``cuda:0`` is busy) — else
-CPU. An explicit ``"cpu"`` / ``"cuda:N"`` (or a ``torch.device``) is honored as-is.
+``resolve_device("auto")`` returns ``cuda:0`` when CUDA is available (even with
+several GPUs present — pick a specific card with an explicit ``"cuda:N"``), else
+CPU. Defaulting to a single fixed device keeps a run on one GPU: ``auto`` is
+resolved more than once per run (model load, then training), and a "least busy"
+heuristic could land those calls on different cards and split the run across both.
+An explicit ``"cpu"`` / ``"cuda:N"`` (or a ``torch.device``) is honored as-is.
 The first time each device is resolved, one line is logged so it is always clear
 which device a run landed on.
 """
@@ -15,29 +18,12 @@ import torch
 _logged: set[str] = set()
 
 
-def _least_busy_cuda() -> int:
-    """Return the index of the CUDA device with the most free memory."""
-    best_idx, best_free = 0, -1
-    for i in range(torch.cuda.device_count()):
-        try:
-            free, _total = torch.cuda.mem_get_info(i)
-        except Exception:  # pragma: no cover - driver quirks; fall back to index 0
-            free = 0
-        if free > best_free:
-            best_idx, best_free = i, free
-    return best_idx
-
-
 def resolve_device(device: str | torch.device = "auto", *, verbose: bool = True) -> torch.device:
     """Resolve a device spec to a concrete :class:`torch.device` (see module docstring)."""
     if isinstance(device, torch.device):
         dev = device
     elif device in ("", "auto"):
-        if torch.cuda.is_available():
-            idx = _least_busy_cuda() if torch.cuda.device_count() > 1 else 0
-            dev = torch.device(f"cuda:{idx}")
-        else:
-            dev = torch.device("cpu")
+        dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     else:
         dev = torch.device(device)
     if verbose:
