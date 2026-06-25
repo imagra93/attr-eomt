@@ -16,13 +16,13 @@ env/
 # Training artifacts
 runs/
 weights/
-data/
+/data/
 *.pt
 *.pth
 
 # Datasets (auto-downloaded)
 datasets/
-data/coco/
+/data/coco/
 scripts/sample_images/
 
 # Editor / OS
