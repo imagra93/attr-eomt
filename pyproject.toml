@@ -38,6 +38,7 @@ dev = ["pytest>=7.0", "build>=1.0", "twine>=5.0"]
 
 [project.urls]
 Homepage = "https://github.com/imagra93/attr-eomt"
+Documentation = "https://imagra93.github.io/attr-eomt"
 Repository = "https://github.com/imagra93/attr-eomt"
 Issues = "https://github.com/imagra93/attr-eomt/issues"
 

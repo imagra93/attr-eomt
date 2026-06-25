@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>attr-eomt — how the attribute heads work</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0e1318;
+    --panel:#151c24;
+    --panel-2:#1b232c;
+    --line:#26313c;
+    --ink:#d7e0e8;
+    --ink-dim:#8c9aa8;
+    --ink-faint:#5e6b78;
+    /* signal palette — each colour means one thing in the data flow */
+    --query:#4ec9b0;   /* the shared per-query embedding (the "bus") */
+    --primary:#5aa6f0; /* primary head: class + mask/box */
+    --aux:#e2b341;     /* auxiliary attribute heads */
+    --warn:#e07a5f;
+    --disp:'Space Grotesk',sans-serif;
+    --body:'IBM Plex Sans',sans-serif;
+    --mono:'IBM Plex Mono',monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:var(--body);font-size:17px;line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(circle at 12% -5%, rgba(78,201,176,.07), transparent 40%),
+      radial-gradient(circle at 90% 0%, rgba(90,166,240,.06), transparent 45%);
+  }
+  .wrap{max-width:920px;margin:0 auto;padding:0 24px}
+  a{color:var(--query);text-decoration:none;border-bottom:1px solid transparent}
+  a:hover{border-bottom-color:var(--query)}
+  code,.mono{font-family:var(--mono)}
+  ::selection{background:rgba(78,201,176,.28)}
+
+  /* ---------- hero ---------- */
+  header{padding:72px 0 40px;border-bottom:1px solid var(--line)}
+  .eyebrow{font-family:var(--mono);font-size:12.5px;letter-spacing:.22em;text-transform:uppercase;color:var(--query)}
+  h1{font-family:var(--disp);font-weight:700;font-size:clamp(34px,6vw,58px);line-height:1.02;margin:.45em 0 .3em;letter-spacing:-.02em}
+  h1 .frac{color:var(--aux)}
+  .lede{font-size:clamp(18px,2.4vw,21px);color:var(--ink-dim);max-width:62ch;margin:0}
+  .repo{margin-top:22px;font-family:var(--mono);font-size:13px;color:var(--ink-faint)}
+
+  /* ---------- sections ---------- */
+  section{padding:56px 0;border-bottom:1px solid var(--line)}
+  .tag{font-family:var(--mono);font-size:12px;letter-spacing:.2em;text-transform:uppercase;color:var(--ink-faint);display:flex;align-items:center;gap:12px;margin-bottom:18px}
+  .tag::before{content:"";width:26px;height:1px;background:var(--ink-faint)}
+  h2{font-family:var(--disp);font-weight:600;font-size:clamp(25px,3.6vw,34px);letter-spacing:-.01em;margin:0 0 .55em;line-height:1.1}
+  h3{font-family:var(--disp);font-weight:600;font-size:20px;margin:34px 0 10px}
+  p{margin:0 0 16px}
+  .dim{color:var(--ink-dim)}
+  strong{color:#eef3f7;font-weight:600}
+  .q-em{color:var(--query);font-weight:600}
+  .pr-em{color:var(--primary);font-weight:600}
+  .ax-em{color:var(--aux);font-weight:600}
+
+  /* ---------- code ---------- */
+  pre{background:#0a0e12;border:1px solid var(--line);border-radius:10px;padding:18px 20px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;line-height:1.6;color:#bcd0c9;margin:18px 0}
+  pre .c{color:#566571;font-style:italic}
+  pre .k{color:#5aa6f0}
+  pre .s{color:#e2b341}
+  pre .f{color:#4ec9b0}
+  :not(pre)>code{background:var(--panel-2);border:1px solid var(--line);padding:1px 6px;border-radius:5px;font-size:.86em;color:#c9d8d2}
+
+  /* ---------- callout ---------- */
+  .note{display:flex;gap:14px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--aux);border-radius:8px;padding:16px 18px;margin:22px 0}
+  .note .ic{font-family:var(--mono);color:var(--aux);font-weight:600;flex:none}
+  .note p{margin:0;font-size:15.5px;color:var(--ink-dim)}
+  .note.q{border-left-color:var(--query)} .note.q .ic{color:var(--query)}
+
+  /* ---------- step list ---------- */
+  ol.steps{list-style:none;counter-reset:s;padding:0;margin:24px 0}
+  ol.steps li{counter-increment:s;position:relative;padding:0 0 22px 52px;border-left:1px solid var(--line);margin-left:14px}
+  ol.steps li:last-child{border-left-color:transparent;padding-bottom:0}
+  ol.steps li::before{content:counter(s,decimal-leading-zero);position:absolute;left:-15px;top:-2px;width:30px;height:30px;background:var(--bg);border:1px solid var(--aux);color:var(--aux);border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-size:12px;font-weight:600}
+  ol.steps li b{color:#eef3f7;font-weight:600;font-family:var(--disp)}
+  ol.steps li .d{color:var(--ink-dim);font-size:15.5px;display:block;margin-top:2px}
+
+  /* ---------- the signature diagram ---------- */
+  .fig{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:8px;margin:26px 0}
+  .fig svg{display:block;width:100%;height:auto}
+  .cap{font-size:13.5px;color:var(--ink-faint);font-family:var(--mono);margin:10px 4px 4px;padding:0 8px}
+
+  /* ---------- factorize widget ---------- */
+  .widget{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:24px;margin:26px 0}
+  .widget h3{margin-top:0}
+  .ctrl{display:grid;grid-template-columns:auto 1fr auto;gap:10px 16px;align-items:center;margin:6px 0}
+  .ctrl label{font-family:var(--mono);font-size:13px;color:var(--ink-dim)}
+  .ctrl output{font-family:var(--mono);font-size:14px;color:var(--ink);text-align:right;min-width:2ch}
+  input[type=range]{-webkit-appearance:none;appearance:none;height:4px;background:var(--line);border-radius:3px;outline:none}
+  input[type=range]:focus-visible{box-shadow:0 0 0 3px rgba(78,201,176,.4)}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--query);cursor:pointer;border:2px solid var(--bg)}
+  input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--query);cursor:pointer;border:2px solid var(--bg)}
+  .verdict{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:22px}
+  .card{border:1px solid var(--line);border-radius:10px;padding:16px;text-align:center;background:var(--panel-2)}
+  .card .lab{font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint)}
+  .card .big{font-family:var(--disp);font-weight:700;font-size:38px;line-height:1.1;margin:6px 0 2px}
+  .card.flat{border-color:rgba(224,122,95,.4)} .card.flat .big{color:var(--warn)}
+  .card.fac{border-color:rgba(78,201,176,.4)} .card.fac .big{color:var(--query)}
+  .card .sub{font-size:12.5px;color:var(--ink-dim);font-family:var(--mono)}
+  .gap{text-align:center;margin-top:16px;font-size:14.5px;color:var(--ink-dim)}
+  .gap b{color:var(--aux);font-family:var(--mono)}
+
+  /* ---------- table ---------- */
+  table{width:100%;border-collapse:collapse;margin:20px 0;font-size:14.5px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line)}
+  th{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint);font-weight:500}
+  td code{font-size:.92em}
+
+  footer{padding:48px 0 80px;color:var(--ink-faint);font-size:13.5px;font-family:var(--mono)}
+  footer a{color:var(--ink-dim)}
+
+  @media (max-width:560px){
+    body{font-size:16px}
+    .verdict{grid-template-columns:1fr}
+    ol.steps li{padding-left:44px}
+  }
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  .pulse{animation:pulse 2.6s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="eyebrow">Encoder-only Mask Transformer · annotated</div>
+    <h1>One query embedding,<br><span class="frac">many</span> independent labels.</h1>
+    <p class="lede">attr-eomt is a standalone EoMT detector whose distinguishing trick is small: it reads <em>extra</em> per-instance attributes straight off the embedding the detector already computes — for free, without bloating the class list.</p>
+    <div class="repo">imagra93/attr-eomt · Apache-2.0 · this page focuses on the ⭐ auxiliary attribute heads</div>
+  </div>
+</header>
+
+<main class="wrap">
+
+<!-- ============ THE BASE ============ -->
+<section>
+  <div class="tag">The base it builds on</div>
+  <h2>EoMT in one breath</h2>
+  <p>Before the attributes make sense, the host model: <strong>EoMT</strong> is a <strong>DINOv2-with-registers ViT</strong> whose last few transformer blocks are augmented with a fixed set of <strong>learnable queries</strong> (the Mask2Former idea). Each query is one "slot" that learns to latch onto one object instance.</p>
+  <p>After the encoder runs, every query produces a single vector — the <span class="q-em">per-query embedding</span>, shape <code>[B, Q, hidden]</code> (batch × queries × width). The whole model is essentially "turn that embedding into predictions":</p>
+  <ul class="dim">
+    <li>the <span class="pr-em">class head</span> (<code>class_predictor</code>) turns it into a primary label,</li>
+    <li>the <span class="pr-em">mask head</span> (or a box head, in the <code>detect</code> family) turns it into geometry.</li>
+  </ul>
+  <p>It's <strong>NMS-free</strong>: two overlapping cars stay two distinct queries instead of being merged by non-max suppression. That property is what lets attributes stay attached to the right instance.</p>
+
+  <table>
+    <thead><tr><th>size</th><th>backbone</th><th>hidden</th><th>queries</th></tr></thead>
+    <tbody>
+      <tr><td><code>s</code></td><td>DINOv2-small</td><td>384</td><td>100</td></tr>
+      <tr><td><code>b</code></td><td>DINOv2-base</td><td>768</td><td>200</td></tr>
+      <tr><td><code>l</code></td><td>DINOv2-large</td><td>1024</td><td>200</td></tr>
+    </tbody>
+  </table>
+  <p class="dim" style="font-size:15px">Two families share all of the above and differ only in the geometry head: <code>instance</code> → masks, <code>detect</code> → boxes. Everything about attributes applies identically to both.</p>
+</section>
+
+<!-- ============ THE PROBLEM ============ -->
+<section>
+  <div class="tag">Why attributes exist</div>
+  <h2>The label space explodes</h2>
+  <p>A normal detector has one flat list of classes. So when an object has a <em>type</em> <strong>and</strong> a <em>colour</em> <strong>and</strong> a <em>state</em>, the only way to express it is the Cartesian product: <code>type × colour × state</code>. That blows up combinatorially, starves each leaf class of examples, and multiplies the targets the Hungarian matcher has to assign.</p>
+  <p><strong>attr-eomt factorizes instead.</strong> Keep the primary taxonomy small and general (<code>car</code>, <code>apple</code>, <code>person</code>); push orthogonal distinctions into <span class="ax-em">independent heads</span> that add, not multiply. Drag the sliders — this is the entire argument for the feature:</p>
+
+  <div class="widget">
+    <h3>Flat label space vs. factorized heads</h3>
+    <div class="ctrl">
+      <label for="t">primary types</label>
+      <input id="t" type="range" min="2" max="12" value="4" aria-label="number of primary types">
+      <output id="to">4</output>
+    </div>
+    <div class="ctrl">
+      <label for="c">colour values</label>
+      <input id="c" type="range" min="2" max="12" value="6" aria-label="number of colour values">
+      <output id="co">6</output>
+    </div>
+    <div class="ctrl">
+      <label for="d">damage states</label>
+      <input id="d" type="range" min="2" max="8" value="3" aria-label="number of damage states">
+      <output id="do">3</output>
+    </div>
+    <div class="verdict">
+      <div class="card flat">
+        <div class="lab">Flat — one head</div>
+        <div class="big" id="flat">72</div>
+        <div class="sub" id="flatx">4 × 6 × 3 leaf classes</div>
+      </div>
+      <div class="card fac">
+        <div class="lab">Factorized — 3 heads</div>
+        <div class="big" id="fac">13</div>
+        <div class="sub" id="facx">4 + 6 + 3 outputs</div>
+      </div>
+    </div>
+    <p class="gap">The flat space is <b id="ratio">5.5×</b> larger — and each of those leaves has to be learned from its own scarce examples. Factorized heads each see <em>every</em> instance.</p>
+  </div>
+
+  <div class="note q">
+    <span class="ic">↳</span>
+    <p>Because the heads are independent, the model can predict <code>red</code> on a class it <em>never saw in red</em> during training — it composes <span class="ax-em">attribute × class</span> combinations a flat label space cannot even represent.</p>
+  </div>
+</section>
+
+<!-- ============ THE WIRING (signature diagram) ============ -->
+<section>
+  <div class="tag">How it's wired</div>
+  <h2>The heads tap the same embedding</h2>
+  <p>The key implementation idea: the attribute heads don't get a new feature extractor. They read the <span class="q-em">exact same per-query embedding</span> that feeds <code>class_predictor</code> — captured non-invasively with a PyTorch <strong>forward hook</strong>. The detector doesn't even know they're there.</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 880 430" role="img" aria-label="Diagram: image flows through DINOv2 encoder with learnable queries to a per-query embedding, which fans out to the primary class head, the mask/box head, and several auxiliary attribute heads.">
+      <defs>
+        <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#5e6b78"/>
+        </marker>
+        <marker id="arq" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+          <path d="M0,0 L9,4.5 L0,9 z" fill="#4ec9b0"/>
+        </marker>
+      </defs>
+      <style>
+        .bx{fill:#1b232c;stroke:#26313c;stroke-width:1.4;rx:9}
+        .lbl{font-family:'IBM Plex Mono',monospace;font-size:13px;fill:#d7e0e8}
+        .sub{font-family:'IBM Plex Mono',monospace;font-size:10.5px;fill:#5e6b78}
+        .hd{font-family:'Space Grotesk',sans-serif;font-size:13.5px;font-weight:600}
+        .flow{stroke:#5e6b78;stroke-width:1.6;fill:none}
+        .flowq{stroke:#4ec9b0;stroke-width:2.2;fill:none}
+      </style>
+
+      <!-- image -->
+      <rect class="bx" x="20" y="180" width="118" height="64" rx="9"/>
+      <text class="lbl" x="79" y="208" text-anchor="middle">image</text>
+      <text class="sub" x="79" y="226" text-anchor="middle">644×644</text>
+
+      <!-- encoder -->
+      <rect class="bx" x="180" y="150" width="180" height="124" rx="9" stroke="#5aa6f0"/>
+      <text class="hd" x="270" y="190" text-anchor="middle" fill="#5aa6f0">DINOv2 ViT</text>
+      <text class="sub" x="270" y="210" text-anchor="middle">last blocks +</text>
+      <text class="sub" x="270" y="225" text-anchor="middle">learnable queries</text>
+      <text class="sub" x="270" y="252" text-anchor="middle" fill="#8c9aa8">NMS-free</text>
+
+      <!-- query embedding bus -->
+      <rect x="430" y="186" width="150" height="58" rx="9" fill="#10201c" stroke="#4ec9b0" stroke-width="1.8"/>
+      <text class="lbl" x="505" y="210" text-anchor="middle" fill="#4ec9b0">query_embed</text>
+      <text class="sub" x="505" y="228" text-anchor="middle" fill="#3f8a78">[B, Q, hidden]</text>
+
+      <!-- hook tag -->
+      <text class="sub" x="505" y="172" text-anchor="middle" fill="#8c9aa8" class="pulse">▲ forward hook on class_predictor</text>
+
+      <!-- arrows in -->
+      <path class="flow" d="M138,212 H176" marker-end="url(#ar)"/>
+      <path class="flow" d="M360,212 H426" marker-end="url(#ar)"/>
+
+      <!-- fan-out -->
+      <!-- primary class -->
+      <path class="flowq" d="M580,205 C640,205 640,86 690,86" marker-end="url(#arq)"/>
+      <rect class="bx" x="694" y="62" width="172" height="48" stroke="#5aa6f0"/>
+      <text class="lbl" x="780" y="83" text-anchor="middle" fill="#5aa6f0">class_predictor</text>
+      <text class="sub" x="780" y="99" text-anchor="middle">primary class · nc+1</text>
+
+      <!-- mask/box -->
+      <path class="flowq" d="M580,215 C636,215 636,150 690,150" marker-end="url(#arq)"/>
+      <rect class="bx" x="694" y="126" width="172" height="48" stroke="#5aa6f0"/>
+      <text class="lbl" x="780" y="147" text-anchor="middle" fill="#5aa6f0">mask / box head</text>
+      <text class="sub" x="780" y="163" text-anchor="middle">geometry</text>
+
+      <!-- aux heads -->
+      <path class="flowq" d="M580,225 C636,225 636,222 690,222" marker-end="url(#arq)"/>
+      <rect class="bx" x="694" y="198" width="172" height="48" stroke="#e2b341"/>
+      <text class="lbl" x="780" y="219" text-anchor="middle" fill="#e2b341">aux head · "ripeness"</text>
+      <text class="sub" x="780" y="235" text-anchor="middle">3 classes</text>
+
+      <path class="flowq" d="M580,233 C630,233 630,286 690,286" marker-end="url(#arq)"/>
+      <rect class="bx" x="694" y="262" width="172" height="48" stroke="#e2b341"/>
+      <text class="lbl" x="780" y="283" text-anchor="middle" fill="#e2b341">aux head · "grade"</text>
+      <text class="sub" x="780" y="299" text-anchor="middle">2 classes</text>
+
+      <path class="flowq" d="M580,240 C624,240 624,350 690,350" marker-end="url(#arq)" stroke-dasharray="3 4"/>
+      <rect class="bx" x="694" y="326" width="172" height="48" stroke="#e2b341" stroke-dasharray="4 4"/>
+      <text class="lbl" x="780" y="354" text-anchor="middle" fill="#8c9aa8">… as many as the data defines</text>
+
+      <text class="sub" x="640" y="408" text-anchor="middle" fill="#5e6b78">teal = the one shared embedding · every head is just a small classifier on top of it</text>
+    </svg>
+    <div class="cap">model.py — a forward hook stashes the input to class_predictor; aux heads live in an nn.ModuleDict keyed by name.</div>
+  </div>
+
+  <p>In code it's about as small as it sounds. Each head is built by <code>_build_aux_head</code> — a bare linear probe, or a tiny MLP if you ask for more layers:</p>
+<pre><span class="c"># model.py — one head per attribute spec, sharing one arch</span>
+self.aux_heads = nn.ModuleDict({
+    s.name: _build_aux_head(hidden, s.num_classes, arch)  <span class="c"># Linear, or small MLP</span>
+    for s in self.aux_specs
+})
+
+<span class="c"># non-invasive: grab the embedding feeding the class head</span>
+self.eomt.class_predictor.register_forward_hook(self._capture_query_embed)
+
+<span class="k">def</span> <span class="f">_capture_query_embed</span>(self, _m, inputs, _out):
+    self._query_embed = inputs[0]   <span class="c"># [B, Q, hidden]</span></pre>
+  <p class="dim" style="font-size:15px">Default head arch is a 2-layer MLP (<code>Linear → LayerNorm → GELU → Linear</code>); <code>layers=1</code> makes it a pure linear probe. The arch is stored in the checkpoint, so reloading rebuilds identical modules.</p>
+</section>
+
+<!-- ============ TRAINING ============ -->
+<section>
+  <div class="tag">Training — aux_cls.py</div>
+  <h2>It rides on the detector's own matching</h2>
+  <p>The clever part of training is that attributes never run their own matcher. Detection already solves "which query is responsible for which ground-truth object" via the <strong>Hungarian matcher</strong>. Attributes simply reuse that same query→GT assignment, then read the answer off the matched queries.</p>
+
+  <ol class="steps">
+    <li><b>Match</b><span class="d">Reuse <code>model.eomt.criterion.matcher</code> on the model's geometry (masks for <code>instance</code>, boxes for <code>detect</code>) to get <code>(query_idx, gt_idx)</code> pairs — the <em>same</em> assignment the detection loss used.</span></li>
+    <li><b>Gate (optional)</b><span class="d">The matcher pairs <em>every</em> GT, even barely-overlapping ones (common early on). <code>gate_indices</code> drops pairs whose predicted↔GT IoU is below a threshold, so attributes only learn from queries that actually localize the object.</span></li>
+    <li><b>Gather</b><span class="d"><code>_gather_matched</code> pulls just the matched rows out of <code>query_embed</code> → a tight <code>[N, hidden]</code> tensor of "real" instances.</span></li>
+    <li><b>Loss</b><span class="d">Each head runs on that tensor; cross-entropy against the per-instance attribute labels, summed across heads, scaled by <code>aux_w</code> (default 1.0), and added to the detector loss. Missing labels use <code>ignore_index</code> and contribute nothing.</span></li>
+    <li><b>Graph-safe zero</b><span class="d">If no query matched in a batch, it returns <code>embed.sum()*0</code> — a real zero that keeps autograd happy instead of crashing.</span></li>
+  </ol>
+
+<pre><span class="c"># aux_cls.py — the whole supervision, condensed</span>
+indices  = match_queries(model, out, geom_labels, class_labels)  <span class="c"># reuse Hungarian</span>
+indices  = gate_indices(out, indices, ..., iou_thr=0.5)          <span class="c"># keep well-localized</span>
+matched  = gather_matched(out, indices)                          <span class="c"># [N, hidden]</span>
+<span class="k">for</span> name, head <span class="k">in</span> model.aux_heads.items():
+    logits = head(matched)
+    loss  += w * F.<span class="f">cross_entropy</span>(logits, gt[name], ignore_index=-100)</pre>
+
+  <div class="note">
+    <span class="ic">★</span>
+    <p>The attribute "rides along for free": it reuses the backbone <em>and</em> the detector's matched queries, adding only a thin head and one CE term — not a second model or a second pass.</p>
+  </div>
+
+  <h3>It never hijacks model selection</h3>
+  <p>Per-head matched-query accuracy is printed live and written to <code>metrics.csv</code>, but it <strong>never drives</strong> which checkpoint becomes <code>best.pt</code> — that's still <code>segm/mAP</code> (or <code>bbox/mAP</code>). The attribute genuinely tags along without changing the detector's training contract.</p>
+</section>
+
+<!-- ============ DATA + INFERENCE ============ -->
+<section>
+  <div class="tag">Data &amp; inference</div>
+  <h2>Attributes live inside the COCO annotations</h2>
+  <p>Because every COCO annotation is already a per-instance object, alignment is automatic — <code>pycocotools</code> still parses the file untouched. Two additions define the heads; no YAML changes, the heads (count, classes, names) are discovered straight from the JSON, just like <code>nc</code>.</p>
+
+  <h3>1 · a top-level <code>attributes</code> list (the vocabulary)</h3>
+<pre>"attributes": [
+  {"name": <span class="s">"ripeness"</span>, "categories": [
+     {"id": 0, "name": "unripe"}, {"id": 1, "name": "turning"}, {"id": 2, "name": "ripe"}]},
+  {"name": <span class="s">"grade"</span>, "categories": [
+     {"id": 10, "name": "A"}, {"id": 20, "name": "B"}]}
+]</pre>
+  <h3>2 · a per-annotation <code>attributes</code> map</h3>
+<pre>{ "id": 1, "image_id": 42, "category_id": 1, "bbox": [...], "segmentation": [...],
+  "attributes": {<span class="s">"ripeness"</span>: 1, <span class="s">"grade"</span>: 20} }</pre>
+  <p class="dim" style="font-size:15px">Raw ids are remapped to a contiguous <code>0..n-1</code> per head (so grade's <code>10/20</code> → <code>0/1</code>). A missing value defaults to <code>0</code>; a JSON with no <code>attributes</code> is just detection-only, exactly as before.</p>
+
+  <h3>At inference</h3>
+  <p>Each kept detection gets an <code>aux = {head: {"ids", "probs"}}</code> entry, and <code>predict(plot=True)</code> renders every attribute next to the class label, using the names stored in the checkpoint — the primary class on the first row, each attribute + its confidence on the row beneath.</p>
+  <div class="note q">
+    <span class="ic">↳</span>
+    <p>Roadmap idea worth noting: train an aux head with a <em>contrastive</em> objective and its per-instance embedding becomes a <strong>re-identification vector</strong> — matching the same object across frames and cameras, reusing the detector's matched queries instead of a separate tracker.</p>
+  </div>
+</section>
+
+<!-- ============ RECAP ============ -->
+<section style="border-bottom:none">
+  <div class="tag">The whole idea, once more</div>
+  <h2>Factorize the labels, tap the embedding, reuse the match</h2>
+  <p>Keep the primary taxonomy small and well-populated. For everything orthogonal — colour, state, grade, laterality — attach an <span class="ax-em">independent head</span> that reads the <span class="q-em">per-query embedding</span> the detector already produces, supervise it on the <span class="pr-em">detector's own Hungarian match</span>, and add a cross-entropy term. You get composable, generalizing per-instance attributes for almost no extra compute, and the primary detection metric stays exactly as it was.</p>
+</section>
+
+</main>
+
+<footer class="wrap">
+  Built from imagra93/attr-eomt — README + eomt/aux_cls.py, eomt/model.py, eomt/config.py.
+  Source: <a href="https://github.com/imagra93/attr-eomt">github.com/imagra93/attr-eomt</a> · Apache-2.0.
+</footer>
+
+<script>
+(function(){
+  var t=document.getElementById('t'),c=document.getElementById('c'),d=document.getElementById('d');
+  var to=document.getElementById('to'),co=document.getElementById('co'),doo=document.getElementById('do');
+  var flat=document.getElementById('flat'),fac=document.getElementById('fac');
+  var flatx=document.getElementById('flatx'),facx=document.getElementById('facx'),ratio=document.getElementById('ratio');
+  function upd(){
+    var T=+t.value,C=+c.value,D=+d.value;
+    to.textContent=T;co.textContent=C;doo.textContent=D;
+    var f=T*C*D, g=T+C+D;
+    flat.textContent=f; fac.textContent=g;
+    flatx.textContent=T+' × '+C+' × '+D+' leaf classes';
+    facx.textContent=T+' + '+C+' + '+D+' outputs';
+    ratio.textContent=(f/g).toFixed(1)+'×';
+  }
+  [t,c,d].forEach(function(s){s.addEventListener('input',upd)});
+  upd();
+})();
+</script>
+</body>
+</html>

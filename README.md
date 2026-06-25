@@ -1,18 +1,40 @@
-# attr-eomt
+<div align="center">
 
-Standalone **EoMT** (Encoder-only Mask Transformer) for **instance segmentation**
-and **object detection**, extended with one feature that sets it apart:
-**secondary per-instance classification heads** ("auxiliary classes"). Alongside the
-usual mask/box + class output, the model predicts **one or several independent
-attributes for every detected instance** — and they train and infer for free on top
-of the detector, without inflating the primary class space.
+<img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/00-hero-banner.png" alt="attr-eomt — Encoder-only Mask Transformer with per-instance attribute heads" width="100%">
 
-EoMT itself is a DINOv2-with-registers ViT whose last few transformer blocks are
-augmented with learnable queries (Mask2Former-style). This package builds it in three
-sizes, initializes the encoder from DINOv2, and provides training, per-epoch COCO-mAP
-validation, and inference/rendering — all behind a small `EoMT` class. It is a
-clean-room, Apache-2.0-compatible reimplementation; weights you train are yours to
-release.
+<p>
+  <a href="https://pypi.org/project/attr-eomt/"><img src="https://img.shields.io/pypi/v/attr-eomt.svg?color=4ec9b0" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/attr-eomt/"><img src="https://img.shields.io/pypi/pyversions/attr-eomt.svg" alt="Python versions"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
+  <a href="https://imagra93.github.io/attr-eomt"><img src="https://img.shields.io/badge/docs-annotated%20explainer-e2b341.svg" alt="Annotated explainer"></a>
+</p>
+
+**One query embedding, many independent labels.**
+
+📖 **[Read the annotated explainer →](https://imagra93.github.io/attr-eomt)**
+
+</div>
+
+---
+
+## Abstract
+
+**attr-eomt** is a standalone **EoMT** (Encoder-only Mask Transformer) for **instance
+segmentation** and **object detection**, extended with one feature that sets it apart:
+**independent per-instance attribute heads**. Alongside the usual mask/box + class
+output, the model predicts **one or several orthogonal attributes for every detected
+instance** — colour, state, grade, laterality, anything — read straight off the *same*
+per-query embedding the detector already computes. Instead of folding every distinction
+into one combinatorial class list, attr-eomt **factorizes the label space**: a small,
+well-populated primary taxonomy plus thin attribute heads that *add* rather than
+*multiply*. Each head reuses the detector's own Hungarian match, so attributes train
+and infer **for near-zero extra compute** — no second model, no second pass, and the
+primary detection metric is left exactly as it was. The result is composable,
+generalizing per-instance labels that can even predict `attribute × class` combinations
+never seen during training.
+
+It is a clean-room, Apache-2.0-compatible reimplementation: weights you train are yours
+to release.
 
 ```python
 from eomt import EoMT
@@ -26,7 +48,26 @@ model.predict("images/", plot=True)          # render masks/boxes + per-instance
 
 ---
 
-## Two model families: segmentation & detection
+## Architecture
+
+EoMT is a **DINOv2-with-registers ViT** whose last few transformer blocks are augmented
+with a fixed set of **learnable queries** (the Mask2Former idea) — each query is one
+"slot" that latches onto one object instance. After the encoder runs, every query emits
+a single vector, the **per-query embedding** of shape `[B, Q, hidden]`. The whole model
+is then just "turn that embedding into predictions": a **class head** for the primary
+label and a **mask/box head** for geometry. It is **NMS-free**, so two overlapping cars
+stay two distinct queries instead of being merged — the property that lets attributes
+stay attached to the right instance.
+
+The attribute heads add nothing to this picture except themselves: they tap the **exact
+same embedding** (captured non-invasively with a forward hook), each a small classifier
+on top.
+
+<div align="center">
+<img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/01-architecture.png" alt="Architecture: image → DINOv2 ViT with learnable queries → per-query embedding, fanning out to the class head, mask/box head and several auxiliary attribute heads" width="100%">
+</div>
+
+### Two model families: segmentation & detection
 
 Both families share the same DINOv2 encoder, query mechanism, NMS-free matching and
 auxiliary heads — they differ only in the head on top and what they output:
@@ -42,32 +83,38 @@ EoMT("l").train(data="coco", family="detect")     # boxes only
 ```
 
 The family is recorded in the checkpoint, so `val` / `predict` pick the right
-post-processing automatically. Everything below (sizes, auxiliary heads, recipe)
-applies to both.
+post-processing automatically. Everything below applies identically to both.
+
+### Models & sizes
+
+| size | backbone        | hidden | layers | heads | queries |
+|------|-----------------|--------|--------|-------|---------|
+| `s`  | DINOv2-small    | 384    | 12     | 6     | 100     |
+| `b`  | DINOv2-base     | 768    | 12     | 12    | 200     |
+| `l`  | DINOv2-large    | 1024   | 24     | 16    | 200     |
+
+Default input is a patch-14-aligned square (`644 = 14 × 46`) so DINOv2 weights load 1:1.
 
 ---
 
-## ⭐ Auxiliary per-instance attribute heads
+## ⭐ Method — factorizing the label space
 
-The primary task is **unchanged**: instance segmentation (or detection) over `nc`
-classes. On top of it you can attach **one or several independent secondary
-classifiers** — a per-instance *attribute* predicted for each detected object, read
-straight from that query's embedding. You can have as many heads as your data
-defines.
+This is the contribution. Conventional detectors fold every distinction into a single
+flat label space. When an object has both a *type* and several *attributes* — a car's
+make **and** its colour **and** whether a door is open — the only way to express that is
+the Cartesian product `type × colour × state × …`. That space explodes combinatorially,
+starves each leaf class of training examples, and breaks Hungarian matching by
+multiplying the query targets.
 
-### Why it matters
+**attr-eomt factorizes instead.** The primary head stays small and *general*; orthogonal
+attributes are predicted by independent secondary heads, each reading the same
+per-instance query embedding the detector already computes — they **add, not multiply**.
 
-Conventional detectors fold every distinction into a single flat label space. When an
-object has both a *type* and several *attributes* — a car's make **and** its colour
-**and** whether a door is open — the only way to express that is the Cartesian product
-`type × colour × state × …`. That space explodes combinatorially, starves each leaf
-class of training examples, and breaks Hungarian matching by multiplying the query
-targets.
+<div align="center">
+<img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/02-factorized-labels.png" alt="Flat label space (type × colour × state leaf classes) versus factorized independent heads (type + colour + state outputs)" width="100%">
+</div>
 
-**attr-eomt factorizes the label space instead.** The primary head stays small and
-*general*; orthogonal attributes are predicted by independent secondary heads, each
-reading the same per-instance query embedding the detector already computes. Because
-the heads are independent:
+Because the heads are independent:
 
 - **Categories stay collapsed and general.** Keep a compact, well-populated primary
   taxonomy (`car`, `person`, `fruit`) and push fine-grained or orthogonal distinctions
@@ -93,7 +140,7 @@ One model segments each fruit (primary classes `apple` / `banana` / `orange` /
 renderer prints the primary class + score on the first row and each attribute + its
 confidence on the row beneath it.
 
-![A bowl of fruit; each box labelled with its fruit class plus a ripeness and a grade](docs/examples/example_1.png)
+![A bowl of fruit; each box labelled with its fruit class plus a ripeness and a grade](https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/example_1.png)
 
 `ripeness` and `grade` are *orthogonal* — they vary independently — which is exactly
 the case that's awkward to fold into the primary class space. The same pattern fits
@@ -105,16 +152,28 @@ health**, **apparel → garment + pattern**.
 > through the package's own renderer ([`eomt.visualize.draw_instances`](eomt/visualize.py))
 > to show the output format — not a trained model's predictions.
 
-### How it works
+---
+
+## Training — it rides on the detector's own match
+
+Attributes never run their own matcher. Detection already solves "which query is
+responsible for which ground-truth object" via the **Hungarian matcher**; attributes
+simply reuse that same query→GT assignment and read the answer off the matched queries.
+
+<div align="center">
+<img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/03-training-flow.png" alt="Training flow: query_embed → Hungarian matcher (reused) → IoU gate → matched queries [N, hidden] → per-head cross-entropy → × aux_w → added to detector loss" width="100%">
+</div>
 
 - **Embedding source.** Each head reads the per-query embedding — the input to EoMT's
   `class_predictor`, captured with a forward hook (`[B, Q, hidden]`).
 - **Matching.** Supervision reuses EoMT's *own* Hungarian matcher
   (`model.eomt.criterion.matcher`), so every attribute is trained on the **same**
   query→GT assignment the detection loss used; the attribute is read *after* matching.
+- **Gate.** An optional IoU gate drops barely-overlapping matched pairs (common early in
+  training) so attributes only learn from queries that actually localize the object.
 - **Loss.** Cross-entropy per head over matched queries, summed across heads and scaled
   by `aux_w` (default `1.0`), added to the detector loss. Empty-match batches contribute
-  a graph-preserving zero.
+  a graph-preserving zero, and missing labels use `ignore_index` and contribute nothing.
 - **Checkpoint selection is unchanged.** The attribute "rides along": its per-head
   matched-query accuracy is shown live and written to `metrics.csv`, but never drives
   `best.pt` (still `segm/mAP` or `bbox/mAP`).
@@ -122,11 +181,14 @@ health**, **apparel → garment + pattern**.
   detections, and `predict(plot=True)` renders each attribute next to the class label
   using names stored in the checkpoint.
 
-### Data format (auto-discovered from the COCO JSON)
+---
+
+## Data format (auto-discovered from the COCO JSON)
 
 Attributes live **inside the COCO annotations** — each annotation is already a
 per-instance object, so alignment is automatic and `pycocotools` still parses it. Just
-two additions to a standard COCO file.
+two additions to a standard COCO file; **no YAML changes** — heads (count, classes,
+names) are discovered from the JSON, the same as `nc`.
 
 **1. A top-level `attributes` list** — one entry per head, defining its vocabulary:
 
@@ -166,33 +228,19 @@ Notes:
   `0`/`1`); `categories` may be omitted, in which case the id set is inferred.
 - A missing per-annotation value defaults to `0`; a JSON with **no** `attributes` ⇒
   detection-only, exactly as before.
-- No YAML changes needed — heads (count, classes, names) are discovered from the JSON,
-  the same as `nc`.
 
 A tiny, self-contained example (two heads, including a non-contiguous id set) lives in
 [sample_data/](sample_data/).
 
 ---
 
-## Models & sizes
-
-| size | backbone        | hidden | layers | heads | queries |
-|------|-----------------|--------|--------|-------|---------|
-| `s`  | DINOv2-small    | 384    | 12     | 6     | 100     |
-| `b`  | DINOv2-base     | 768    | 12     | 12    | 200     |
-| `l`  | DINOv2-large    | 1024   | 24     | 16    | 200     |
-
-Default input is a patch-14-aligned square (`644 = 14 × 46`) so DINOv2 weights load 1:1.
-
-### Install
+## Install
 
 ```bash
 pip install attr-eomt                  # from PyPI
 pip install "attr-eomt[logging]"       # + tensorboard/wandb
 pip install -e ".[dev]"                # from source (editable; [dev] adds pytest/build/twine)
 ```
-
----
 
 ## Usage
 
@@ -263,4 +311,3 @@ argument, so legacy behaviour is one override away.
   vector** — matching the same object across images, frames and cameras for tracking and
   retrieval. The aux head already produces a per-instance embedding from the detector's
   own matched queries; re-ID reuses that signal instead of bolting on a separate model.
-```
