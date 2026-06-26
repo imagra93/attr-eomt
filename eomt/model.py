@@ -97,6 +97,11 @@ class Embeddings(nn.Module):
         self.num_prefix_tokens = 1 + config.num_register_tokens
         self.position_embeddings = nn.Embedding(num_patches, config.hidden_size)
         self.register_buffer("position_ids", torch.arange(num_patches).expand((1, -1)), persistent=False)
+        # The pos-embed table is stored at the *trained* grid; ``forward`` interpolates
+        # it to whatever grid the actual input implies, so the model runs at any size.
+        self.patch_size = config.patch_size
+        g = config.image_size // config.patch_size
+        self.base_grid = (g, g)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         batch_size = pixel_values.shape[0]
@@ -104,7 +109,14 @@ class Embeddings(nn.Module):
         embeddings = self.patch_embeddings(pixel_values.to(dtype=target_dtype))
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
         register_tokens = self.register_tokens.expand(batch_size, -1, -1)
-        embeddings = embeddings + self.position_embeddings(self.position_ids)
+        # Native size -> use the stored table directly (identical numerics); otherwise
+        # bicubically interpolate the trained grid onto the actual input grid.
+        grid = (pixel_values.shape[-2] // self.patch_size, pixel_values.shape[-1] // self.patch_size)
+        if grid == self.base_grid:
+            pos = self.position_embeddings(self.position_ids)
+        else:
+            pos = _interp_pos_grid(self.position_embeddings.weight, self.base_grid, grid)[None]
+        embeddings = embeddings + pos
         embeddings = torch.cat([cls_tokens, register_tokens, embeddings], dim=1)
         return self.dropout(embeddings)
 
@@ -325,10 +337,14 @@ class EoMTEncoder(nn.Module):
 
     # --- prediction heads (mirrors HF predict) ------------------------------
 
-    def predict(self, logits: torch.Tensor):
+    def predict(self, logits: torch.Tensor, grid_size: tuple[int, int] | None = None):
         """Per-query heads. Returns ``(geometry, class_logits)``: mask logits
         ``(B, Q, h, w)`` for the instance family, box preds ``(B, Q, 4)`` for detect.
+
+        ``grid_size`` is the actual patch grid of the current input; it defaults to
+        the trained ``self.grid_size`` so legacy callers keep working.
         """
+        grid_size = grid_size or self.grid_size
         num_queries = self.config.num_queries
         query_tokens = logits[:, :num_queries, :]
         class_logits = self.class_predictor(query_tokens)
@@ -339,7 +355,7 @@ class EoMTEncoder(nn.Module):
         num_prefix = self.embeddings.num_prefix_tokens
         prefix_tokens = logits[:, num_queries + num_prefix :, :]
         prefix_tokens = prefix_tokens.transpose(1, 2)
-        prefix_tokens = prefix_tokens.reshape(prefix_tokens.shape[0], -1, *self.grid_size)
+        prefix_tokens = prefix_tokens.reshape(prefix_tokens.shape[0], -1, *grid_size)
 
         query_tokens = self.mask_head(query_tokens)
         prefix_tokens = self.upscale_block(prefix_tokens)
@@ -353,14 +369,15 @@ class EoMTEncoder(nn.Module):
             attn_mask[:, :num_query_tokens, encoder_start_tokens:][random_queries] = 1
         return attn_mask
 
-    def _build_attention_mask(self, hidden_states, masks_queries_logits, prob):
+    def _build_attention_mask(self, hidden_states, masks_queries_logits, prob, grid_size=None):
+        grid_size = grid_size or self.grid_size
         num_query_tokens = self.config.num_queries
         encoder_start_tokens = num_query_tokens + self.embeddings.num_prefix_tokens
         attention_mask = torch.ones(
             hidden_states.shape[0], hidden_states.shape[1], hidden_states.shape[1],
             device=hidden_states.device, dtype=torch.bool,
         )
-        interpolated_logits = F.interpolate(masks_queries_logits, size=self.grid_size, mode="bilinear")
+        interpolated_logits = F.interpolate(masks_queries_logits, size=grid_size, mode="bilinear")
         interpolated_logits = interpolated_logits.view(
             interpolated_logits.size(0), interpolated_logits.size(1), -1
         )
@@ -388,6 +405,11 @@ class EoMTEncoder(nn.Module):
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")
 
+        # Actual patch grid for this input (may differ from the trained grid when
+        # running at a non-native image size); threaded into the prediction heads.
+        ps = self.config.patch_size
+        grid = (pixel_values.shape[-2] // ps, pixel_values.shape[-1] // ps)
+
         hidden_states = self.embeddings(pixel_values)
 
         for idx, layer_module in enumerate(self.layers):
@@ -406,22 +428,22 @@ class EoMTEncoder(nn.Module):
                 # attention (no masks to focus on) — queries do full attention.
                 if in_query_blocks and self.training:
                     norm_hidden_states = self.layernorm(hidden_states)
-                    geom, cls = self.predict(norm_hidden_states)
+                    geom, cls = self.predict(norm_hidden_states, grid)
                     geom_per_layer += (geom,)
                     class_per_layer += (cls,)
             elif in_query_blocks and (self.training or self.attn_mask_probs[block_idx] > 0):
                 norm_hidden_states = self.layernorm(hidden_states)
-                masks_queries_logits, class_queries_logits = self.predict(norm_hidden_states)
+                masks_queries_logits, class_queries_logits = self.predict(norm_hidden_states, grid)
                 geom_per_layer += (masks_queries_logits,)
                 class_per_layer += (class_queries_logits,)
                 attention_mask = self._build_attention_mask(
-                    hidden_states, masks_queries_logits, self.attn_mask_probs[block_idx]
+                    hidden_states, masks_queries_logits, self.attn_mask_probs[block_idx], grid
                 )
 
             hidden_states = layer_module(hidden_states, attention_mask)
 
         sequence_output = self.layernorm(hidden_states)
-        geom_final, class_queries_logits = self.predict(sequence_output)
+        geom_final, class_queries_logits = self.predict(sequence_output, grid)
         geom_per_layer += (geom_final,)
         class_per_layer += (class_queries_logits,)
 
@@ -691,6 +713,26 @@ def _resize_patch_projection(weight: torch.Tensor, target_patch: int) -> torch.T
     )
 
 
+def _interp_pos_grid(
+    weight: torch.Tensor, src_hw: tuple[int, int], dst_hw: tuple[int, int]
+) -> torch.Tensor:
+    """Bicubically resize a flat ``(src_h*src_w, dim)`` patch pos-embed table to ``dst_hw``.
+
+    Returns a ``(dst_h*dst_w, dim)`` table; a no-op (returns ``weight`` unchanged)
+    when the grids already match. Used both at load time (DINOv2 -> EoMT) and at
+    inference time (trained grid -> the actual input grid) so the model can run at
+    any image size without a fixed-resolution pos-embed.
+    """
+    if src_hw == dst_hw:
+        return weight
+    sh, sw = src_hw
+    dh, dw = dst_hw
+    dim = weight.shape[-1]
+    grid = weight.reshape(1, sh, sw, dim).permute(0, 3, 1, 2).float()
+    grid = F.interpolate(grid, size=(dh, dw), mode="bicubic", align_corners=False)
+    return grid.permute(0, 2, 3, 1).reshape(dh * dw, dim).to(weight.dtype)
+
+
 def _resize_pos_embed(dinov2_pos: torch.Tensor, target_weight: torch.Tensor) -> torch.Tensor:
     """Map DINOv2 position embeddings onto EoMT's patches-only pos-embed table.
 
@@ -702,17 +744,10 @@ def _resize_pos_embed(dinov2_pos: torch.Tensor, target_weight: torch.Tensor) -> 
     """
     import math
 
-    dim = dinov2_pos.shape[-1]
     src_patches = dinov2_pos[0][1:]  # drop cls position
-    n_src = src_patches.shape[0]
-    n_tgt = target_weight.shape[0]
-    if n_src == n_tgt:
-        return src_patches
-    hs = int(math.isqrt(n_src))
-    ht = int(math.isqrt(n_tgt))
-    grid = src_patches.reshape(1, hs, hs, dim).permute(0, 3, 1, 2)
-    grid = F.interpolate(grid, size=(ht, ht), mode="bicubic", align_corners=False)
-    return grid.permute(0, 2, 3, 1).reshape(n_tgt, dim)
+    hs = int(math.isqrt(src_patches.shape[0]))
+    ht = int(math.isqrt(target_weight.shape[0]))
+    return _interp_pos_grid(src_patches, (hs, hs), (ht, ht))
 
 
 def load_dinov2_backbone(model: EoMTModel, *, verbose: bool = True) -> dict[str, int]:

@@ -55,6 +55,27 @@ def _looks_like_checkpoint(spec: str | Path) -> bool:
     return False
 
 
+def _resolve_imgsz(imgsz: int | None, model) -> int:
+    """Resolve an inference image size, defaulting to the model's trained size.
+
+    The ViT needs a size that is a multiple of the patch size (14); a request that
+    isn't is rounded *down* to the nearest valid size (with a warning) rather than
+    crashing, so ``imgsz=900`` quietly becomes 896.
+    """
+    if imgsz is None:
+        return int(model.image_size)
+    ps = int(getattr(model, "patch_size", 14))
+    snapped = max(ps, (int(imgsz) // ps) * ps)
+    if snapped != int(imgsz):
+        import warnings
+
+        warnings.warn(
+            f"imgsz={imgsz} is not a multiple of patch size {ps}; using {snapped} instead.",
+            stacklevel=3,
+        )
+    return snapped
+
+
 def _resolve_data(data: str | Path) -> dict:
     """Resolve a dataset spec (alias like ``"coco"`` or a YAML path) to absolute paths."""
     yaml_path = _DATASET_ALIASES.get(str(data), str(data))
@@ -204,11 +225,15 @@ class EoMT:
 
     # -------------------------------------------------------------------- val
     def val(self, data: str | Path = "coco", *, batch: int = 4, workers: int = 4,
-            conf_thres: float = 0.0, max_det: int = 100, letterbox: bool | None = None, **kw) -> dict:
+            conf_thres: float = 0.0, max_det: int = 100, letterbox: bool | None = None,
+            imgsz: int | None = None, **kw) -> dict:
         """Evaluate on a dataset's val split, returning COCO mAP metrics.
 
         Segmentation models report ``segm/*`` (+ ``bbox/*``); detection
-        (``family="detect"``) models report ``bbox/*`` only.
+        (``family="detect"``) models report ``bbox/*`` only. ``imgsz`` overrides the
+        evaluation image size (defaults to the trained size); the model interpolates
+        its positional embeddings to the new resolution, so any multiple of the patch
+        size works.
         """
         cfg = _resolve_data(data)
         if not (cfg["val_images"] and cfg["val_json"]):
@@ -218,7 +243,7 @@ class EoMT:
         dev = next(model.parameters()).device
         lb = letterbox if letterbox is not None else bool(getattr(model, "preprocess_letterbox", False))
         val_ds = CocoValImages(
-            cfg["val_images"], cfg["val_json"], imgsz=int(model.image_size), letterbox=lb,
+            cfg["val_images"], cfg["val_json"], imgsz=_resolve_imgsz(imgsz, model), letterbox=lb,
             mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None),
         )
         eval_fn = _evaluate_detection if getattr(model, "family", "instance") == "detect" else _evaluate
@@ -229,16 +254,19 @@ class EoMT:
 
     # ---------------------------------------------------------------- predict
     def predict(self, source: str | Path, *, plot: bool = False, save: str | None = "runs/predict",
-                conf_thres: float = 0.3, max_det: int = 100, mask_thresh: float = 0.5, **kw) -> list[dict]:
+                conf_thres: float = 0.3, max_det: int = 100, mask_thresh: float = 0.5,
+                imgsz: int | None = None, **kw) -> list[dict]:
         """Run inference on an image or a directory.
 
         Returns one result dict per image (``boxes`` / ``scores`` / ``classes`` /
         ``masks`` and, for models with secondary heads, ``aux``). With ``plot=True``
         each image is rendered with masks/boxes/labels and saved under ``save``.
+        ``imgsz`` overrides the inference image size (defaults to the trained size).
         """
         return _predict(
             self.model, str(source), plot=plot, save=save,
-            conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh, **kw,
+            conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
+            imgsz=_resolve_imgsz(imgsz, self.model), **kw,
         )
 
     # ------------------------------------------------------------------- save

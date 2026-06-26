@@ -274,13 +274,13 @@
       <!-- aux heads -->
       <path class="flowq" d="M580,225 C636,225 636,222 690,222" marker-end="url(#arq)"/>
       <rect class="bx" x="694" y="198" width="172" height="48" stroke="#e2b341"/>
-      <text class="lbl" x="780" y="219" text-anchor="middle" fill="#e2b341">aux head · "ripeness"</text>
+      <text class="lbl" x="780" y="219" text-anchor="middle" fill="#e2b341">aux head · "scale"</text>
       <text class="sub" x="780" y="235" text-anchor="middle">3 classes</text>
 
       <path class="flowq" d="M580,233 C630,233 630,286 690,286" marker-end="url(#arq)"/>
       <rect class="bx" x="694" y="262" width="172" height="48" stroke="#e2b341"/>
-      <text class="lbl" x="780" y="283" text-anchor="middle" fill="#e2b341">aux head · "grade"</text>
-      <text class="sub" x="780" y="299" text-anchor="middle">2 classes</text>
+      <text class="lbl" x="780" y="283" text-anchor="middle" fill="#e2b341">aux head · "viewpoint"</text>
+      <text class="sub" x="780" y="299" text-anchor="middle">3 classes</text>
 
       <path class="flowq" d="M580,240 C624,240 624,350 690,350" marker-end="url(#arq)" stroke-dasharray="3 4"/>
       <rect class="bx" x="694" y="326" width="172" height="48" stroke="#e2b341" stroke-dasharray="4 4"/>
@@ -345,18 +345,28 @@ matched  = gather_matched(out, indices)                          <span class="c"
 
   <h3>1 · a top-level <code>attributes</code> list (the vocabulary)</h3>
 <pre>"attributes": [
-  {"name": <span class="s">"ripeness"</span>, "categories": [
-     {"id": 0, "name": "unripe"}, {"id": 1, "name": "turning"}, {"id": 2, "name": "ripe"}]},
-  {"name": <span class="s">"grade"</span>, "categories": [
-     {"id": 10, "name": "A"}, {"id": 20, "name": "B"}]}
+  {"name": <span class="s">"scale"</span>, "categories": [
+     {"id": 1, "name": "small"}, {"id": 2, "name": "modest"}, {"id": 3, "name": "large"}]},
+  {"name": <span class="s">"viewpoint"</span>, "categories": [
+     {"id": 0, "name": "frontal"}, {"id": 1, "name": "side"}, {"id": 2, "name": "back"}]}
 ]</pre>
   <h3>2 · a per-annotation <code>attributes</code> map</h3>
 <pre>{ "id": 1, "image_id": 42, "category_id": 1, "bbox": [...], "segmentation": [...],
-  "attributes": {<span class="s">"ripeness"</span>: 1, <span class="s">"grade"</span>: 20} }</pre>
-  <p class="dim" style="font-size:15px">Raw ids are remapped to a contiguous <code>0..n-1</code> per head (so grade's <code>10/20</code> → <code>0/1</code>). A missing value defaults to <code>0</code>; a JSON with no <code>attributes</code> is just detection-only, exactly as before.</p>
+  "attributes": {<span class="s">"scale"</span>: 3, <span class="s">"viewpoint"</span>: 0} }</pre>
+  <p class="dim" style="font-size:15px">Raw ids are remapped to a contiguous <code>0..n-1</code> per head (so scale's <code>1/2/3</code> → <code>0/1/2</code>). A missing value defaults to <code>0</code>; a JSON with no <code>attributes</code> is just detection-only, exactly as before.</p>
 
   <h3>At inference</h3>
   <p>Each kept detection gets an <code>aux = {head: {"ids", "probs"}}</code> entry, and <code>predict(plot=True)</code> renders every attribute next to the class label, using the names stored in the checkpoint — the primary class on the first row, each attribute + its confidence on the row beneath.</p>
+
+  <figure style="margin:30px 0 6px">
+    <img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/sample.jpg"
+         alt="Two people in dresses; each instance labelled with its garment class plus scale, occlusion, zoom and viewpoint attributes"
+         style="width:100%;height:auto;border-radius:10px;border:1px solid rgba(255,255,255,.12);display:block">
+    <figcaption class="dim" style="font-size:15px;margin-top:12px">
+      A prediction from the <a href="https://github.com/switchablenorms/DeepFashion2">DeepFashion2</a> showcase: two <code>vest_dress</code> instances, each carrying four independent attribute heads — <code>scale</code>, <code>occlusion</code>, <code>zoom_in</code>, <code>viewpoint</code> — read off the same per-query embedding and drawn by <code>eomt.visualize.draw_instances</code>.
+    </figcaption>
+  </figure>
+
   <div class="note q">
     <span class="ic">↳</span>
     <p>Roadmap idea worth noting: train an aux head with a <em>contrastive</em> objective and its per-instance embedding becomes a <strong>re-identification vector</strong> — matching the same object across frames and cameras, reusing the detector's matched queries instead of a separate tracker.</p>

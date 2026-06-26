@@ -159,25 +159,26 @@ Because the heads are independent:
   matched queries — they add only a thin linear/MLP head and a cross-entropy term, not
   a second model or a second pass.
 
-### Example: a bowl of fruit
+### Example: clothing with per-instance attributes
 
-One model segments each fruit (primary classes `apple` / `banana` / `orange` /
-`pear`) and, for **every** detection, reads off two **independent** attribute heads —
-`ripeness` (`unripe` / `turning` / `ripe`) and a quality `grade` (`A` / `B`). The
-renderer prints the primary class + score on the first row and each attribute + its
-confidence on the row beneath it.
+One model segments each garment (primary classes like `vest_dress` / `short_sleeve_top`
+/ `long_sleeve_dress` / `skirt` / `trousers` …) and, for **every** detection, reads off
+four **independent** attribute heads — `scale` (`small` / `modest` / `large`),
+`occlusion` (`no` / `slight` / `medium`), `zoom_in` (`no` / `medium` / `large`) and
+`viewpoint` (`frontal` / `side` / `back`). The renderer prints the primary class + score
+on the first row and each attribute + its confidence on the rows beneath it.
 
-![A bowl of fruit; each box labelled with its fruit class plus a ripeness and a grade](https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/example_1.png)
+![Two people in dresses; each instance labelled with its garment class plus scale, occlusion, zoom and viewpoint attributes](https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/sample.jpg)
 
-`ripeness` and `grade` are *orthogonal* — they vary independently — which is exactly
-the case that's awkward to fold into the primary class space. The same pattern fits
-any "class **plus** per-instance sub-labels" task: **retail shelves → product +
-facing**, **vehicles → type + colour + damage state**, **cells / leaves → type +
-health**, **apparel → garment + pattern**.
+The four attributes are *orthogonal* to the garment class — they vary independently —
+which is exactly the case that's awkward to fold into the primary class space. The same
+pattern fits any "class **plus** per-instance sub-labels" task: **retail shelves →
+product + facing**, **vehicles → type + colour + damage state**, **cells / leaves →
+type + health**.
 
-> The image above is a **simulation**: a stock photo with hand-placed detections fed
-> through the package's own renderer ([`eomt.visualize.draw_instances`](eomt/visualize.py))
-> to show the output format — not a trained model's predictions.
+> Trained on the public **[DeepFashion2](https://github.com/switchablenorms/DeepFashion2)**
+> dataset (13 garment classes + 4 attribute heads) and rendered with the package's own
+> renderer ([`eomt.visualize.draw_instances`](eomt/visualize.py)).
 
 ---
 
@@ -222,18 +223,19 @@ names) are discovered from the JSON, the same as `nc`.
 ```jsonc
 "attributes": [
   {
-    "name": "ripeness",
+    "name": "scale",
     "categories": [
-      {"id": 0, "name": "unripe"},
-      {"id": 1, "name": "turning"},
-      {"id": 2, "name": "ripe"}
+      {"id": 1, "name": "small"},
+      {"id": 2, "name": "modest"},
+      {"id": 3, "name": "large"}
     ]
   },
   {
-    "name": "grade",
+    "name": "viewpoint",
     "categories": [
-      {"id": 10, "name": "A"},
-      {"id": 20, "name": "B"}
+      {"id": 0, "name": "frontal"},
+      {"id": 1, "name": "side"},
+      {"id": 2, "name": "back"}
     ]
   }
 ]
@@ -245,14 +247,14 @@ names) are discovered from the JSON, the same as `nc`.
 {
   "id": 1, "image_id": 42, "category_id": 1,
   "segmentation": [...], "bbox": [...], "area": 1234, "iscrowd": 0,
-  "attributes": {"ripeness": 1, "grade": 20}
+  "attributes": {"scale": 3, "viewpoint": 0}
 }
 ```
 
 Notes:
 
-- Raw ids are remapped to a contiguous `0..n-1` per head (so `grade`'s `10`/`20` become
-  `0`/`1`); `categories` may be omitted, in which case the id set is inferred.
+- Raw ids are remapped to a contiguous `0..n-1` per head (so `scale`'s `1`/`2`/`3` become
+  `0`/`1`/`2`); `categories` may be omitted, in which case the id set is inferred.
 - A missing per-annotation value defaults to `0`; a JSON with **no** `attributes` ⇒
   detection-only, exactly as before.
 

@@ -70,8 +70,12 @@ def predict(
     max_det: int = 100,
     mask_thresh: float = 0.5,
     device: str = "auto",
-    alpha: float = 0.5,
+    alpha: float = 0.35,
     draw_boxes: bool = True,
+    aux_multiline: bool = True,
+    show_scores: bool = True,
+    color_by: str = "class",
+    imgsz: int | None = None,
 ) -> list[dict]:
     """Run inference on an image or a directory of images.
 
@@ -87,7 +91,7 @@ def predict(
         model = load_model(model, device=device)
 
     dev = next(model.parameters()).device
-    imgsz = int(model.image_size)
+    imgsz = int(imgsz if imgsz is not None else model.image_size)
     letterbox = bool(getattr(model, "preprocess_letterbox", False))
     names = getattr(model, "names", None)
     aux_names = {s.name: s.names for s in getattr(model, "aux_specs", [])}
@@ -121,7 +125,8 @@ def predict(
         if plot:
             rendered = draw_instances(
                 image, result, names=names, aux_names=aux_names or None,
-                alpha=alpha, draw_boxes=draw_boxes,
+                alpha=alpha, draw_boxes=draw_boxes, aux_multiline=aux_multiline,
+                show_scores=show_scores, color_by=color_by,
             )
             if out_root is not None:
                 dst = out_root / path.name

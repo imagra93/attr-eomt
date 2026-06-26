@@ -105,7 +105,11 @@ def build_optimizer(
         no_decay = p.ndim <= 1 or any(tok in name for tok in _NO_DECAY_TOKENS)
         wd_i = 0.0 if no_decay else weight_decay
         key = (round(lr_i, 12), wd_i)
-        groups.setdefault(key, {"params": [], "lr": lr_i, "weight_decay": wd_i})["params"].append(p)
+        # Groups are homogeneous (backbone LR != head LR), so ``is_backbone`` set at
+        # creation labels the whole group — used for the post-unfreeze LR re-warmup.
+        groups.setdefault(
+            key, {"params": [], "lr": lr_i, "weight_decay": wd_i, "is_backbone": is_backbone}
+        )["params"].append(p)
     opt = torch.optim.AdamW(list(groups.values()), lr=lr, weight_decay=weight_decay)
     for g in opt.param_groups:
         g["initial_lr"] = g["lr"]
@@ -258,6 +262,7 @@ def train(
     warmup_epochs: float = 1.0,
     warmup_lr_start: float = 1e-6,
     min_lr_ratio: float = 0.01,
+    freeze_backbone_epochs: int = 2,
     ema: bool = True,
     ema_decay: float = 0.9999,
     ema_tau: float = 2000.0,
@@ -269,8 +274,8 @@ def train(
     prefetch: int = 4,
     device: str = "auto",
     amp: bool = True,
+    amp_dtype: str = "auto",
     tf32: bool = True,
-    compile: bool = False,
     seed: int | None = None,
     pretrained: bool = True,
     flip_prob: float = 0.5,
@@ -313,6 +318,15 @@ def train(
     schedule and EMA — use it to retrain with changed hyper-parameters (e.g.
     ``flip_prob=0``) while keeping the learned weights. The two are mutually
     exclusive.
+
+    ``freeze_backbone_epochs`` trains the task head only for the first N epochs
+    (DINOv2 frozen), then unfreezes — the LP-FT recipe. With a from-scratch head
+    this protects the pretrained features from early noisy-gradient corruption and
+    tends to give better *final* metrics (not just faster early epochs). On
+    unfreeze the backbone groups get a short LR re-warmup so they don't take the
+    full cosine LR in one step. ``amp_dtype`` selects the autocast dtype:
+    ``"auto"`` uses bf16 on hardware that supports it (no GradScaler, more stable),
+    else fp16; force with ``"bf16"`` / ``"fp16"``.
     """
     if imgsz % 14:
         raise ValueError(f"imgsz={imgsz} must be divisible by 14 (DINOv2 grid).")
@@ -505,13 +519,14 @@ def train(
             "llrd": llrd,
             "warmup_epochs": warmup_epochs,
             "min_lr_ratio": min_lr_ratio,
+            "freeze_backbone_epochs": freeze_backbone_epochs,
             "clip_norm": clip_norm,
             "ema": ema,
             "ema_decay": ema_decay,
             "ema_tau": ema_tau,
             "amp": amp,
+            "amp_dtype": amp_dtype,
             "tf32": tf32,
-            "compile": compile,
             "seed": seed,
             "pretrained": pretrained,
             "mask_anneal": mask_anneal,
@@ -593,19 +608,50 @@ def train(
         ema_model.load_state_dict(resume_ckpt["ema"])
         print(f"[resume] restored EMA ({ema_model.updates} updates)")
 
-    # ``torch.compile`` wraps the module; ``core`` is the un-wrapped model used for
-    # buffer access (``attn_mask_probs``) and state-dict export so checkpoints keep
-    # clean (un-prefixed) keys. Compile is experimental here — the HF matcher/loss
-    # use dynamic shapes that can trigger graph breaks/recompiles.
-    if compile:
-        model = torch.compile(model)
     core = _unwrap(model)
+    # NOTE: torch.compile is intentionally not used. The encoder's masked-attention
+    # path has data-dependent control flow and shapes — ``_disable_attention_mask``
+    # boolean-indexes a random subset of queries, and the per-block branches read the
+    # ``attn_mask_probs`` buffer (mutated every step by mask annealing). Compiling it
+    # produced constant graph breaks/recompiles: no net speedup and highly variable
+    # step times. Keep the encoder eager.
 
-    scaler = torch.amp.GradScaler("cuda", enabled=amp and dev.type == "cuda")
+    # LP-FT: the optimizer was built (above) with every param trainable, so the
+    # backbone groups exist; we toggle their ``requires_grad`` per epoch. Frozen
+    # params yield ``grad=None``, which AdamW skips — no optimizer rebuild needed.
+    backbone_params = [p for n, p in core.named_parameters() if n.startswith(_ENCODER_PREFIXES)]
+
+    def _set_backbone_requires_grad(flag: bool) -> None:
+        for p in backbone_params:
+            p.requires_grad_(flag)
+
+    # Precision: bf16 (Ampere+/Blackwell) needs no GradScaler and is more stable
+    # than fp16; "auto" picks bf16 when supported, else fp16. The GradScaler is
+    # only ever enabled for fp16 — with bf16 its scale/unscale/step/update calls
+    # below become no-ops, leaving the loop logic unchanged.
+    amp_on = amp and dev.type == "cuda"
+    if not amp_on:
+        autocast_dtype, use_fp16 = torch.float32, False
+    elif amp_dtype == "fp16":
+        autocast_dtype, use_fp16 = torch.float16, True
+    elif amp_dtype == "bf16":
+        autocast_dtype, use_fp16 = torch.bfloat16, False
+    else:  # "auto"
+        if torch.cuda.is_bf16_supported():
+            autocast_dtype, use_fp16 = torch.bfloat16, False
+        else:
+            autocast_dtype, use_fp16 = torch.float16, True
+    print(f"[amp] {'off' if not amp_on else str(autocast_dtype).split('.')[-1]}"
+          f"{' (+GradScaler)' if use_fp16 else ''}")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
     iters_per_epoch = max(1, len(train_loader))
     total_iters = epochs * iters_per_epoch
     warmup_iters = int(warmup_epochs * iters_per_epoch)
     warmup_start_factor = warmup_lr_start / lr0 if lr0 > 0 else 0.0
+    # LP-FT unfreeze: global iter at which the backbone thaws, and the length of the
+    # linear backbone-LR re-warmup that follows (~1 epoch). 0 when no freezing.
+    unfreeze_it = freeze_backbone_epochs * iters_per_epoch
+    unfreeze_warmup_iters = iters_per_epoch if freeze_backbone_epochs > 0 else 0
 
     tb = _Logger(logger, run_dir, name) if logger != "none" else None
 
@@ -655,6 +701,17 @@ def train(
     # --- epochs ---
     for epoch in range(start_epoch, epochs):
         model.train()
+        # LP-FT: head-only while frozen, then unfreeze. Re-applied every epoch so it
+        # is correct after a resume that lands past the unfreeze boundary.
+        if freeze_backbone_epochs > 0:
+            frozen = epoch < freeze_backbone_epochs
+            _set_backbone_requires_grad(not frozen)
+            if epoch == 0 and frozen:
+                print(f"[freeze] backbone frozen for epochs 0..{freeze_backbone_epochs - 1} "
+                      f"(head-only / LP-FT)")
+            elif epoch == freeze_backbone_epochs:
+                print(f"[freeze] backbone unfrozen at epoch {epoch}; "
+                      f"re-warming backbone LR over ~1 epoch")
         running = 0.0
         # matched-query accuracy per aux head, accumulated over the epoch
         aux_hits = {s.name: 0 for s in aux_specs}
@@ -665,8 +722,15 @@ def train(
         for step, (pixel_values, geom_labels, class_labels, aux_labels) in enumerate(pbar):
             it = epoch * iters_per_epoch + step
             factor = _lr_factor(it, total_iters, warmup_iters, warmup_start_factor, min_lr_ratio)
+            # After unfreezing, linearly ramp the backbone groups from ~0 to full LR
+            # over unfreeze_warmup_iters so the thawed DINOv2 isn't hit at full LR.
+            bb_factor = 1.0
+            if unfreeze_warmup_iters and unfreeze_it <= it < unfreeze_it + unfreeze_warmup_iters:
+                bb_factor = warmup_start_factor + (1.0 - warmup_start_factor) * (
+                    it - unfreeze_it
+                ) / unfreeze_warmup_iters
             for g in optimizer.param_groups:
-                g["lr"] = g["initial_lr"] * factor
+                g["lr"] = g["initial_lr"] * factor * (bb_factor if g.get("is_backbone") else 1.0)
 
             if mask_anneal:
                 p = _attn_mask_prob(it, total_iters, mask_anneal_start, mask_anneal_end)
@@ -686,7 +750,7 @@ def train(
             # ``geom_labels`` carries instance masks (instance family) or normalized
             # cxcywh boxes (detect family); route it to the matching forward kwarg.
             geom_kw = {"box_labels": geom_labels} if is_detect else {"mask_labels": geom_labels}
-            with torch.amp.autocast("cuda", enabled=amp and dev.type == "cuda"):
+            with torch.amp.autocast("cuda", enabled=amp_on, dtype=autocast_dtype):
                 out = model(pixel_values, class_labels=class_labels, **geom_kw)
                 loss = out["loss"]
                 if aux_specs:
