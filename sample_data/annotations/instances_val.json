@@ -4,34 +4,36 @@
     {"id": 1, "file_name": "img_0101.jpg", "width": 100, "height": 100}
   ],
   "categories": [
-    {"id": 1, "name": "apple"},
-    {"id": 2, "name": "banana"},
-    {"id": 3, "name": "orange"},
-    {"id": 4, "name": "pear"}
+    {"id": 1, "name": "short_sleeve_top"},
+    {"id": 2, "name": "long_sleeve_dress"},
+    {"id": 3, "name": "vest_dress"},
+    {"id": 4, "name": "skirt"},
+    {"id": 5, "name": "trousers"}
   ],
   "attributes": [
-    {"name": "ripeness", "categories": [
-      {"id": 0, "name": "unripe"},
-      {"id": 1, "name": "turning"},
-      {"id": 2, "name": "ripe"}
+    {"name": "scale", "categories": [
+      {"id": 1, "name": "small"},
+      {"id": 2, "name": "modest"},
+      {"id": 3, "name": "large"}
     ]},
-    {"name": "grade", "categories": [
-      {"id": 10, "name": "A"},
-      {"id": 20, "name": "B"}
+    {"name": "viewpoint", "categories": [
+      {"id": 0, "name": "frontal"},
+      {"id": 1, "name": "side"},
+      {"id": 2, "name": "back"}
     ]}
   ],
   "annotations": [
     {
-      "id": 1, "image_id": 1, "category_id": 4, "iscrowd": 0,
+      "id": 1, "image_id": 1, "category_id": 2, "iscrowd": 0,
       "bbox": [15, 15, 35, 35], "area": 1225,
       "segmentation": [[15, 15, 50, 15, 50, 50, 15, 50]],
-      "attributes": {"ripeness": 2, "grade": 10}
+      "attributes": {"scale": 3, "viewpoint": 2}
     },
     {
-      "id": 2, "image_id": 1, "category_id": 3, "iscrowd": 0,
+      "id": 2, "image_id": 1, "category_id": 5, "iscrowd": 0,
       "bbox": [60, 55, 25, 30], "area": 750,
       "segmentation": [[60, 55, 85, 55, 85, 85, 60, 85]],
-      "attributes": {"ripeness": 1, "grade": 20}
+      "attributes": {"scale": 2, "viewpoint": 1}
     }
   ]
 }

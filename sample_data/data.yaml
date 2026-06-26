@@ -20,10 +20,10 @@
 # The JSONs demonstrate the attributes extension that powers the secondary heads:
 # a top-level `attributes` list (one entry per head, each with its own label
 # vocabulary) and a per-annotation `attributes: {head: id}` map. Raw ids are
-# remapped to a contiguous 0..n-1 per head, so non-contiguous ids (e.g. grade
-# 10/20) are fine. A dataset with NO `attributes` is plain instance segmentation.
+# remapped to a contiguous 0..n-1 per head, so non-contiguous ids (e.g. scale
+# 1/2/3) are fine. A dataset with NO `attributes` is plain instance segmentation.
 #
-# The attribute names used here (`ripeness`, `grade`) are only examples — use
+# The attribute names used here (`scale`, `viewpoint`) are only examples — use
 # whatever attributes your task needs, and as many heads as you like.
 
 path: .

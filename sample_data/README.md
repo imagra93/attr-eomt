@@ -17,20 +17,20 @@ sample_data/
 
 ## What it demonstrates
 
-A bowl of fruit (the same example shown in the top-level README): one model
-segments each fruit and reads off two independent attributes per detection.
+Clothing instances (the same example shown in the top-level README): one model
+segments each garment and reads off two independent attributes per detection.
 
-- **Primary classes** come from `categories` (`apple`, `banana`, `orange`, `pear`)
-  — `nc` is inferred.
-- **Two secondary heads** (`ripeness`, `grade`) are declared once at the top
+- **Primary classes** come from `categories` (`short_sleeve_top`,
+  `long_sleeve_dress`, `vest_dress`, `skirt`, `trousers`) — `nc` is inferred.
+- **Two secondary heads** (`scale`, `viewpoint`) are declared once at the top
   level under `attributes`, then assigned per instance via each annotation's
   `attributes: {head: id}` map.
 - Raw attribute ids are remapped to a contiguous `0..n-1` per head, so the
-  non-contiguous `grade` ids (`10`, `20`) become `0`, `1` automatically.
+  non-contiguous `scale` ids (`1`, `2`, `3`) become `0`, `1`, `2` automatically.
 - Remove the `attributes` blocks entirely and it's an ordinary instance-seg
   dataset — the secondary heads simply don't get built.
 
-The head names (`ripeness`, `grade`) are just examples; define whatever
+The head names (`scale`, `viewpoint`) are just examples; define whatever
 attributes your task needs.
 
 ## Try it
