@@ -151,7 +151,7 @@
     <li>the <span class="pr-em">class head</span> (<code>class_predictor</code>) turns it into a primary label,</li>
     <li>the <span class="pr-em">mask head</span> (or a box head, in the <code>detect</code> family) turns it into geometry.</li>
   </ul>
-  <p>It's <strong>NMS-free</strong>: two overlapping cars stay two distinct queries instead of being merged by non-max suppression. That property is what lets attributes stay attached to the right instance.</p>
+  <p>It's <strong>NMS-free</strong>: two overlapping garments stay two distinct queries instead of being merged by non-max suppression. That property is what lets attributes stay attached to the right instance.</p>
 
   <table>
     <thead><tr><th>size</th><th>backbone</th><th>hidden</th><th>queries</th></tr></thead>
@@ -168,8 +168,8 @@
 <section>
   <div class="tag">Why attributes exist</div>
   <h2>The label space explodes</h2>
-  <p>A normal detector has one flat list of classes. So when an object has a <em>type</em> <strong>and</strong> a <em>colour</em> <strong>and</strong> a <em>state</em>, the only way to express it is the Cartesian product: <code>type × colour × state</code>. That blows up combinatorially, starves each leaf class of examples, and multiplies the targets the Hungarian matcher has to assign.</p>
-  <p><strong>attr-eomt factorizes instead.</strong> Keep the primary taxonomy small and general (<code>car</code>, <code>apple</code>, <code>person</code>); push orthogonal distinctions into <span class="ax-em">independent heads</span> that add, not multiply. Drag the sliders — this is the entire argument for the feature:</p>
+  <p>A normal detector has one flat list of classes. So when an object has a <em>type</em> <strong>and</strong> a <em>viewpoint</em> <strong>and</strong> an <em>occlusion</em> level, the only way to express it is the Cartesian product: <code>type × viewpoint × occlusion</code>. That blows up combinatorially, starves each leaf class of examples, and multiplies the targets the Hungarian matcher has to assign.</p>
+  <p><strong>attr-eomt factorizes instead.</strong> Keep the primary taxonomy small and general (<code>short_sleeve_top</code>, <code>dress</code>, <code>trousers</code>); push orthogonal distinctions into <span class="ax-em">independent heads</span> that add, not multiply. Drag the sliders — this is the entire argument for the feature:</p>
 
   <div class="widget">
     <h3>Flat label space vs. factorized heads</h3>
@@ -179,33 +179,33 @@
       <output id="to">4</output>
     </div>
     <div class="ctrl">
-      <label for="c">colour values</label>
-      <input id="c" type="range" min="2" max="12" value="6" aria-label="number of colour values">
-      <output id="co">6</output>
+      <label for="c">viewpoint values</label>
+      <input id="c" type="range" min="2" max="12" value="3" aria-label="number of viewpoint values">
+      <output id="co">3</output>
     </div>
     <div class="ctrl">
-      <label for="d">damage states</label>
-      <input id="d" type="range" min="2" max="8" value="3" aria-label="number of damage states">
+      <label for="d">occlusion levels</label>
+      <input id="d" type="range" min="2" max="8" value="3" aria-label="number of occlusion levels">
       <output id="do">3</output>
     </div>
     <div class="verdict">
       <div class="card flat">
         <div class="lab">Flat — one head</div>
-        <div class="big" id="flat">72</div>
-        <div class="sub" id="flatx">4 × 6 × 3 leaf classes</div>
+        <div class="big" id="flat">36</div>
+        <div class="sub" id="flatx">4 × 3 × 3 leaf classes</div>
       </div>
       <div class="card fac">
         <div class="lab">Factorized — 3 heads</div>
-        <div class="big" id="fac">13</div>
-        <div class="sub" id="facx">4 + 6 + 3 outputs</div>
+        <div class="big" id="fac">10</div>
+        <div class="sub" id="facx">4 + 3 + 3 outputs</div>
       </div>
     </div>
-    <p class="gap">The flat space is <b id="ratio">5.5×</b> larger — and each of those leaves has to be learned from its own scarce examples. Factorized heads each see <em>every</em> instance.</p>
+    <p class="gap">The flat space is <b id="ratio">3.6×</b> larger — and each of those leaves has to be learned from its own scarce examples. Factorized heads each see <em>every</em> instance.</p>
   </div>
 
   <div class="note q">
     <span class="ic">↳</span>
-    <p>Because the heads are independent, the model can predict <code>red</code> on a class it <em>never saw in red</em> during training — it composes <span class="ax-em">attribute × class</span> combinations a flat label space cannot even represent.</p>
+    <p>Because the heads are independent, the model can predict <code>side</code> on a garment it <em>never saw sideways</em> during training — it composes <span class="ax-em">attribute × class</span> combinations a flat label space cannot even represent.</p>
   </div>
 </section>
 
@@ -377,7 +377,7 @@ matched  = gather_matched(out, indices)                          <span class="c"
 <section style="border-bottom:none">
   <div class="tag">The whole idea, once more</div>
   <h2>Factorize the labels, tap the embedding, reuse the match</h2>
-  <p>Keep the primary taxonomy small and well-populated. For everything orthogonal — colour, state, grade, laterality — attach an <span class="ax-em">independent head</span> that reads the <span class="q-em">per-query embedding</span> the detector already produces, supervise it on the <span class="pr-em">detector's own Hungarian match</span>, and add a cross-entropy term. You get composable, generalizing per-instance attributes for almost no extra compute, and the primary detection metric stays exactly as it was.</p>
+  <p>Keep the primary taxonomy small and well-populated. For everything orthogonal — scale, occlusion, zoom, viewpoint — attach an <span class="ax-em">independent head</span> that reads the <span class="q-em">per-query embedding</span> the detector already produces, supervise it on the <span class="pr-em">detector's own Hungarian match</span>, and add a cross-entropy term. You get composable, generalizing per-instance attributes for almost no extra compute, and the primary detection metric stays exactly as it was.</p>
 </section>
 
 </main>

@@ -55,9 +55,9 @@ with a fixed set of **learnable queries** (the Mask2Former idea) — each query 
 "slot" that latches onto one object instance. After the encoder runs, every query emits
 a single vector, the **per-query embedding** of shape `[B, Q, hidden]`. The whole model
 is then just "turn that embedding into predictions": a **class head** for the primary
-label and a **mask/box head** for geometry. It is **NMS-free**, so two overlapping cars
-stay two distinct queries instead of being merged — the property that lets attributes
-stay attached to the right instance.
+label and a **mask/box head** for geometry. It is **NMS-free**, so two overlapping
+garments stay two distinct queries instead of being merged — the property that lets
+attributes stay attached to the right instance.
 
 The attribute heads add nothing to this picture except themselves: they tap the **exact
 same embedding** (captured non-invasively with a forward hook), each a small classifier
@@ -127,9 +127,9 @@ attribute heads add a thin linear/MLP per head and are negligible by design.
 ## ⭐ Method — factorizing the label space
 
 This is the contribution. Conventional detectors fold every distinction into a single
-flat label space. When an object has both a *type* and several *attributes* — a car's
-make **and** its colour **and** whether a door is open — the only way to express that is
-the Cartesian product `type × colour × state × …`. That space explodes combinatorially,
+flat label space. When an object has both a *type* and several *attributes* — a garment's
+class **and** its viewpoint **and** whether it's occluded — the only way to express that is
+the Cartesian product `type × viewpoint × occlusion × …`. That space explodes combinatorially,
 starves each leaf class of training examples, and breaks Hungarian matching by
 multiplying the query targets.
 
@@ -144,11 +144,11 @@ per-instance query embedding the detector already computes — they **add, not m
 Because the heads are independent:
 
 - **Categories stay collapsed and general.** Keep a compact, well-populated primary
-  taxonomy (`car`, `person`, `fruit`) and push fine-grained or orthogonal distinctions
-  into attributes — every primary class keeps its full sample count instead of being
-  shattered into rare leaves.
-- **Unseen combinations generalize.** A `colour` head trained across many object types
-  predicts `red` on a class it *never co-occurred with in red*, because colour is
+  taxonomy (`short_sleeve_top`, `dress`, `trousers`) and push fine-grained or orthogonal
+  distinctions into attributes — every primary class keeps its full sample count instead
+  of being shattered into rare leaves.
+- **Unseen combinations generalize.** A `viewpoint` head trained across many garment types
+  predicts `side` on a class it *never co-occurred with sideways*, because viewpoint is
   learned independently of type. The model composes `attribute × class` combinations
   that **never appear in the training data** — combinations a flat label space cannot
   even represent.
@@ -173,8 +173,7 @@ on the first row and each attribute + its confidence on the rows beneath it.
 The four attributes are *orthogonal* to the garment class — they vary independently —
 which is exactly the case that's awkward to fold into the primary class space. The same
 pattern fits any "class **plus** per-instance sub-labels" task: **retail shelves →
-product + facing**, **vehicles → type + colour + damage state**, **cells / leaves →
-type + health**.
+product + facing**, **documents → element + role**, **cells → type + health**.
 
 > Trained on the public **[DeepFashion2](https://github.com/switchablenorms/DeepFashion2)**
 > dataset (13 garment classes + 4 attribute heads) and rendered with the package's own
