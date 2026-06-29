@@ -29,3 +29,4 @@ scripts/sample_images/
 .idea/
 .vscode/
 .DS_Store
+.env

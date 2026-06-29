@@ -66,6 +66,7 @@ def wrap_checkpoint(
     norm_mean: Any = None,
     norm_std: Any = None,
     patch_size: int | None = None,
+    compression: dict | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
     """Build a metadata-wrapped checkpoint that :func:`load_model` can restore.
@@ -103,6 +104,10 @@ def wrap_checkpoint(
         checkpoint["loss_weights"] = dict(loss_weights)
     if num_upscale_blocks is not None:
         checkpoint["num_upscale_blocks"] = int(num_upscale_blocks)
+    # Records the torchao recipe (if the weights are compressed) so ``load_model``
+    # re-creates the quantized layout before loading the subclassed tensors.
+    if compression is not None:
+        checkpoint["compression"] = dict(compression)
     checkpoint.update({k: v for k, v in extra.items() if v is not None})
     return checkpoint
 
@@ -224,7 +229,23 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
         loss_weights=loss_weights,
         num_upscale_blocks=num_upscale_blocks,
     )
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    # Compressed checkpoints carry int8 tensor subclasses (torchao). Re-create the
+    # quantized layout, then load with ``assign=True`` so the saved subclassed
+    # tensors *replace* the module weights directly — copying into freshly built
+    # fp parameters would fail on the packed-layout shape mismatch. The loaded
+    # tensors are pinned to the exact target device (the int8 subclass deserializes
+    # onto a bare ``cuda`` without an index, which ``assign`` rejects against a
+    # ``cuda:0`` module), so normalize each with ``.to(dev)`` before assigning.
+    compression = ckpt.get("compression")
+    if compression:
+        from .compress import compress_model
+
+        dev = resolve_device(device)
+        model = compress_model(model.to(dev), compression.get("recipe", "int8"))
+        state = {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in state.items()}
+        missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
+    else:
+        missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         warnings.warn(
             f"load_state_dict: {len(missing)} missing / {len(unexpected)} unexpected keys.",
@@ -237,6 +258,10 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     # Restore normalization (legacy checkpoints predate it → keep the ImageNet default).
     model.pixel_mean = tuple(float(x) for x in ckpt.get("norm_mean", model.pixel_mean))
     model.pixel_std = tuple(float(x) for x in ckpt.get("norm_std", model.pixel_std))
+    # Stash the compression recipe so a re-save round-trips it (see EoMT.save).
+    model._compression_meta = dict(compression) if compression else None
+    if compression:
+        return model.eval()  # already on the target device via assigned tensors
     return model.to(resolve_device(device)).eval()
 
 

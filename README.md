@@ -290,6 +290,27 @@ EoMT("runs/train/eomt-l").val(data="coco")
 EoMT("runs/train/eomt-l").predict("images/", plot=True)   # writes annotated images
 ```
 
+### Compress to int8
+
+`compress()` applies **int8 weight-only quantization** (via [torchao](https://github.com/pytorch/ao))
+to the ViT transformer blocks — the bulk of the parameters — while keeping the
+prediction heads in full precision. It's **data-free** (no calibration) and shrinks the
+checkpoint ≈**3.4×** on `l` with no measurable mAP loss.
+
+```python
+m = EoMT("runs/train/eomt-l")
+m.compress("int8", data="coco", save="runs/train/eomt-int8/weights/best.pt")  # quantize, validate, save
+# size/mAP/latency deltas are returned (and written to compression_metrics.json in the
+# run folder); omit `data` to skip the before/after validation
+
+# Reload like any run — the recipe is recorded in the checkpoint, so the int8 layout
+# is rebuilt automatically:
+EoMT("runs/train/eomt-int8").predict("images/")
+```
+
+The compressed model is **GPU-only** (torchao's int8 kernels have no CPU path), and
+`best.pt` exported from an EMA run quantizes exactly those EMA weights.
+
 ### Useful `train()` options
 
 Passed as keyword arguments to `model.train(...)`:

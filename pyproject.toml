@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "attr-eomt"
-version = "0.1.2"
+version = "0.1.3"
 description = "Standalone EoMT (Encoder-only Mask Transformer) for instance segmentation, with DINOv2 init, COCO training/validation and inference."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,6 +30,7 @@ dependencies = [
     "PyYAML>=6.0",
     "requests>=2.25.0",
     "huggingface_hub>=0.23.0",
+    "torchao>=0.7.0",
 ]
 
 [project.optional-dependencies]

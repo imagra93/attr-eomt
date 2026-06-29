@@ -76,6 +76,49 @@ def _resolve_imgsz(imgsz: int | None, model) -> int:
     return snapped
 
 
+def _state_dict_mb(model) -> float:
+    """Serialized size (MB) of a model's state dict — captures packed int8 tensors."""
+    import io
+
+    import torch
+
+    buf = io.BytesIO()
+    torch.save(model.state_dict(), buf)
+    return round(buf.getbuffer().nbytes / 1e6, 1)
+
+
+def _measure_latency(model, device, *, warmup: int = 3, iters: int = 10) -> float | None:
+    """Mean forward latency (ms) on a synthetic input at the model's image size.
+
+    Best-effort: returns ``None`` if a forward pass fails (e.g. an int8 kernel that
+    needs a GPU not present here).
+    """
+    import time
+
+    import torch
+
+    imgsz = int(model.image_size)
+    dtype = model.eomt.layernorm.weight.dtype
+    x = torch.randn(1, 3, imgsz, imgsz, device=device, dtype=dtype)
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    is_cuda = dev.type == "cuda"
+    try:
+        model.eval()
+        with torch.no_grad():
+            for _ in range(warmup):
+                model(x)
+            if is_cuda:
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                model(x)
+            if is_cuda:
+                torch.cuda.synchronize()
+        return round((time.perf_counter() - t0) / iters * 1e3, 2)
+    except Exception:  # noqa: BLE001 - latency is informational
+        return None
+
+
 def _resolve_data(data: str | Path) -> dict:
     """Resolve a dataset spec (alias like ``"coco"`` or a YAML path) to absolute paths."""
     yaml_path = _DATASET_ALIASES.get(str(data), str(data))
@@ -101,11 +144,15 @@ class EoMT:
         self._ckpt: str | None = None
         self._pretrained = pretrained
         self._build_kwargs = build_kwargs
+        #: torchao recipe metadata once :meth:`compress` has been applied (else None).
+        self._compression: dict | None = None
 
         if isinstance(model, (str, Path)) and _looks_like_checkpoint(model):
             self._model = load_model(model, device=device)
             self._ckpt = str(model)
             self.size = self._model.size
+            # Carry forward a compressed checkpoint's recipe so a re-save round-trips it.
+            self._compression = getattr(self._model, "_compression_meta", None)
         elif str(model) in SIZES:
             self.size = str(model)
             self._model = None  # built lazily (avoids a wasted DINOv2 load before train())
@@ -252,6 +299,75 @@ class EoMT:
             conf_thres=conf_thres, max_det=max_det, **kw,
         )
 
+    # -------------------------------------------------------------- compress
+    def compress(self, recipe: str = "int8", *, data: str | Path | None = None,
+                 batch: int = 4, workers: int = 4, validate: bool = True,
+                 save: str | Path | None = None) -> dict:
+        """Quantize the ViT transformer blocks to int8 with ``torchao`` and report the impact.
+
+        Int8 weight-only quantization is **data-free** (it just re-rounds the existing
+        weights) and keeps the prediction heads in full precision, so accuracy is
+        preserved in practice while the state dict shrinks ≈3.4× on ViT-L. With
+        ``data`` set and ``validate=True``, mAP is measured before and after. ``save``
+        writes a self-describing compressed checkpoint reloadable with ``EoMT(path)``,
+        plus a ``compression_metrics.json`` sidecar in the run folder recording these
+        size / mAP / latency deltas. Returns the same metrics as a dict.
+        """
+        from . import compress as _compress
+
+        model = self.model  # realize the fp model first (size-init builds it here)
+        dev = next(model.parameters()).device
+        source = self._ckpt  # original (fp) checkpoint, before save() reassigns it
+        result: dict = {"recipe": recipe}
+
+        def _primary(metrics: dict) -> float | None:
+            for key in ("segm/mAP", "bbox/mAP"):
+                if key in metrics:
+                    return float(metrics[key])
+            return next((float(v) for v in metrics.values()), None)
+
+        result["size_mb_before"] = _state_dict_mb(model)
+        if validate and data is not None:
+            result["mAP_before"] = _primary(self.val(data, batch=batch, workers=workers))
+
+        _compress.compress_model(model, recipe)
+        self._compression = _compress.compression_meta(recipe)
+
+        result["size_mb_after"] = _state_dict_mb(model)
+        if result["size_mb_before"]:
+            result["size_ratio"] = round(result["size_mb_after"] / result["size_mb_before"], 3)
+        result["latency_ms"] = _measure_latency(model, dev)
+        if validate and data is not None:
+            result["mAP_after"] = _primary(self.val(data, batch=batch, workers=workers))
+            if result.get("mAP_before") is not None and result["mAP_after"] is not None:
+                result["mAP_delta"] = round(result["mAP_after"] - result["mAP_before"], 4)
+
+        if save is not None:
+            self.save(save)
+            self._ckpt = str(save)
+            result["saved"] = str(save)
+            self._write_compression_metrics(save, result, source=source, data=data)
+        return result
+
+    @staticmethod
+    def _write_compression_metrics(save, result: dict, *, source, data) -> str:
+        """Drop a ``compression_metrics.json`` sidecar in the compressed run folder.
+
+        Written next to the checkpoint's run dir (stripping a trailing ``weights/``)
+        so a compressed run self-documents its size / mAP / latency impact.
+        """
+        import json
+
+        run_dir = Path(save).parent
+        if run_dir.name == "weights":
+            run_dir = run_dir.parent
+        run_dir.mkdir(parents=True, exist_ok=True)
+        metrics = {"source": source, "data": str(data) if data is not None else None,
+                   **{k: v for k, v in result.items() if k != "saved"}}
+        out = run_dir / "compression_metrics.json"
+        out.write_text(json.dumps(metrics, indent=2) + "\n")
+        return str(out)
+
     # ---------------------------------------------------------------- predict
     def predict(self, source: str | Path, *, plot: bool = False, save: str | None = "runs/predict",
                 conf_thres: float = 0.3, max_det: int = 100, mask_thresh: float = 0.5,
@@ -282,6 +398,7 @@ class EoMT:
             loss_weights=m.loss_weights, num_upscale_blocks=m.num_upscale_blocks,
             norm_mean=getattr(m, "pixel_mean", None), norm_std=getattr(m, "pixel_std", None),
             patch_size=getattr(m, "patch_size", None),
+            compression=self._compression,
         )
         save_checkpoint(ckpt, path)
 
