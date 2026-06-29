@@ -63,6 +63,7 @@ def wrap_checkpoint(
     letterbox: bool = False,
     loss_weights: dict | None = None,
     num_upscale_blocks: int | None = None,
+    fpn_scales: tuple[float, ...] | list[float] | None = None,
     norm_mean: Any = None,
     norm_std: Any = None,
     patch_size: int | None = None,
@@ -104,6 +105,11 @@ def wrap_checkpoint(
         checkpoint["loss_weights"] = dict(loss_weights)
     if num_upscale_blocks is not None:
         checkpoint["num_upscale_blocks"] = int(num_upscale_blocks)
+    # Multi-scale (B1): load-bearing metadata — the conv weights don't encode which
+    # level is upsample vs downsample, so the scales must be recorded to rebuild the
+    # SimpleFPN + cross-attn modules with matching shapes on reload.
+    if fpn_scales is not None:
+        checkpoint["fpn_scales"] = [float(s) for s in fpn_scales]
     # Records the torchao recipe (if the weights are compressed) so ``load_model``
     # re-creates the quantized layout before loading the subclassed tensors.
     if compression is not None:
@@ -217,6 +223,9 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     # clean load — recover it from the state dict when the metadata predates it.
     loss_weights = ckpt.get("loss_weights")
     num_upscale_blocks = ckpt.get("num_upscale_blocks") or _infer_num_upscale_blocks(state)
+    # Multi-scale (B1) modules: rebuilt from the recorded scales (or recovered
+    # best-effort from the state dict when the metadata predates the field).
+    fpn_scales = ckpt.get("fpn_scales") or _infer_fpn_scales(state)
 
     model = build_model(
         size,
@@ -228,6 +237,7 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
         aux_head_arch=aux_head_arch,
         loss_weights=loss_weights,
         num_upscale_blocks=num_upscale_blocks,
+        fpn_scales=fpn_scales,
     )
     # Compressed checkpoints carry int8 tensor subclasses (torchao). Re-create the
     # quantized layout, then load with ``assign=True`` so the saved subclassed
@@ -325,6 +335,30 @@ def _infer_num_upscale_blocks(state: dict) -> int | None:
                     idxs.add(int(head))
                 break
     return (max(idxs) + 1) if idxs else None
+
+
+def _infer_fpn_scales(state: dict) -> list[float] | None:
+    """Best-effort recovery of B1 multi-scale: ``None`` unless FPN keys are present.
+
+    The conv weights record only the *count* of pyramid levels (``eomt.fpn.blocks.<i>``),
+    not their scale factors, so this falls back to the default scale tuple for that
+    count. Trust the ``fpn_scales`` metadata when present; this only covers a
+    metadata-stripped FPN checkpoint and warns implicitly via the level-count match.
+    """
+    from .model import DEFAULT_FPN_SCALES
+
+    idxs = set()
+    for key in state:
+        for prefix in ("eomt.fpn.blocks.", "fpn.blocks."):
+            if key.startswith(prefix):
+                head = key[len(prefix) :].split(".", 1)[0]
+                if head.isdigit():
+                    idxs.add(int(head))
+                break
+    if not idxs:
+        return None
+    n = max(idxs) + 1
+    return list(DEFAULT_FPN_SCALES) if n == len(DEFAULT_FPN_SCALES) else None
 
 
 def _infer_imgsz(state: dict, patch_size: int = 14) -> int:

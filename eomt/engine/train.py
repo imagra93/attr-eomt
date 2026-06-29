@@ -30,7 +30,7 @@ from ..config import normalize_loss_weights
 from ..data import CocoDetection, CocoInstanceSeg, CocoValImages, collate_train
 from ..data.transforms import build_val_transform
 from ..ema import ModelEMA, _unwrap
-from ..model import build_model, load_dinov2_backbone
+from ..model import DEFAULT_FPN_SCALES, build_model, load_dinov2_backbone
 from ..plotting import plot_aux_per_class, plot_metrics_csv
 from ..device import resolve_device
 from ..serialization import load_raw, resolve_checkpoint, save_checkpoint, wrap_checkpoint
@@ -306,6 +306,7 @@ def train(
     l1_weight: float = 5.0,
     giou_weight: float = 2.0,
     num_upscale_blocks: int | None = None,
+    fpn_scales: tuple[float, ...] | list[float] | None = DEFAULT_FPN_SCALES,
     logger: str = "none",
     resume: str | None = None,
     init_weights: str | None = None,
@@ -318,6 +319,12 @@ def train(
     schedule and EMA — use it to retrain with changed hyper-parameters (e.g.
     ``flip_prob=0``) while keeping the learned weights. The two are mutually
     exclusive.
+
+    ``fpn_scales`` defaults to the B1 multi-scale recipe (SimpleFPN + query
+    cross-attention, :data:`~eomt.model.DEFAULT_FPN_SCALES`); pass ``None`` for the
+    original single-scale model. Resuming ignores this and keeps the checkpoint's
+    architecture; warm-starting (``init_weights``) honors it, so fine-tuning a
+    single-scale checkpoint into a multi-scale one is the default warm-start path.
 
     ``freeze_backbone_epochs`` trains the task head only for the first N epochs
     (DINOv2 frozen), then unfreezes — the LP-FT recipe. With a from-scratch head
@@ -445,8 +452,17 @@ def train(
     if resume_ckpt is not None:
         loss_weights = normalize_loss_weights(resume_ckpt.get("loss_weights"), family=family)
         num_upscale_blocks = resume_ckpt.get("num_upscale_blocks", num_upscale_blocks)
+        # Resuming MUST keep the checkpoint's architecture (the saved FPN/cross-attn
+        # tensors must match the rebuilt modules); the CLI flag/default is ignored.
+        # An absent key means the checkpoint is single-scale — do NOT fall back to the
+        # (now multi-scale) default, or resuming an old run would build a mismatched head.
+        fpn_scales = resume_ckpt.get("fpn_scales")
     elif init_ckpt is not None and init_ckpt.get("num_upscale_blocks") is not None:
         num_upscale_blocks = int(init_ckpt["num_upscale_blocks"])
+    # Warm-start (init_weights) deliberately keeps the CLI ``fpn_scales``: enabling
+    # multi-scale by fine-tuning a single-scale checkpoint is the intended workflow —
+    # the new FPN/cross-attn modules init random (shape-mismatched/missing tensors are
+    # skipped by the warm-start loader below) while the ViT + heads load 1:1.
 
     # --- data ---
     Dataset = CocoDetection if is_detect else CocoInstanceSeg
@@ -549,6 +565,7 @@ def train(
             "aux_heads": {s.name: s.num_classes for s in aux_specs},
             "loss_weights": loss_weights,
             "num_upscale_blocks": num_upscale_blocks,
+            "fpn_scales": list(fpn_scales) if fpn_scales else None,
         },
     )
 
@@ -563,8 +580,11 @@ def train(
         aux_head_arch=aux_head_arch,
         loss_weights=loss_weights,
         num_upscale_blocks=num_upscale_blocks,
+        fpn_scales=fpn_scales,
     ).to(dev)
     print(f"[model] loss weights: {loss_weights}; upscale blocks: {model.num_upscale_blocks}")
+    if model.fpn_scales:
+        print(f"[model] multi-scale FPN enabled: scales={model.fpn_scales}")
     if aux_specs:
         print(f"[model] aux head arch: {model.aux_head_arch}")
     start_epoch, best_metric = 0, -1.0
@@ -677,6 +697,7 @@ def train(
             letterbox=letterbox,
             loss_weights=loss_weights,
             num_upscale_blocks=core.num_upscale_blocks,
+            fpn_scales=core.fpn_scales,
             norm_mean=getattr(core, "pixel_mean", None),
             norm_std=getattr(core, "pixel_std", None),
             patch_size=getattr(core, "patch_size", None),

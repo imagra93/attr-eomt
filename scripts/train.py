@@ -33,7 +33,17 @@ def main() -> None:
     p.add_argument("--name", default=None, help="Run name (default: eomt-{size}).")
     p.add_argument("--weights", default=None, help="Init from a checkpoint/run to fine-tune (warm start).")
     p.add_argument("--resume", default=None, help="Resume a run from a checkpoint/run folder.")
+    p.add_argument(
+        "--fpn-scales", default="2,1,0.5",
+        help="B1 multi-scale SimpleFPN scales relative to the native grid (default "
+             "'2,1,0.5', on by default). Pass 'none'/'off' for the single-scale model.",
+    )
     args = p.parse_args()
+
+    if args.fpn_scales.strip().lower() in ("", "none", "off", "0"):
+        fpn_scales = None
+    else:
+        fpn_scales = [float(s) for s in args.fpn_scales.split(",") if s.strip()]
 
     # Init from a checkpoint (fine-tune / resume) or from a size (fresh, DINOv2 backbone).
     model = EoMT(args.weights or args.resume or args.size, device=args.device)
@@ -45,6 +55,7 @@ def main() -> None:
         imgsz=args.imgsz,
         name=args.name,
         resume=bool(args.resume),
+        fpn_scales=fpn_scales,
     )
     if result["best_metric"] >= 0:
         metric = "bbox mAP" if args.task == "detect" else "segm mAP"
