@@ -273,6 +273,136 @@ class BoxHead(nn.Module):
         return self.fc3(hidden_states).sigmoid()
 
 
+#: Default ViTDet-style pyramid scales relative to the native stride-14 grid:
+#: 2x (fine, the small-object win), 1x (native), 0.5x (coarse). Used when
+#: ``fpn_scales`` is enabled without an explicit tuple, and by the serialization
+#: inferer (the conv weights don't encode the scale, so this is the recovery prior).
+DEFAULT_FPN_SCALES: tuple[float, ...] = (2.0, 1.0, 0.5)
+
+
+def _sincos_2d(h: int, w: int, dim: int, device, dtype) -> torch.Tensor:
+    """Standard DETR 2D sine-cosine positional embedding, ``[h*w, dim]``.
+
+    Computed on the fly per level (no fixed table) so the model still runs at any
+    input size. ``dim`` must be divisible by 4 (half the channels encode the row
+    coordinate, half the column; each half split into sin/cos).
+    """
+    if dim % 4:
+        raise ValueError(f"_sincos_2d needs dim divisible by 4, got {dim}.")
+    quarter = dim // 4
+    omega = 1.0 / (10000.0 ** (torch.arange(quarter, device=device, dtype=torch.float32) / quarter))
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=device, dtype=torch.float32),
+        torch.arange(w, device=device, dtype=torch.float32),
+        indexing="ij",
+    )
+
+    def _emb(coord: torch.Tensor) -> torch.Tensor:  # coord [h, w] -> [h*w, dim//2]
+        a = coord.reshape(-1, 1) * omega[None, :]
+        return torch.cat([a.sin(), a.cos()], dim=1)
+
+    return torch.cat([_emb(yy), _emb(xx)], dim=1).to(dtype)  # [h*w, dim]
+
+
+class SimpleFPN(nn.Module):
+    """ViTDet-style multi-scale pyramid from a single ViT feature map.
+
+    Input  : native patch features ``[B, hidden, Hn, Wn]`` (stride-14 grid).
+    Output : list of ``[B, hidden, H_l, W_l]`` at each scale. ``scale > 1`` upsamples
+    (the fine level that buys small-object recall), ``== 1`` refines, ``< 1``
+    downsamples. All levels stay hidden-dim so the cross-attention bank is cheap.
+    """
+
+    def __init__(self, config, scales: tuple[float, ...]):
+        super().__init__()
+        h = config.hidden_size
+        self.scales = tuple(scales)
+        self.blocks = nn.ModuleList()
+        for s in self.scales:
+            if s > 1:  # upsample x2 -> fine (stride-7)
+                blk = nn.Sequential(
+                    nn.ConvTranspose2d(h, h, kernel_size=2, stride=2),
+                    LayerNorm2d(h),
+                    _act(config.hidden_act),
+                )
+            elif s == 1:  # depthwise refine -> native
+                blk = nn.Sequential(
+                    nn.Conv2d(h, h, kernel_size=3, padding=1, groups=h, bias=False),
+                    LayerNorm2d(h),
+                )
+            else:  # downsample x2 -> coarse
+                blk = nn.Sequential(
+                    nn.Conv2d(h, h, kernel_size=2, stride=2),
+                    LayerNorm2d(h),
+                    _act(config.hidden_act),
+                )
+            self.blocks.append(blk)
+
+    def forward(self, feat: torch.Tensor) -> list[torch.Tensor]:
+        return [blk(feat) for blk in self.blocks]
+
+
+class MultiScaleBank(nn.Module):
+    """Flatten SimpleFPN levels into one token bank with level + 2D-sincos position.
+
+    ``forward`` returns ``(feats, pos)`` each ``[B, sum(H_l*W_l), hidden]``: ``feats``
+    are the level features (the cross-attn values), ``pos`` the additive positional
+    encoding (sincos per level + a learned per-level embedding) added to the keys.
+    """
+
+    def __init__(self, config, num_levels: int):
+        super().__init__()
+        self.level_embed = nn.Embedding(num_levels, config.hidden_size)
+
+    def forward(self, levels: list[torch.Tensor]):
+        feats, poss = [], []
+        for lvl, x in enumerate(levels):
+            b, c, h, w = x.shape
+            feats.append(x.flatten(2).transpose(1, 2))  # [B, h*w, c]
+            pos = _sincos_2d(h, w, c, x.device, x.dtype)[None] + self.level_embed.weight[lvl][None, None]
+            poss.append(pos.expand(b, -1, -1))
+        return torch.cat(feats, dim=1), torch.cat(poss, dim=1)
+
+
+class QueryCrossAttention(nn.Module):
+    """Additive cross-attention sublayer: queries attend to the multi-scale bank.
+
+    Pre-norm + LayerScale + residual, mirroring :class:`Layer`. No FFN — the queries
+    already get self-attention + MLP from the shared stream they sit in; this only
+    injects multi-scale context. Cost is ``O(Q * N_bank)`` (Q ~= 100), so it stays
+    cheap even with a fine level in the bank — the point of B1.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // self.num_heads
+        self.scale = self.head_dim**-0.5
+        self.norm_q = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm_kv = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.layer_scale = LayerScale(config)
+
+    def forward(self, queries: torch.Tensor, bank_feats: torch.Tensor, bank_pos: torch.Tensor) -> torch.Tensor:
+        q_in = self.norm_q(queries)
+        kv = self.norm_kv(bank_feats)
+        b, q_n, _ = q_in.shape
+        n = kv.shape[1]
+
+        def _split(x, length):
+            return x.view(b, length, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q = _split(self.q_proj(q_in), q_n)
+        k = _split(self.k_proj(kv + bank_pos), n)  # position added to keys only (DETR)
+        v = _split(self.v_proj(kv), n)
+        attn = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        attn = attn.transpose(1, 2).reshape(b, q_n, -1)
+        return queries + self.layer_scale(self.out_proj(attn))
+
+
 class EoMTEncoder(nn.Module):
     """Pure-PyTorch ``EomtForUniversalSegmentation`` (forward + loss).
 
@@ -280,6 +410,12 @@ class EoMTEncoder(nn.Module):
     ``family="detect"`` swaps the mask head for a :class:`BoxHead` and the mask/dice
     criterion for :class:`~eomt.box_loss.DetectionLoss`; masked attention is not used
     (there is no predicted mask to focus on), so the last blocks do full attention.
+
+    When ``config.fpn_scales`` is set, a :class:`SimpleFPN` builds a multi-scale token
+    bank from the patch features at the query-injection point and each query block
+    gains a :class:`QueryCrossAttention` sublayer so queries can attend to it (the B1
+    multi-scale fix). Left unset, the module is bit-for-bit the original EoMT — no
+    extra params, so it keeps state-dict parity with the HF model.
     """
 
     def __init__(self, config, family: str = "instance"):
@@ -315,6 +451,18 @@ class EoMTEncoder(nn.Module):
             }
             self.criterion = EoMTLoss(config=config, weight_dict=self.weight_dict)
         self.register_buffer("attn_mask_probs", torch.ones(config.num_blocks))
+
+        # Optional multi-scale (B1): SimpleFPN bank + one query→bank cross-attention
+        # per query block. Built only when enabled, so the default model adds no
+        # params and keeps state-dict parity with the HF EoMT.
+        fpn_scales = getattr(config, "fpn_scales", None)
+        self.fpn_scales = tuple(fpn_scales) if fpn_scales else None
+        if self.fpn_scales:
+            self.fpn = SimpleFPN(config, self.fpn_scales)
+            self.bank = MultiScaleBank(config, num_levels=len(self.fpn_scales))
+            self.cross_blocks = nn.ModuleList(
+                [QueryCrossAttention(config) for _ in range(config.num_blocks)]
+            )
 
     # --- loss plumbing (mirrors HF get_loss_dict / get_loss) ----------------
 
@@ -412,8 +560,17 @@ class EoMTEncoder(nn.Module):
 
         hidden_states = self.embeddings(pixel_values)
 
+        # Multi-scale bank (B1), built once from the patch features at the injection
+        # point and held fixed across the query blocks (Mask2Former-style memory).
+        bank_feats = bank_pos = None
+
         for idx, layer_module in enumerate(self.layers):
             if idx == self.num_hidden_layers - self.config.num_blocks:
+                if self.fpn_scales:
+                    num_prefix = self.embeddings.num_prefix_tokens
+                    patch = hidden_states[:, num_prefix:]  # [B, Hn*Wn, hidden]
+                    patch2d = patch.transpose(1, 2).reshape(patch.shape[0], -1, *grid)
+                    bank_feats, bank_pos = self.bank(self.fpn(patch2d))
                 query = (
                     self.query.weight[None, :, :]
                     .expand(hidden_states.shape[0], -1, -1)
@@ -441,6 +598,16 @@ class EoMTEncoder(nn.Module):
                 )
 
             hidden_states = layer_module(hidden_states, attention_mask)
+
+            # Multi-scale (B1): after the shared self-attention, let the query slice
+            # cross-attend to the bank so it gathers fine/coarse context the native
+            # grid alone can't provide. The next block's prediction reads the result.
+            if self.fpn_scales and in_query_blocks:
+                num_q = self.config.num_queries
+                refined = self.cross_blocks[block_idx](
+                    hidden_states[:, :num_q], bank_feats, bank_pos
+                )
+                hidden_states = torch.cat((refined, hidden_states[:, num_q:]), dim=1)
 
         sequence_output = self.layernorm(hidden_states)
         geom_final, class_queries_logits = self.predict(sequence_output, grid)
@@ -516,6 +683,7 @@ def build_model(
     aux_head_arch: dict | None = None,
     loss_weights: dict | None = None,
     num_upscale_blocks: int | None = None,
+    fpn_scales: tuple[float, ...] | list[float] | None = None,
 ) -> "EoMTModel":
     """Build an :class:`EoMTModel`.
 
@@ -526,6 +694,8 @@ def build_model(
     criterion weights (mask/dice for instance, L1/GIoU for detect — see
     ``normalize_loss_weights``); ``num_upscale_blocks`` overrides the mask-head
     upsampling depth (instance only; ``None`` = size preset default).
+    ``fpn_scales`` enables the B1 multi-scale path (SimpleFPN + query
+    cross-attention); ``None`` = the original single-scale model.
     """
     if family not in FAMILIES:
         raise ValueError(f"family={family!r} is not one of {FAMILIES}.")
@@ -540,6 +710,7 @@ def build_model(
         aux_head_arch=aux_head_arch,
         loss_weights=loss_weights,
         num_upscale_blocks=num_upscale_blocks,
+        fpn_scales=fpn_scales,
     )
 
 
@@ -562,6 +733,7 @@ class EoMTModel(nn.Module):
         aux_head_arch: dict | None = None,
         loss_weights: dict | None = None,
         num_upscale_blocks: int | None = None,
+        fpn_scales: tuple[float, ...] | list[float] | None = None,
     ):
         super().__init__()
         self.size = size
@@ -599,6 +771,13 @@ class EoMTModel(nn.Module):
         if family == "detect":
             config.l1_weight = float(self.loss_weights["l1_weight"])
             config.giou_weight = float(self.loss_weights["giou_weight"])
+        # Multi-scale (B1): stash the FPN scales on the config so ``EoMTEncoder``
+        # (which only receives the config) builds the SimpleFPN + cross-attn modules.
+        # ``EomtConfig`` has no such field, so this is an added attribute; left unset
+        # the encoder is the original single-scale model.
+        self.fpn_scales = tuple(float(s) for s in fpn_scales) if fpn_scales else None
+        if self.fpn_scales:
+            config.fpn_scales = self.fpn_scales
         self.config = config
         # Effective upscale depth (resolved from the preset when not overridden).
         self.num_upscale_blocks = int(config.num_upscale_blocks)

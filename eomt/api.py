@@ -396,6 +396,7 @@ class EoMT:
             aux_heads=m.aux_specs, aux_head_arch=m.aux_head_arch,
             letterbox=bool(getattr(m, "preprocess_letterbox", False)),
             loss_weights=m.loss_weights, num_upscale_blocks=m.num_upscale_blocks,
+            fpn_scales=getattr(m, "fpn_scales", None),
             norm_mean=getattr(m, "pixel_mean", None), norm_std=getattr(m, "pixel_std", None),
             patch_size=getattr(m, "patch_size", None),
             compression=self._compression,
