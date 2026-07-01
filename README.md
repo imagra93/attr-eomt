@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/00-hero-banner.png" alt="attr-eomt — Encoder-only Mask Transformer with per-instance attribute heads" width="100%">
+<img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/00-hero-banner.png" alt="attr-eomt — one DINOv2 encoder predicts instances plus independent per-instance attribute heads in a single pass, contrasted with flat combinatorial labels and a detector-plus-second-model pipeline" width="100%">
 
 <p>
   <a href="https://pypi.org/project/attr-eomt/"><img src="https://img.shields.io/pypi/v/attr-eomt.svg?color=4ec9b0" alt="PyPI version"></a>
@@ -17,24 +17,16 @@
 
 ---
 
-## Abstract
+## What it is
 
 **attr-eomt** is a standalone **EoMT** (Encoder-only Mask Transformer) for **instance
-segmentation** and **object detection**, extended with one feature that sets it apart:
-**independent per-instance attribute heads**. Alongside the usual mask/box + class
-output, the model predicts **one or several orthogonal attributes for every detected
-instance** — colour, state, grade, laterality, anything — read straight off the *same*
-per-query embedding the detector already computes. Instead of folding every distinction
-into one combinatorial class list, attr-eomt **factorizes the label space**: a small,
-well-populated primary taxonomy plus thin attribute heads that *add* rather than
-*multiply*. Each head reuses the detector's own Hungarian match, so attributes train
-and infer **for near-zero extra compute** — no second model, no second pass, and the
-primary detection metric is left exactly as it was. The result is composable,
-generalizing per-instance labels that can even predict `attribute × class` combinations
-never seen during training.
+segmentation** and **object detection**, with one feature that sets it apart: **independent
+per-instance attribute heads**. Alongside the mask/box + class output, it predicts one or
+several orthogonal attributes for *every* detected instance — read straight off the **same**
+per-query embedding the detector already computes. No second model, no second pass, and the
+primary detection metric is untouched (the figure above tells the whole story).
 
-It is a clean-room, Apache-2.0-compatible reimplementation: weights you train are yours
-to release.
+It's a clean-room, Apache-2.0 reimplementation: the weights you train are yours to release.
 
 ```python
 from eomt import EoMT
@@ -63,9 +55,11 @@ The attribute heads add nothing to this picture except themselves: they tap the 
 same embedding** (captured non-invasively with a forward hook), each a small classifier
 on top.
 
-<div align="center">
-<img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/01-architecture.png" alt="Architecture: image → DINOv2 ViT with learnable queries → per-query embedding, fanning out to the class head, mask/box head and several auxiliary attribute heads" width="100%">
-</div>
+This collapses what is classically a *two-stage* pipeline — detect, crop each box, run a
+second classifier per crop — into a single pass. Attributes therefore cost only a thin head
+each, see **full-image context** (not just a cropped box), and never inherit a second
+model's cropping errors — the modern, single-stage formulation of the DETR / Mask2Former
+lineage (see the figure at the top).
 
 ### Two model families: segmentation & detection
 
@@ -124,40 +118,18 @@ attribute heads add a thin linear/MLP per head and are negligible by design.
 
 ---
 
-## ⭐ Method — factorizing the label space
+## Factorizing the label space
 
-This is the contribution. Conventional detectors fold every distinction into a single
-flat label space. When an object has both a *type* and several *attributes* — a garment's
-class **and** its viewpoint **and** whether it's occluded — the only way to express that is
-the Cartesian product `type × viewpoint × occlusion × …`. That space explodes combinatorially,
-starves each leaf class of training examples, and breaks Hungarian matching by
-multiplying the query targets.
+This is the contribution. Conventional detectors fold every distinction into one flat
+label space: an object's `type × viewpoint × occlusion × …` becomes a Cartesian product of
+leaf classes that explodes combinatorially, starves each leaf of examples, and multiplies
+the Hungarian matcher's targets. **attr-eomt factorizes instead** — a small, general primary
+head plus independent attribute heads that **add, not multiply**.
 
-**attr-eomt factorizes instead.** The primary head stays small and *general*; orthogonal
-attributes are predicted by independent secondary heads, each reading the same
-per-instance query embedding the detector already computes — they **add, not multiply**.
-
-<div align="center">
-<img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/02-factorized-labels.png" alt="Flat label space (type × colour × state leaf classes) versus factorized independent heads (type + colour + state outputs)" width="100%">
-</div>
-
-Because the heads are independent:
-
-- **Categories stay collapsed and general.** Keep a compact, well-populated primary
-  taxonomy (`short_sleeve_top`, `dress`, `trousers`) and push fine-grained or orthogonal
-  distinctions into attributes — every primary class keeps its full sample count instead
-  of being shattered into rare leaves.
-- **Unseen combinations generalize.** A `viewpoint` head trained across many garment types
-  predicts `side` on a class it *never co-occurred with sideways*, because viewpoint is
-  learned independently of type. The model composes `attribute × class` combinations
-  that **never appear in the training data** — combinations a flat label space cannot
-  even represent.
-- **Instances stay separate.** EoMT is **NMS-free**, so two overlapping same-class
-  objects remain two distinct queries; each carries its own attribute predictions
-  rather than being merged.
-- **It rides along for free.** Attributes reuse the backbone and the detector's own
-  matched queries — they add only a thin linear/MLP head and a cross-entropy term, not
-  a second model or a second pass.
+Because the heads are independent, the primary taxonomy stays compact and every class keeps
+its full sample count; attributes ride along for near-zero compute; and the model composes
+`attribute × class` combinations that **never appear in the training data** — combinations a
+flat label space cannot even represent.
 
 ### Example: clothing with per-instance attributes
 
@@ -186,10 +158,6 @@ product + facing**, **documents → element + role**, **cells → type + health*
 Attributes never run their own matcher. Detection already solves "which query is
 responsible for which ground-truth object" via the **Hungarian matcher**; attributes
 simply reuse that same query→GT assignment and read the answer off the matched queries.
-
-<div align="center">
-<img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/03-training-flow.png" alt="Training flow: query_embed → Hungarian matcher (reused) → IoU gate → matched queries [N, hidden] → per-head cross-entropy → × aux_w → added to detector loss" width="100%">
-</div>
 
 - **Embedding source.** Each head reads the per-query embedding — the input to EoMT's
   `class_predictor`, captured with a forward hook (`[B, Q, hidden]`).
@@ -290,59 +258,8 @@ EoMT("runs/train/eomt-l").val(data="coco")
 EoMT("runs/train/eomt-l").predict("images/", plot=True)   # writes annotated images
 ```
 
-### Compress to int8
-
-`compress()` applies **int8 weight-only quantization** (via [torchao](https://github.com/pytorch/ao))
-to the ViT transformer blocks — the bulk of the parameters — while keeping the
-prediction heads in full precision. It's **data-free** (no calibration) and shrinks the
-checkpoint ≈**3.4×** on `l` with no measurable mAP loss.
-
-```python
-m = EoMT("runs/train/eomt-l")
-m.compress("int8", data="coco", save="runs/train/eomt-int8/weights/best.pt")  # quantize, validate, save
-# size/mAP/latency deltas are returned (and written to compression_metrics.json in the
-# run folder); omit `data` to skip the before/after validation
-
-# Reload like any run — the recipe is recorded in the checkpoint, so the int8 layout
-# is rebuilt automatically:
-EoMT("runs/train/eomt-int8").predict("images/")
-```
-
-The compressed model is **GPU-only** (torchao's int8 kernels have no CPU path), and
-`best.pt` exported from an EMA run quantizes exactly those EMA weights.
-
-### Useful `train()` options
-
-Passed as keyword arguments to `model.train(...)`:
-
-| arg | default | effect |
-|------|---------|--------|
-| `family` | `"instance"` | `"instance"` (masks) or `"detect"` (boxes only) |
-| `nominal_batch` / `accum` | `16` / `0` | gradient accumulation to an **effective batch** of `nominal_batch`; `accum=N` sets the step count explicitly |
-| `ema` / `ema_decay` / `ema_tau` | `True` / `0.9999` / `2000` | validate & export `best.pt` from an **EMA** of the weights |
-| `llrd` | `0.85` | **layer-wise LR decay** on the DINOv2 backbone (`1.0` = flat `backbone_lr_mult`) |
-| `min_scale` / `max_scale` | `0.1` / `2.0` | **Large-Scale Jitter** range |
-| `letterbox` | `True` | aspect-preserving **letterbox** eval (vs legacy square stretch); recorded in the checkpoint |
-| `flip_prob` | `0.5` | horizontal-flip probability. **Set `0`** for datasets with a left/right attribute — hflip mirrors pixels without swapping the laterality label |
-| `mask_anneal` | `True` | anneal masked attention `1→0` over training (EoMT recipe) |
-| `aux_w` | `1.0` | weight on the summed secondary-head loss |
-
-### Training recipe (defaults)
-
-Defaults follow the EoMT/Mask2Former fine-tuning recipe; each piece is a keyword
-argument, so legacy behaviour is one override away.
-
-- **Effective batch via gradient accumulation** — LR/WD/clip are tuned for an effective
-  batch of 16; EoMT is a ViT (LayerNorm, no BatchNorm) so accumulation ≈ a true large
-  batch at a fraction of the memory.
-- **EMA weights** validated and saved as `best.pt`; `last.pt` holds live weights +
-  optimizer + EMA state for exact resume.
-- **Large-Scale Jitter** for training, **letterbox** for eval/inference (mode stored
-  per-checkpoint so `val`/`predict` match training automatically).
-- **AdamW** with no weight decay on norms/biases/embeddings and layer-wise LR decay on
-  the backbone.
-- **Masked-attention annealing** `1 → 0` so the final stretch trains mask-free and
-  matches efficient (mask-less) inference.
+For the full training recipe, every `train()` knob, and int8 compression, see the
+**[annotated explainer →](https://imagra93.github.io/attr-eomt)** — it's the deep dive.
 
 ---
 

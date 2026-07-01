@@ -135,11 +135,18 @@
     <div class="eyebrow">Encoder-only Mask Transformer · annotated</div>
     <h1>One query embedding,<br><span class="frac">many</span> independent labels.</h1>
     <p class="lede">attr-eomt is a standalone EoMT detector whose distinguishing trick is small: it reads <em>extra</em> per-instance attributes straight off the embedding the detector already computes — for free, without bloating the class list.</p>
-    <div class="repo">imagra93/attr-eomt · Apache-2.0 · this page focuses on the ⭐ auxiliary attribute heads</div>
+    <div class="repo">imagra93/attr-eomt · Apache-2.0 · the deep dive — attribute heads, training recipe &amp; deployment</div>
   </div>
 </header>
 
 <main class="wrap">
+
+<figure style="margin:34px 0 0">
+  <img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/assets/00-hero-banner.png"
+       alt="attr-eomt overview: one DINOv2 encoder predicts instances plus independent per-instance attribute heads in a single pass — contrasted with flat combinatorial labels and a detector-plus-second-model pipeline"
+       style="width:100%;height:auto;border-radius:12px;border:1px solid var(--line);display:block">
+  <figcaption class="cap">The whole idea on one canvas: two ways it's usually done wrong (flat combinatorial labels; a bolt-on second model) versus one encoder that reads every attribute off the query embedding it already computed.</figcaption>
+</figure>
 
 <!-- ============ THE BASE ============ -->
 <section>
@@ -151,7 +158,7 @@
     <li>the <span class="pr-em">class head</span> (<code>class_predictor</code>) turns it into a primary label,</li>
     <li>the <span class="pr-em">mask head</span> (or a box head, in the <code>detect</code> family) turns it into geometry.</li>
   </ul>
-  <p>It's <strong>NMS-free</strong>: two overlapping garments stay two distinct queries instead of being merged by non-max suppression. That property is what lets attributes stay attached to the right instance.</p>
+  <p>It's <strong>NMS-free</strong>: two overlapping instances stay two distinct queries instead of being merged by non-max suppression. That property is what lets attributes stay attached to the right instance.</p>
 
   <table>
     <thead><tr><th>size</th><th>backbone</th><th>hidden</th><th>queries</th></tr></thead>
@@ -168,24 +175,24 @@
 <section>
   <div class="tag">Why attributes exist</div>
   <h2>The label space explodes</h2>
-  <p>A normal detector has one flat list of classes. So when an object has a <em>type</em> <strong>and</strong> a <em>viewpoint</em> <strong>and</strong> an <em>occlusion</em> level, the only way to express it is the Cartesian product: <code>type × viewpoint × occlusion</code>. That blows up combinatorially, starves each leaf class of examples, and multiplies the targets the Hungarian matcher has to assign.</p>
-  <p><strong>attr-eomt factorizes instead.</strong> Keep the primary taxonomy small and general (<code>short_sleeve_top</code>, <code>dress</code>, <code>trousers</code>); push orthogonal distinctions into <span class="ax-em">independent heads</span> that add, not multiply. Drag the sliders — this is the entire argument for the feature:</p>
+  <p>A normal detector has one flat list of classes. So when an object has a <em>class</em> <strong>and</strong> several orthogonal <em>attributes</em>, the only way to express it is the Cartesian product: <code>class × attribute #1 × attribute #2 × …</code>. That blows up combinatorially, starves each leaf class of examples, and multiplies the targets the Hungarian matcher has to assign.</p>
+  <p><strong>attr-eomt factorizes instead.</strong> Keep the primary taxonomy small and general (<code>class #1</code>, <code>class #2</code>, …); push each orthogonal attribute into its own <span class="ax-em">independent head</span> that adds, not multiplies. Drag the sliders — this is the entire argument for the feature:</p>
 
   <div class="widget">
     <h3>Flat label space vs. factorized heads</h3>
     <div class="ctrl">
-      <label for="t">primary types</label>
-      <input id="t" type="range" min="2" max="12" value="4" aria-label="number of primary types">
+      <label for="t">primary classes</label>
+      <input id="t" type="range" min="2" max="12" value="4" aria-label="number of primary classes">
       <output id="to">4</output>
     </div>
     <div class="ctrl">
-      <label for="c">viewpoint values</label>
-      <input id="c" type="range" min="2" max="12" value="3" aria-label="number of viewpoint values">
+      <label for="c">attribute #1 values</label>
+      <input id="c" type="range" min="2" max="12" value="3" aria-label="number of attribute #1 values">
       <output id="co">3</output>
     </div>
     <div class="ctrl">
-      <label for="d">occlusion levels</label>
-      <input id="d" type="range" min="2" max="8" value="3" aria-label="number of occlusion levels">
+      <label for="d">attribute #2 values</label>
+      <input id="d" type="range" min="2" max="8" value="3" aria-label="number of attribute #2 values">
       <output id="do">3</output>
     </div>
     <div class="verdict">
@@ -205,7 +212,7 @@
 
   <div class="note q">
     <span class="ic">↳</span>
-    <p>Because the heads are independent, the model can predict <code>side</code> on a garment it <em>never saw sideways</em> during training — it composes <span class="ax-em">attribute × class</span> combinations a flat label space cannot even represent.</p>
+    <p>Because the heads are independent, the model can predict an attribute value on a class it <em>never co-occurred with</em> during training — it composes <span class="ax-em">attribute × class</span> combinations a flat label space cannot even represent.</p>
   </div>
 </section>
 
@@ -274,13 +281,13 @@
       <!-- aux heads -->
       <path class="flowq" d="M580,225 C636,225 636,222 690,222" marker-end="url(#arq)"/>
       <rect class="bx" x="694" y="198" width="172" height="48" stroke="#e2b341"/>
-      <text class="lbl" x="780" y="219" text-anchor="middle" fill="#e2b341">aux head · "scale"</text>
-      <text class="sub" x="780" y="235" text-anchor="middle">3 classes</text>
+      <text class="lbl" x="780" y="219" text-anchor="middle" fill="#e2b341">attribute head #1</text>
+      <text class="sub" x="780" y="235" text-anchor="middle">n classes</text>
 
       <path class="flowq" d="M580,233 C630,233 630,286 690,286" marker-end="url(#arq)"/>
       <rect class="bx" x="694" y="262" width="172" height="48" stroke="#e2b341"/>
-      <text class="lbl" x="780" y="283" text-anchor="middle" fill="#e2b341">aux head · "viewpoint"</text>
-      <text class="sub" x="780" y="299" text-anchor="middle">3 classes</text>
+      <text class="lbl" x="780" y="283" text-anchor="middle" fill="#e2b341">attribute head #2</text>
+      <text class="sub" x="780" y="299" text-anchor="middle">n classes</text>
 
       <path class="flowq" d="M580,240 C624,240 624,350 690,350" marker-end="url(#arq)" stroke-dasharray="3 4"/>
       <rect class="bx" x="694" y="326" width="172" height="48" stroke="#e2b341" stroke-dasharray="4 4"/>
@@ -345,25 +352,30 @@ matched  = gather_matched(out, indices)                          <span class="c"
 
   <h3>1 · a top-level <code>attributes</code> list (the vocabulary)</h3>
 <pre>"attributes": [
-  {"name": <span class="s">"scale"</span>, "categories": [
-     {"id": 1, "name": "small"}, {"id": 2, "name": "modest"}, {"id": 3, "name": "large"}]},
-  {"name": <span class="s">"viewpoint"</span>, "categories": [
-     {"id": 0, "name": "frontal"}, {"id": 1, "name": "side"}, {"id": 2, "name": "back"}]}
+  {"name": <span class="s">"attribute_1"</span>, "categories": [
+     {"id": 1, "name": "value_a"}, {"id": 2, "name": "value_b"}, {"id": 3, "name": "value_c"}]},
+  {"name": <span class="s">"attribute_2"</span>, "categories": [
+     {"id": 0, "name": "value_x"}, {"id": 1, "name": "value_y"}, {"id": 2, "name": "value_z"}]}
 ]</pre>
   <h3>2 · a per-annotation <code>attributes</code> map</h3>
 <pre>{ "id": 1, "image_id": 42, "category_id": 1, "bbox": [...], "segmentation": [...],
-  "attributes": {<span class="s">"scale"</span>: 3, <span class="s">"viewpoint"</span>: 0} }</pre>
-  <p class="dim" style="font-size:15px">Raw ids are remapped to a contiguous <code>0..n-1</code> per head (so scale's <code>1/2/3</code> → <code>0/1/2</code>). A missing value defaults to <code>0</code>; a JSON with no <code>attributes</code> is just detection-only, exactly as before.</p>
+  "attributes": {<span class="s">"attribute_1"</span>: 3, <span class="s">"attribute_2"</span>: 0} }</pre>
+  <p class="dim" style="font-size:15px">Raw ids are remapped to a contiguous <code>0..n-1</code> per head (so <code>attribute_1</code>'s <code>1/2/3</code> → <code>0/1/2</code>). A missing value defaults to <code>0</code>; a JSON with no <code>attributes</code> is just detection-only, exactly as before.</p>
 
   <h3>At inference</h3>
   <p>Each kept detection gets an <code>aux = {head: {"ids", "probs"}}</code> entry, and <code>predict(plot=True)</code> renders every attribute next to the class label, using the names stored in the checkpoint — the primary class on the first row, each attribute + its confidence on the row beneath.</p>
 
   <figure style="margin:30px 0 6px">
-    <img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/sample.jpg"
-         alt="Two people in dresses; each instance labelled with its garment class plus scale, occlusion, zoom and viewpoint attributes"
-         style="width:100%;height:auto;border-radius:10px;border:1px solid rgba(255,255,255,.12);display:block">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px">
+      <img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/rosalia.jpg"
+           alt="A detected instance labelled with its primary class plus several independent per-instance attributes"
+           style="width:100%;height:auto;border-radius:10px;border:1px solid rgba(255,255,255,.12);display:block">
+      <img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/taylor_swift.jpg"
+           alt="Another detected instance labelled with its primary class plus several independent per-instance attributes"
+           style="width:100%;height:auto;border-radius:10px;border:1px solid rgba(255,255,255,.12);display:block">
+    </div>
     <figcaption class="dim" style="font-size:15px;margin-top:12px">
-      A prediction from the <a href="https://github.com/switchablenorms/DeepFashion2">DeepFashion2</a> showcase: two <code>vest_dress</code> instances, each carrying four independent attribute heads — <code>scale</code>, <code>occlusion</code>, <code>zoom_in</code>, <code>viewpoint</code> — read off the same per-query embedding and drawn by <code>eomt.visualize.draw_instances</code>.
+      Two predictions: every detected instance carries its <span class="pr-em">primary class</span> plus several <span class="ax-em">independent attributes</span> — all read off the same per-query embedding, drawn by <code>eomt.visualize.draw_instances</code> (primary class on the first row, each attribute + its confidence beneath).
     </figcaption>
   </figure>
 
@@ -373,11 +385,59 @@ matched  = gather_matched(out, indices)                          <span class="c"
   </div>
 </section>
 
+<!-- ============ TRAINING RECIPE ============ -->
+<section>
+  <div class="tag">Defaults that matter</div>
+  <h2>The training recipe, and the knobs</h2>
+  <p>Defaults follow the EoMT / Mask2Former fine-tuning recipe. Each piece is a keyword argument to <code>train()</code>, so legacy behaviour is one override away.</p>
+  <ul class="dim">
+    <li><strong>Effective batch via gradient accumulation</strong> — LR/WD/clip are tuned for an effective batch of 16; EoMT is a ViT (LayerNorm, no BatchNorm), so accumulation ≈ a true large batch at a fraction of the memory.</li>
+    <li><strong>EMA weights</strong> are validated and saved as <code>best.pt</code>; <code>last.pt</code> holds live weights + optimizer + EMA state for exact resume.</li>
+    <li><strong>Large-Scale Jitter</strong> for training, <strong>letterbox</strong> for eval/inference (the mode is stored per-checkpoint so <code>val</code>/<code>predict</code> match training automatically).</li>
+    <li><strong>AdamW</strong> with no weight decay on norms/biases/embeddings, and layer-wise LR decay on the backbone.</li>
+    <li><strong>Masked-attention annealing</strong> <code>1 → 0</code> so the final stretch trains mask-free and matches efficient (mask-less) inference.</li>
+  </ul>
+
+  <table>
+    <thead><tr><th>arg</th><th>default</th><th>effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>family</code></td><td><code>"instance"</code></td><td><code>"instance"</code> (masks) or <code>"detect"</code> (boxes only)</td></tr>
+      <tr><td><code>nominal_batch</code> / <code>accum</code></td><td><code>16</code> / <code>0</code></td><td>gradient accumulation to an effective batch of <code>nominal_batch</code>; <code>accum=N</code> sets the step count explicitly</td></tr>
+      <tr><td><code>ema</code> / <code>ema_decay</code> / <code>ema_tau</code></td><td><code>True</code> / <code>0.9999</code> / <code>2000</code></td><td>validate &amp; export <code>best.pt</code> from an EMA of the weights</td></tr>
+      <tr><td><code>llrd</code></td><td><code>0.85</code></td><td>layer-wise LR decay on the DINOv2 backbone (<code>1.0</code> = flat <code>backbone_lr_mult</code>)</td></tr>
+      <tr><td><code>min_scale</code> / <code>max_scale</code></td><td><code>0.1</code> / <code>2.0</code></td><td>Large-Scale Jitter range</td></tr>
+      <tr><td><code>letterbox</code></td><td><code>True</code></td><td>aspect-preserving letterbox eval (vs legacy square stretch); recorded in the checkpoint</td></tr>
+      <tr><td><code>flip_prob</code></td><td><code>0.5</code></td><td>horizontal-flip probability</td></tr>
+      <tr><td><code>mask_anneal</code></td><td><code>True</code></td><td>anneal masked attention <code>1→0</code> over training</td></tr>
+      <tr><td><code>aux_w</code></td><td><code>1.0</code></td><td>weight on the summed secondary-head loss</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note" style="border-left-color:var(--warn)">
+    <span class="ic" style="color:var(--warn)">⚑</span>
+    <p><strong>Laterality gotcha.</strong> If an attribute encodes left/right, train with <code>flip_prob=0</code> — a horizontal flip mirrors the pixels but <em>not</em> the label, silently corrupting it.</p>
+  </div>
+</section>
+
+<!-- ============ COMPRESS ============ -->
+<section>
+  <div class="tag">Deployment</div>
+  <h2>Compress to int8</h2>
+  <p><code>compress()</code> applies <strong>int8 weight-only quantization</strong> (via <a href="https://github.com/pytorch/ao">torchao</a>) to the ViT transformer blocks — the bulk of the parameters — while keeping the prediction heads in full precision. It's <strong>data-free</strong> (no calibration) and shrinks the checkpoint <strong>≈3.4×</strong> on <code>l</code> with no measurable mAP loss.</p>
+<pre>m = EoMT(<span class="s">"runs/train/eomt-l"</span>)
+m.<span class="f">compress</span>(<span class="s">"int8"</span>, data=<span class="s">"coco"</span>, save=<span class="s">"runs/train/eomt-int8/weights/best.pt"</span>)
+<span class="c"># deltas returned + written to compression_metrics.json; omit `data` to skip validation</span>
+
+<span class="c"># reload like any run — the int8 layout is rebuilt from the checkpoint recipe</span>
+EoMT(<span class="s">"runs/train/eomt-int8"</span>).<span class="f">predict</span>(<span class="s">"images/"</span>)</pre>
+  <p class="dim" style="font-size:15px">The compressed model is GPU-only (torchao's int8 kernels have no CPU path), and <code>best.pt</code> exported from an EMA run quantizes exactly those EMA weights.</p>
+</section>
+
 <!-- ============ RECAP ============ -->
 <section style="border-bottom:none">
   <div class="tag">The whole idea, once more</div>
   <h2>Factorize the labels, tap the embedding, reuse the match</h2>
-  <p>Keep the primary taxonomy small and well-populated. For everything orthogonal — scale, occlusion, zoom, viewpoint — attach an <span class="ax-em">independent head</span> that reads the <span class="q-em">per-query embedding</span> the detector already produces, supervise it on the <span class="pr-em">detector's own Hungarian match</span>, and add a cross-entropy term. You get composable, generalizing per-instance attributes for almost no extra compute, and the primary detection metric stays exactly as it was.</p>
+  <p>Keep the primary taxonomy small and well-populated. For every orthogonal axis — each an independent attribute — attach an <span class="ax-em">independent head</span> that reads the <span class="q-em">per-query embedding</span> the detector already produces, supervise it on the <span class="pr-em">detector's own Hungarian match</span>, and add a cross-entropy term. You get composable, generalizing per-instance attributes for almost no extra compute, and the primary detection metric stays exactly as it was.</p>
 </section>
 
 </main>

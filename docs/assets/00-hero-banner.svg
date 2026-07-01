@@ -1,1 +1,95 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 380" width="1200" height="380"><defs><radialGradient id="g1" cx="18%" cy="0%" r="80%"><stop offset="0%" stop-color="#13201d"/><stop offset="100%" stop-color="#0e1318"/></radialGradient><marker id="h" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#4ec9b0"/></marker></defs><rect x="1" y="1" width="1198" height="378" rx="18" fill="url(#g1)" stroke="#2a3744" stroke-width="1.5"/><text x="70" y="120" font-family="DejaVu Sans, sans-serif" font-size="84" fill="#d7e0e8" text-anchor="start" font-weight="bold">attr</text><text x="254.8" y="120" font-family="DejaVu Sans, sans-serif" font-size="84" fill="#e2b341" font-weight="bold">-eomt</text><rect x="72" y="142" width="250" height="4" rx="2" fill="#4ec9b0"/><text x="72" y="184" font-family="DejaVu Sans, sans-serif" font-size="18" fill="#8c9aa8" text-anchor="start" font-weight="normal">Encoder-only Mask Transformer + per-instance attribute heads</text><text x="72" y="214" font-family="DejaVu Sans Mono, monospace" font-size="13" fill="#5e6b78" text-anchor="start" font-weight="normal">instance segmentation / detection · attributes train for free on top</text><text x="72" y="300" font-family="DejaVu Sans Mono, monospace" font-size="13" fill="#4ec9b0" text-anchor="start" font-weight="bold">one query embedding</text><text x="72" y="320" font-family="DejaVu Sans Mono, monospace" font-size="13" fill="#e2b341" text-anchor="start" font-weight="bold">→ many independent labels</text><rect x="720" y="160.0" width="120" height="60" rx="8" fill="#1b232c" stroke="#5aa6f0" stroke-width="1.5"/><text x="780.0" y="194.0" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#5aa6f0" text-anchor="middle" font-weight="bold">encoder</text><path d="M840,190.0 H878" stroke="#4ec9b0" stroke-width="2" fill="none" marker-end="url(#h)"/><rect x="882" y="165.0" width="120" height="50" rx="8" fill="#10201c" stroke="#4ec9b0" stroke-width="1.5"/><text x="942.0" y="194.0" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#4ec9b0" text-anchor="middle" font-weight="bold">query_embed</text><path d="M1002,190.0 C1026,190.0 1026,114.0 1050,114.0" stroke="#4ec9b0" stroke-width="1.8" fill="none" marker-end="url(#h)"/><rect x="1054" y="98.0" width="128" height="32" rx="8" fill="#1b232c" stroke="#5aa6f0" stroke-width="1.5"/><text x="1118.0" y="118.0" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#5aa6f0" text-anchor="middle" font-weight="bold">class</text><path d="M1002,190.0 C1026,190.0 1026,162.0 1050,162.0" stroke="#4ec9b0" stroke-width="1.8" fill="none" marker-end="url(#h)"/><rect x="1054" y="146.0" width="128" height="32" rx="8" fill="#1b232c" stroke="#5aa6f0" stroke-width="1.5"/><text x="1118.0" y="166.0" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#5aa6f0" text-anchor="middle" font-weight="bold">mask/box</text><path d="M1002,190.0 C1026,190.0 1026,210.0 1050,210.0" stroke="#4ec9b0" stroke-width="1.8" fill="none" marker-end="url(#h)"/><rect x="1054" y="194.0" width="128" height="32" rx="8" fill="#1b232c" stroke="#e2b341" stroke-width="1.5"/><text x="1118.0" y="214.0" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e2b341" text-anchor="middle" font-weight="bold">attribute</text><path d="M1002,190.0 C1026,190.0 1026,258.0 1050,258.0" stroke="#4ec9b0" stroke-width="1.8" fill="none" marker-end="url(#h)"/><rect x="1054" y="242.0" width="128" height="32" rx="8" fill="#1b232c" stroke="#e2b341" stroke-width="1.5"/><text x="1118.0" y="262.0" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e2b341" text-anchor="middle" font-weight="bold">attribute</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 710" width="1240" height="710">
+<defs>
+<radialGradient id="g1" cx="18%" cy="0%" r="90%"><stop offset="0%" stop-color="#13201d"/><stop offset="100%" stop-color="#0e1318"/></radialGradient>
+<marker id="ac" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e07a5f"/></marker>
+<marker id="ag" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#e2b341"/></marker>
+</defs>
+<rect x="1" y="1" width="1238" height="708" rx="18" fill="url(#g1)" stroke="#2a3744" stroke-width="1.5"/>
+
+<!-- ============ banner ============ -->
+<text x="54" y="92" font-family="DejaVu Sans, sans-serif" font-size="54" fill="#d7e0e8" text-anchor="start" font-weight="bold">attr</text>
+<text x="173" y="92" font-family="DejaVu Sans, sans-serif" font-size="54" fill="#e2b341" text-anchor="start" font-weight="bold">-eomt</text>
+<rect x="56" y="104" width="176" height="4" rx="2" fill="#4ec9b0"/>
+<text x="56" y="132" font-family="DejaVu Sans Mono, monospace" font-size="15" fill="#8c9aa8" text-anchor="start">Encoder-only Mask Transformer · per-instance attribute heads</text>
+<text x="56" y="156" font-family="DejaVu Sans Mono, monospace" font-size="12.5" fill="#4ec9b0" text-anchor="start" font-weight="bold">one query embedding</text>
+<text x="206" y="156" font-family="DejaVu Sans Mono, monospace" font-size="12.5" fill="#e2b341" text-anchor="start" font-weight="bold">→ many independent labels</text>
+<text x="1200" y="86" font-family="DejaVu Sans Mono, monospace" font-size="13" fill="#8c9aa8" text-anchor="end">instance segmentation · detection</text>
+<text x="1200" y="110" font-family="DejaVu Sans Mono, monospace" font-size="13" fill="#e2b341" text-anchor="end" font-weight="bold">+ attributes, in one forward pass</text>
+
+<!-- ============ panels ============ -->
+<rect x="40" y="185" width="370" height="445" rx="12" fill="#10161c" stroke="rgba(224,122,95,.28)" stroke-width="1.2"/>
+<rect x="435" y="185" width="370" height="445" rx="12" fill="#10161c" stroke="rgba(224,122,95,.28)" stroke-width="1.2"/>
+<rect x="830" y="185" width="370" height="445" rx="12" fill="#0f1a18" stroke="#e2b341" stroke-width="1.6"/>
+
+<!-- headers -->
+<circle cx="62" cy="206" r="4" fill="#e07a5f"/>
+<text x="74" y="210" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e07a5f" text-anchor="start" font-weight="bold">PROBLEM — FLAT LABELS</text>
+<line x1="56" y1="222" x2="394" y2="222" stroke="#2a3744" stroke-width="1"/>
+<circle cx="457" cy="206" r="4" fill="#e07a5f"/>
+<text x="469" y="210" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e07a5f" text-anchor="start" font-weight="bold">PROBLEM — SECOND MODEL</text>
+<line x1="451" y1="222" x2="789" y2="222" stroke="#2a3744" stroke-width="1"/>
+<circle cx="852" cy="206" r="4" fill="#e2b341"/>
+<text x="864" y="210" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e2b341" text-anchor="start" font-weight="bold">attr-eomt — ONE MODEL</text>
+<line x1="846" y1="222" x2="1184" y2="222" stroke="#e2b341" stroke-width="1" stroke-opacity="0.35"/>
+
+<!-- ===== COL 1 : flat labels ===== -->
+<text x="225" y="250" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#8c9aa8" text-anchor="middle">flat: a class per class(C) × attribute(A)</text>
+<rect x="85" y="280" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="129" y="299" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C1·A1</text>
+<rect x="181" y="280" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="225" y="299" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C1·A2</text>
+<rect x="277" y="280" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="321" y="299" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C1·A3</text>
+<rect x="85" y="319" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="129" y="338" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C2·A1</text>
+<rect x="181" y="319" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="225" y="338" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C2·A2</text>
+<rect x="277" y="319" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="321" y="338" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C2·A3</text>
+<rect x="85" y="358" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="129" y="377" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C3·A1</text>
+<rect x="181" y="358" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="225" y="377" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C3·A2</text>
+<rect x="277" y="358" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="321" y="377" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C3·A3</text>
+<rect x="85" y="397" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="129" y="416" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C4·A1</text>
+<rect x="181" y="397" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="225" y="416" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C4·A2</text>
+<rect x="277" y="397" width="88" height="30" rx="5" fill="#1b232c" stroke="rgba(224,122,95,.4)"/><text x="321" y="416" font-family="DejaVu Sans Mono, monospace" font-size="8.5" fill="#8c9aa8" text-anchor="middle">C4·A3</text>
+<text x="225" y="452" font-family="DejaVu Sans Mono, monospace" font-size="10" fill="#5e6b78" text-anchor="middle">× more attributes × …</text>
+<text x="225" y="502" font-family="DejaVu Sans Mono, monospace" font-size="21" fill="#e07a5f" text-anchor="middle" font-weight="bold">N × M × …</text>
+<text x="225" y="528" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#5e6b78" text-anchor="middle">one leaf per combination</text>
+<text x="225" y="582" font-family="DejaVu Sans Mono, monospace" font-size="15" fill="#e07a5f" text-anchor="middle" font-weight="bold">combinatorial blow-up</text>
+<text x="225" y="606" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#5e6b78" text-anchor="middle">rare leaves starve · matching targets multiply</text>
+
+<!-- ===== COL 2 : second model ===== -->
+<text x="620" y="250" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#8c9aa8" text-anchor="middle">detect, crop each box, run a 2nd model</text>
+<rect x="545" y="262" width="150" height="30" rx="7" fill="#1b232c" stroke="#2a3744"/><text x="620" y="281" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#8c9aa8" text-anchor="middle">input image</text>
+<line x1="620" y1="292" x2="620" y2="306" stroke="#e07a5f" stroke-width="1.4" marker-end="url(#ac)"/>
+<rect x="495" y="308" width="250" height="38" rx="7" fill="#1b232c" stroke="rgba(224,122,95,.5)" stroke-width="1.2"/><text x="620" y="326" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e07a5f" text-anchor="middle" font-weight="bold">DETECTOR</text><text x="620" y="339" font-family="DejaVu Sans Mono, monospace" font-size="9" fill="#5e6b78" text-anchor="middle">forward pass #1</text>
+<line x1="620" y1="346" x2="620" y2="360" stroke="#e07a5f" stroke-width="1.4" marker-end="url(#ac)"/>
+<rect x="495" y="362" width="250" height="38" rx="7" fill="#1b232c" stroke="rgba(224,122,95,.5)" stroke-width="1.2"/><text x="620" y="380" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e07a5f" text-anchor="middle" font-weight="bold">crop each box</text><text x="620" y="393" font-family="DejaVu Sans Mono, monospace" font-size="9" fill="#5e6b78" text-anchor="middle">sees only the box pixels</text>
+<line x1="620" y1="400" x2="620" y2="414" stroke="#e07a5f" stroke-width="1.4" marker-end="url(#ac)"/>
+<rect x="495" y="416" width="250" height="38" rx="7" fill="#1b232c" stroke="rgba(224,122,95,.5)" stroke-width="1.2"/><text x="620" y="434" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e07a5f" text-anchor="middle" font-weight="bold">SECOND MODEL</text><text x="620" y="447" font-family="DejaVu Sans Mono, monospace" font-size="9" fill="#5e6b78" text-anchor="middle">forward pass #2 · runs ×N crops</text>
+<line x1="620" y1="454" x2="620" y2="468" stroke="#e07a5f" stroke-width="1.4" marker-end="url(#ac)"/>
+<rect x="545" y="470" width="150" height="30" rx="7" fill="#1b232c" stroke="rgba(224,122,95,.5)" stroke-width="1.2"/><text x="620" y="489" font-family="DejaVu Sans Mono, monospace" font-size="11" fill="#e07a5f" text-anchor="middle" font-weight="bold">attribute</text>
+<text x="620" y="530" font-family="DejaVu Sans Mono, monospace" font-size="10" fill="#5e6b78" text-anchor="middle">every crop = one more forward</text>
+<text x="620" y="582" font-family="DejaVu Sans Mono, monospace" font-size="15" fill="#e07a5f" text-anchor="middle" font-weight="bold">2 models · 2 passes</text>
+<text x="620" y="606" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#5e6b78" text-anchor="middle">no context · occlusion mixes instances</text>
+
+<!-- ===== COL 3 : attr-eomt ===== -->
+<text x="1015" y="250" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#e2b341" text-anchor="middle">one encoder · factorized attribute heads</text>
+<rect x="940" y="262" width="150" height="30" rx="7" fill="#1b232c" stroke="#2a3744"/><text x="1015" y="281" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#8c9aa8" text-anchor="middle">input image</text>
+<line x1="1015" y1="292" x2="1015" y2="306" stroke="#e2b341" stroke-width="1.4" marker-end="url(#ag)"/>
+<rect x="845" y="308" width="340" height="38" rx="7" fill="#1b232c" stroke="#e2b341" stroke-width="1.3"/><text x="1015" y="326" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e2b341" text-anchor="middle" font-weight="bold">EoMT ENCODER</text><text x="1015" y="339" font-family="DejaVu Sans Mono, monospace" font-size="9" fill="#5e6b78" text-anchor="middle">one forward pass · attends over the whole image</text>
+<line x1="1015" y1="346" x2="1015" y2="360" stroke="#e2b341" stroke-width="1.4" marker-end="url(#ag)"/>
+<rect x="875" y="362" width="280" height="36" rx="7" fill="#1b232c" stroke="#e2b341" stroke-width="1.3"/><text x="1015" y="384" font-family="DejaVu Sans Mono, monospace" font-size="11" fill="#4ec9b0" text-anchor="middle" font-weight="bold">per-query embedding</text>
+<line x1="1015" y1="398" x2="880" y2="428" stroke="#e2b341" stroke-width="1.3" marker-end="url(#ag)"/>
+<line x1="1015" y1="398" x2="962" y2="428" stroke="#e2b341" stroke-width="1.3" marker-end="url(#ag)"/>
+<line x1="1015" y1="398" x2="1044" y2="428" stroke="#e2b341" stroke-width="1.3" marker-end="url(#ag)"/>
+<line x1="1015" y1="398" x2="1150" y2="428" stroke="#e2b341" stroke-width="1.3" marker-end="url(#ag)"/>
+<rect x="842" y="430" width="76" height="44" rx="7" fill="#1b232c" stroke="rgba(78,201,176,.6)" stroke-width="1.2"/><text x="880" y="450" font-family="DejaVu Sans Mono, monospace" font-size="9" fill="#4ec9b0" text-anchor="middle" font-weight="bold">class / mask</text><text x="880" y="463" font-family="DejaVu Sans Mono, monospace" font-size="7.5" fill="#5e6b78" text-anchor="middle">instances</text>
+<rect x="924" y="430" width="76" height="44" rx="7" fill="#1b232c" stroke="#e2b341" stroke-width="1.2"/><text x="962" y="450" font-family="DejaVu Sans Mono, monospace" font-size="9" fill="#e2b341" text-anchor="middle" font-weight="bold">attribute #1</text><text x="962" y="463" font-family="DejaVu Sans Mono, monospace" font-size="7.5" fill="#5e6b78" text-anchor="middle">+1 MLP</text>
+<rect x="1006" y="430" width="76" height="44" rx="7" fill="#1b232c" stroke="#e2b341" stroke-width="1.2"/><text x="1044" y="450" font-family="DejaVu Sans Mono, monospace" font-size="9" fill="#e2b341" text-anchor="middle" font-weight="bold">attribute #2</text><text x="1044" y="463" font-family="DejaVu Sans Mono, monospace" font-size="7.5" fill="#5e6b78" text-anchor="middle">+1 MLP</text>
+<text x="1097" y="459" font-family="DejaVu Sans Mono, monospace" font-size="18" fill="#e2b341" text-anchor="middle" font-weight="bold">…</text>
+<rect x="1112" y="430" width="76" height="44" rx="7" fill="#1b232c" stroke="#e2b341" stroke-width="1.2"/><text x="1150" y="450" font-family="DejaVu Sans Mono, monospace" font-size="9" fill="#e2b341" text-anchor="middle" font-weight="bold">attribute #N</text><text x="1150" y="463" font-family="DejaVu Sans Mono, monospace" font-size="7.5" fill="#5e6b78" text-anchor="middle">+1 MLP</text>
+<text x="1015" y="502" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#e2b341" text-anchor="middle" font-weight="bold">add (N + M + …), don't multiply</text>
+<text x="1015" y="528" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#5e6b78" text-anchor="middle">independent heads · unseen combos generalize</text>
+<text x="1015" y="582" font-family="DejaVu Sans Mono, monospace" font-size="15" fill="#4ec9b0" text-anchor="middle" font-weight="bold">1 model · 1 pass</text>
+<text x="1015" y="606" font-family="DejaVu Sans Mono, monospace" font-size="10.5" fill="#5e6b78" text-anchor="middle">full context · NMS-free · attributes ≈ free</text>
+
+<line x1="70" y1="558" x2="380" y2="558" stroke="#2a3744" stroke-width="1"/>
+<line x1="465" y1="558" x2="775" y2="558" stroke="#2a3744" stroke-width="1"/>
+<line x1="860" y1="558" x2="1170" y2="558" stroke="#e2b341" stroke-width="1" stroke-opacity="0.3"/>
+<text x="620" y="676" font-family="DejaVu Sans Mono, monospace" font-size="12" fill="#5e6b78" text-anchor="middle">detect · segment · attribute — one DINOv2 encoder, NMS-free queries, heads that add instead of multiply</text>
+</svg>
