@@ -533,8 +533,12 @@ class EoMTEncoder(nn.Module):
         attention_mask = self._disable_attention_mask(
             attention_mask, prob, num_query_tokens, encoder_start_tokens, attention_mask.device
         )
-        attention_mask = attention_mask[:, None, ...].expand(-1, self.config.num_attention_heads, -1, -1)
-        return attention_mask.float().masked_fill(~attention_mask, -1e9)
+        # Return a broadcastable bool mask (B, 1, N, N): SDPA broadcasts over the head
+        # dim (the mask is identical across heads) and accepts bool directly (True =
+        # attend). This is ~64x smaller than the old per-head float32 additive mask
+        # (~1.38 GB -> ~21 MB per query block at ViT-L/B=4) with identical semantics.
+        # No fully-masked rows arise here (query/prefix columns stay True), so no NaNs.
+        return attention_mask.unsqueeze(1)
 
     def forward(
         self,

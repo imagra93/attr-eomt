@@ -85,7 +85,8 @@ def _llrd_scale(name: str, num_layers: int, llrd: float) -> float:
 
 
 def build_optimizer(
-    model, lr: float, weight_decay: float, backbone_lr_mult: float, llrd: float = 1.0
+    model, lr: float, weight_decay: float, backbone_lr_mult: float, llrd: float = 1.0,
+    optim_8bit: bool = False,
 ):
     """AdamW with backbone LR scaling, layer-wise LR decay, and no-WD on norms/biases.
 
@@ -93,6 +94,12 @@ def build_optimizer(
     ``lr * backbone_lr_mult`` further scaled per layer by ``llrd`` (``1.0`` = the
     legacy flat multiplier); the task head gets full ``lr``. 1-D tensors and
     positional/token embeddings are placed in weight-decay-free groups.
+
+    ``optim_8bit`` swaps the fp32 AdamW moments for torchao's block-wise 8-bit
+    AdamW (``torchao.optim.AdamW8bit``), cutting optimizer state ~4x (~2.5 GB ->
+    ~0.6 GB for ViT-L) at negligible quality cost. torchao stores ``lr`` as a
+    Tensor; the per-step schedule (``initial_lr * factor``) preserves that, so no
+    other change is needed.
     """
     num_layers = _count_encoder_layers(model)
     groups: dict[tuple, dict] = {}
@@ -110,7 +117,16 @@ def build_optimizer(
         groups.setdefault(
             key, {"params": [], "lr": lr_i, "weight_decay": wd_i, "is_backbone": is_backbone}
         )["params"].append(p)
-    opt = torch.optim.AdamW(list(groups.values()), lr=lr, weight_decay=weight_decay)
+    if optim_8bit:
+        try:
+            from torchao.optim import AdamW8bit
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "optim_8bit=True needs torchao (a declared dependency): pip install torchao"
+            ) from e
+        opt = AdamW8bit(list(groups.values()), lr=lr, weight_decay=weight_decay)
+    else:
+        opt = torch.optim.AdamW(list(groups.values()), lr=lr, weight_decay=weight_decay)
     for g in opt.param_groups:
         g["initial_lr"] = g["lr"]
     return opt
@@ -266,6 +282,8 @@ def train(
     ema: bool = True,
     ema_decay: float = 0.9999,
     ema_tau: float = 2000.0,
+    ema_device: str = "cpu",
+    optim_8bit: bool = True,
     mask_anneal: bool = True,
     mask_anneal_start: float = 0.0,
     mask_anneal_end: float = 0.9,
@@ -540,6 +558,8 @@ def train(
             "ema": ema,
             "ema_decay": ema_decay,
             "ema_tau": ema_tau,
+            "ema_device": ema_device,
+            "optim_8bit": optim_8bit,
             "amp": amp,
             "amp_dtype": amp_dtype,
             "tf32": tf32,
@@ -588,7 +608,7 @@ def train(
     if aux_specs:
         print(f"[model] aux head arch: {model.aux_head_arch}")
     start_epoch, best_metric = 0, -1.0
-    optimizer = build_optimizer(model, lr0, weight_decay, backbone_lr_mult, llrd)
+    optimizer = build_optimizer(model, lr0, weight_decay, backbone_lr_mult, llrd, optim_8bit=optim_8bit)
 
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model"], strict=False)
@@ -623,7 +643,10 @@ def train(
 
     # EMA of the weights, built after init/resume so it starts from real weights.
     # Restored from the checkpoint when resuming so the average isn't lost.
-    ema_model = ModelEMA(model, decay=ema_decay, tau=ema_tau, device=dev) if ema else None
+    # ``ema_device="cpu"`` holds the shadow copy off-GPU (~1.2 GB VRAM saved for
+    # ViT-L); it is moved to ``dev`` only for validation (see below) and back after.
+    ema_dev = torch.device("cpu") if str(ema_device).lower() == "cpu" else dev
+    ema_model = ModelEMA(model, decay=ema_decay, tau=ema_tau, device=ema_dev) if ema else None
     if ema_model is not None and resume_ckpt is not None and resume_ckpt.get("ema"):
         ema_model.load_state_dict(resume_ckpt["ema"])
         print(f"[resume] restored EMA ({ema_model.updates} updates)")
@@ -853,6 +876,13 @@ def train(
         # The EMA copy is what gets validated and exported as best.pt, so zero its
         # buffer too (its buffers track the live model, which was just annealing).
         eval_model = ema_model.module if ema_model is not None else core
+        will_validate = val_ds is not None and (epoch + 1) % val_interval == 0
+        # A CPU-resident EMA copy must live on the compute device to validate and to
+        # export best.pt (evaluate() moves only inputs, not the model). Bring it up
+        # for this epoch's eval/save; it is sent back after the checkpoint section.
+        ema_on_cpu = ema_model is not None and ema_dev.type == "cpu"
+        if ema_on_cpu and will_validate:
+            eval_model.to(dev)
         if mask_anneal:
             core.eomt.attn_mask_probs.zero_()
             if ema_model is not None:
@@ -861,7 +891,7 @@ def train(
         # --- validation ---
         metrics = {}
         epoch_aux_pc: dict[str, dict[int, tuple[int, int]]] | None = None
-        if val_ds is not None and (epoch + 1) % val_interval == 0:
+        if will_validate:
             if is_detect:
                 metrics = evaluate_detection(
                     eval_model, val_ds, device=dev, batch_size=batch,
@@ -907,6 +937,9 @@ def train(
             best_metric = cur
             _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False)
             print(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
+        # Return the EMA shadow to CPU now that eval + best.pt export are done.
+        if ema_on_cpu and will_validate:
+            eval_model.to(ema_dev)
 
         # --- per-epoch metrics row (missing values -> nan) ---
         row = {"epoch": epoch, "train/loss": epoch_loss}

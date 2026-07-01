@@ -38,6 +38,13 @@ def main() -> None:
         help="B1 multi-scale SimpleFPN scales relative to the native grid (default "
              "'2,1,0.5', on by default). Pass 'none'/'off' for the single-scale model.",
     )
+    p.add_argument("--optim-8bit", action=argparse.BooleanOptionalAction, default=True,
+                   help="torchao 8-bit AdamW (~1.8 GB less VRAM for ViT-L; within-noise of fp32 "
+                        "Adam). ON by default; --no-optim-8bit for plain fp32 AdamW. Resuming a "
+                        "run must reuse the same setting (optimizer state differs).")
+    p.add_argument("--ema-device", default="cpu", choices=["cuda", "cpu"],
+                   help="Where to hold the EMA shadow copy (default 'cpu': frees ~1.2 GB VRAM, "
+                        "moved to GPU only for validation; EMA math is identical either way).")
     args = p.parse_args()
 
     if args.fpn_scales.strip().lower() in ("", "none", "off", "0"):
@@ -56,6 +63,8 @@ def main() -> None:
         name=args.name,
         resume=bool(args.resume),
         fpn_scales=fpn_scales,
+        optim_8bit=args.optim_8bit,
+        ema_device=args.ema_device,
     )
     if result["best_metric"] >= 0:
         metric = "bbox mAP" if args.task == "detect" else "segm mAP"
