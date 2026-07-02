@@ -25,6 +25,7 @@ from .device import resolve_device
 from .engine import evaluate as _evaluate
 from .engine import evaluate_detection as _evaluate_detection
 from .engine import predict as _predict
+from .engine import track as _track
 from .engine import train as _train
 from .model import build_model, load_dinov2_backbone
 from .serialization import (
@@ -383,6 +384,32 @@ class EoMT:
             self.model, str(source), plot=plot, save=save,
             conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
             imgsz=_resolve_imgsz(imgsz, self.model), **kw,
+        )
+
+    # ------------------------------------------------------------------ track
+    def track(self, source: str | Path, *, plot: bool = True, save: str | None = "runs/track",
+              conf_thres: float = 0.3, max_det: int = 100, mask_thresh: float = 0.5,
+              imgsz: int | None = None, min_hits: int = 3, trace: bool = False,
+              hud: bool = True, tracker_kwargs: dict | None = None, **kw) -> list[dict]:
+        """Track instances across a video, returning one result dict per frame.
+
+        Each dict carries the usual ``predict`` keys (``boxes`` / ``scores`` /
+        ``classes`` / optional ``masks``) plus a persistent ``track_ids`` tensor and a
+        ``frame`` index. For models with secondary heads, association still runs on the
+        main class + box only, and ``aux_track`` holds the temporally-smoothed
+        attribute per track (``aux`` keeps the raw per-frame values). With ``plot`` an
+        annotated ``.mp4`` colored by track id is written under ``save`` (``hud`` adds a
+        ``Frame i/N | Tracks: n`` banner, ``trace=True`` draws motion trails), plus a
+        ``<stem>_tracks.json`` per-track summary. ``min_hits`` requires a track to
+        persist that many consecutive frames before it is emitted (speck suppression);
+        ``tracker_kwargs`` are forwarded to ``ByteTrack`` (e.g.
+        ``{"lost_track_buffer": 90}``). ``imgsz`` overrides the inference size.
+        """
+        return _track(
+            self.model, str(source), plot=plot, save=save,
+            conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
+            imgsz=_resolve_imgsz(imgsz, self.model), min_hits=min_hits, trace=trace,
+            hud=hud, tracker_kwargs=tracker_kwargs, **kw,
         )
 
     # ------------------------------------------------------------------- save
