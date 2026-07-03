@@ -389,13 +389,14 @@ class EoMT:
     # ------------------------------------------------------------------ track
     def track(self, source: str | Path, *, plot: bool = True, save: str | None = "runs/track",
               conf_thres: float = 0.3, max_det: int = 100, mask_thresh: float = 0.5,
-              imgsz: int | None = None, min_hits: int = 3, trace: bool = False,
-              hud: bool = True, tracker_kwargs: dict | None = None, **kw) -> list[dict]:
+              imgsz: int | None = None, min_hits: int = 3, with_attr: bool = False,
+              details: bool = False, trace: bool = False, hud: bool = True,
+              tracker_kwargs: dict | None = None, **kw) -> list[dict] | dict:
         """Track instances across a video, returning one result dict per frame.
 
         Each dict carries the usual ``predict`` keys (``boxes`` / ``scores`` /
         ``classes`` / optional ``masks``) plus a persistent ``track_ids`` tensor and a
-        ``frame`` index. For models with secondary heads, association still runs on the
+        ``frame`` index. For models with secondary heads, association runs on the
         main class + box only, and ``aux_track`` holds the temporally-smoothed
         attribute per track (``aux`` keeps the raw per-frame values). With ``plot`` an
         annotated ``.mp4`` colored by track id is written under ``save`` (``hud`` adds a
@@ -404,11 +405,17 @@ class EoMT:
         persist that many consecutive frames before it is emitted (speck suppression);
         ``tracker_kwargs`` are forwarded to ``ByteTrack`` (e.g.
         ``{"lost_track_buffer": 90}``). ``imgsz`` overrides the inference size.
+
+        ``with_attr`` treats each attribute as part of the class — the tracked identity
+        becomes the compound class ``cls-attr1-attr2…`` (one ByteTrack per compound
+        class). ``details`` records the per-frame attribute evolution per track and
+        changes the return to ``{"frames": [...], "tracks": [...]}``.
         """
         return _track(
             self.model, str(source), plot=plot, save=save,
             conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
-            imgsz=_resolve_imgsz(imgsz, self.model), min_hits=min_hits, trace=trace,
+            imgsz=_resolve_imgsz(imgsz, self.model), min_hits=min_hits,
+            with_attr=with_attr, details=details, trace=trace,
             hud=hud, tracker_kwargs=tracker_kwargs, **kw,
         )
 
