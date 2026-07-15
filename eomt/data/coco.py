@@ -352,11 +352,6 @@ class CocoDetection(Dataset):
     **normalized ``cxcywh`` boxes** ``(num_inst, 4)`` in ``[0, 1]`` (relative to the
     square input) and their contiguous class ids. Boxes ride the **same** transforms
     as masks via ``tv_tensors.BoundingBoxes``, so LSJ/flip/crop apply identically.
-
-    .. warning::
-        Horizontal flip swaps left/right, which **corrupts left/right-valued aux
-        labels** exactly as it does for the seg dataset. Train such runs with
-        ``flip_prob=0``.
     """
 
     def __init__(

@@ -1,1 +1,0 @@
-compresión prunning
