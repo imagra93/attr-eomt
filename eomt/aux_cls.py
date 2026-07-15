@@ -1,8 +1,8 @@
 """Secondary per-instance classification heads ("attributes") for EoMT.
 
 The primary task (instance segmentation over ``nc`` classes) is unchanged. Each
-aux head predicts an extra attribute per *detected instance* — typology,
-laterality, severity, … — read from the matched query's embedding.
+aux head predicts an extra attribute per *detected instance* — color, material,
+size, … — read from the matched query's embedding.
 
 The supervision reuses EoMT's own Hungarian matcher
 (``model.eomt.criterion.matcher``) so each attribute is trained on the **same**

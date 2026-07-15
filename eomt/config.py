@@ -35,19 +35,29 @@ class AuxHeadSpec:
     ``name`` keys the head everywhere (model ``ModuleDict``, COCO ``attributes``
     field, checkpoint metadata). ``names`` maps the contiguous ``0..num_classes-1``
     ids to human labels. Several specs ⇒ several independent heads.
+
+    ``applies_to`` optionally scopes the head to a subset of **primary** classes
+    (contiguous ids): the head is only supervised on — and only emitted for —
+    instances whose primary class is in the set. ``None`` (the default) ⇒ the head
+    applies to every class (the original behaviour). This is the hard class-routing
+    that lets different attributes attach to different primary classes.
     """
 
     name: str
     num_classes: int
     names: dict[int, str] = field(default_factory=dict)
+    applies_to: frozenset[int] | None = None
 
 
 def aux_specs_to_meta(specs: list[AuxHeadSpec] | None) -> list[dict]:
     """Serialize aux-head specs for a checkpoint."""
-    return [
-        {"name": s.name, "num_classes": int(s.num_classes), "names": dict(s.names)}
-        for s in (specs or [])
-    ]
+    out: list[dict] = []
+    for s in specs or []:
+        d = {"name": s.name, "num_classes": int(s.num_classes), "names": dict(s.names)}
+        if s.applies_to is not None:
+            d["applies_to"] = sorted(int(c) for c in s.applies_to)
+        out.append(d)
+    return out
 
 
 def aux_specs_from_meta(meta: list[dict] | None) -> list[AuxHeadSpec]:
@@ -55,7 +65,9 @@ def aux_specs_from_meta(meta: list[dict] | None) -> list[AuxHeadSpec]:
     out: list[AuxHeadSpec] = []
     for d in meta or []:
         names = {int(k): str(v) for k, v in (d.get("names") or {}).items()}
-        out.append(AuxHeadSpec(str(d["name"]), int(d["num_classes"]), names))
+        raw = d.get("applies_to")
+        applies_to = frozenset(int(c) for c in raw) if raw is not None else None
+        out.append(AuxHeadSpec(str(d["name"]), int(d["num_classes"]), names, applies_to))
     return out
 
 

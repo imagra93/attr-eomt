@@ -15,6 +15,33 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 
 
+def _build_aux_result(aux_logits: dict, sel, classes, aux_scopes: dict | None) -> dict:
+    """Per-head ``{name: {"ids", "probs"}}`` for the kept queries, class-scope-gated.
+
+    For a class-scoped head (``aux_scopes[name]`` a set of primary class ids), any kept
+    detection whose class is out of scope gets ``ids = -1`` (the "not applicable"
+    sentinel) and zeroed ``probs`` — the inference side of the hard routing, so
+    downstream (plotting / track) can skip heads that don't apply to a class.
+    """
+    aux_scopes = aux_scopes or {}
+    res: dict = {}
+    for name, lg in aux_logits.items():
+        probs = lg[0].float().softmax(dim=-1)[sel]  # (N, ns)
+        ids = probs.argmax(dim=-1)
+        scope = aux_scopes.get(name)
+        if scope is not None and ids.numel():
+            out_of_scope = torch.tensor(
+                [int(c) not in scope for c in classes.tolist()],
+                dtype=torch.bool, device=ids.device,
+            )
+            ids = ids.clone()
+            ids[out_of_scope] = -1
+            probs = probs.clone()
+            probs[out_of_scope] = 0.0
+        res[name] = {"ids": ids, "probs": probs}
+    return res
+
+
 def boxes_from_masks(masks: torch.Tensor) -> torch.Tensor:
     """Derive ``xyxy`` boxes (pixel coords) from boolean masks ``(N, H, W)``."""
     n = masks.shape[0]
@@ -89,6 +116,7 @@ def postprocess_detection(
     *,
     max_det: int = 100,
     preprocess_meta: dict | None = None,
+    aux_scopes: dict | None = None,
     **_: object,
 ) -> dict:
     """Convert raw EoMT **detection** output to the canonical instance dict (no masks).
@@ -146,10 +174,7 @@ def postprocess_detection(
         "classes": classes.long(),
     }
     if aux_logits is not None:
-        result["aux"] = {}
-        for name, lg in aux_logits.items():
-            probs = lg[0].float().softmax(dim=-1)[sel]  # (N, ns)
-            result["aux"][name] = {"ids": probs.argmax(dim=-1), "probs": probs}
+        result["aux"] = _build_aux_result(aux_logits, sel, classes, aux_scopes)
     return result
 
 
@@ -162,6 +187,7 @@ def postprocess_instance(
     mask_thresh: float = 0.5,
     min_mask_area: float = 0.0,
     preprocess_meta: dict | None = None,
+    aux_scopes: dict | None = None,
     **_: object,
 ) -> dict:
     """Convert raw EoMT output to the canonical instance-seg dict.
@@ -246,8 +272,5 @@ def postprocess_instance(
         "masks": masks,
     }
     if aux_logits is not None:
-        result["aux"] = {}
-        for name, lg in aux_logits.items():
-            probs = lg[0].float().softmax(dim=-1)[sel]  # (N, ns)
-            result["aux"][name] = {"ids": probs.argmax(dim=-1), "probs": probs}
+        result["aux"] = _build_aux_result(aux_logits, sel, classes, aux_scopes)
     return result

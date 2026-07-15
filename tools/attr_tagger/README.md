@@ -57,7 +57,9 @@ Standard COCO plus a top-level `attributes` schema and a per-annotation
 
 ```jsonc
 "attributes": [
-  { "name": "color", "categories": [{ "id": 0, "name": "red" }, { "id": 1, "name": "green" }] }
+  { "name": "color", "categories": [{ "id": 0, "name": "red" }, { "id": 1, "name": "green" }] },
+  // optional: scope a head to a subset of primary classes (by name or id)
+  { "name": "posture", "categories": [...], "applies_to": ["cat", "dog"] }
 ],
 "annotations": [
   { "id": 1, "image_id": 1, "category_id": 7, "bbox": [...], "segmentation": [...],
@@ -67,3 +69,9 @@ Standard COCO plus a top-level `attributes` schema and a per-annotation
 
 Untagged instances simply omit the value; the training loader treats those as
 ignored (`-100`), so a partially-tagged file is still valid to train on.
+
+**Class-conditional heads.** Add an optional `applies_to` list to an attribute
+definition and that head is only trained on — and only predicted for — instances
+of those primary classes (hard routing on the class). Omit it and the head
+applies to every class. Different attributes can therefore attach to different
+classes, each with its own label set.

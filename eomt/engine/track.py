@@ -3,7 +3,7 @@
 Runs the still-image inference (:func:`~eomt.engine.predict.predict_image`) on every
 frame of a video, associates detections across frames into persistent ``track_id``s
 with ByteTrack, and (optionally) writes an annotated video. For models with auxiliary
-attribute heads (e.g. ``laterality`` / ``typology``) the tracker associates on the
+attribute heads (e.g. ``color`` / ``material``) the tracker associates on the
 **main class + box only** — attributes flicker frame-to-frame and must not drive
 identity — while each track keeps a running mean of the attribute probabilities and
 reports a temporally-smoothed label (``aux_track``).

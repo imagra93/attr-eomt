@@ -62,8 +62,8 @@ def test_aux_heads_train_and_infer():
     from eomt.config import AuxHeadSpec
 
     torch.manual_seed(0)
-    specs = [AuxHeadSpec("typology", 4, {0: "a", 1: "b", 2: "c", 3: "d"}),
-             AuxHeadSpec("severity", 3, {0: "lo", 1: "mid", 2: "hi"})]
+    specs = [AuxHeadSpec("color", 4, {0: "a", 1: "b", 2: "c", 3: "d"}),
+             AuxHeadSpec("material", 3, {0: "lo", 1: "mid", 2: "hi"})]
     model = build_model("s", nc=NC, imgsz=IMGSZ, aux_heads=specs).train()
     x = torch.randn(2, 3, IMGSZ, IMGSZ)
     mask_labels = [
@@ -72,32 +72,32 @@ def test_aux_heads_train_and_infer():
     ]
     class_labels = [torch.tensor([0, 1]), torch.tensor([2])]
     aux_labels = {
-        "typology": [torch.tensor([1, 3]), torch.tensor([0])],
-        "severity": [torch.tensor([2, 0]), torch.tensor([1])],
+        "color": [torch.tensor([1, 3]), torch.tensor([0])],
+        "material": [torch.tensor([2, 0]), torch.tensor([1])],
     }
     out = model(x, mask_labels=mask_labels, class_labels=class_labels)
     total = out["loss"]
     a_loss, per_head = aux_loss(model, out, mask_labels, class_labels, aux_labels)
-    assert set(per_head) == {"typology", "severity"}
+    assert set(per_head) == {"color", "material"}
     (total + a_loss).backward()
     # default head is a small MLP -> assert grads flow through *some* head param
-    assert any(p.grad is not None for p in model.aux_heads["typology"].parameters())
+    assert any(p.grad is not None for p in model.aux_heads["color"].parameters())
 
     acc = aux_accuracy(model, out, mask_labels, class_labels, aux_labels)
-    assert set(acc) == {"typology", "severity"}
+    assert set(acc) == {"color", "material"}
 
     # inference forward exposes per-head logits; postprocess attaches them
     model.eval()
     with torch.no_grad():
         out = model(x)
-    assert out["aux_queries_logits"]["typology"].shape == (2, EOMT_CONFIGS["s"].num_queries, 4)
+    assert out["aux_queries_logits"]["color"].shape == (2, EOMT_CONFIGS["s"].num_queries, 4)
     res = postprocess_instance(
         {k: v[:1] if torch.is_tensor(v) else {n: t[:1] for n, t in v.items()}
          for k, v in out.items() if k != "query_embed"},
         conf_thres=0.0, original_size=(20, 15), max_det=5,
     )
-    assert set(res["aux"]) == {"typology", "severity"}
-    assert res["aux"]["typology"]["probs"].shape[1] == 4
+    assert set(res["aux"]) == {"color", "material"}
+    assert res["aux"]["color"]["probs"].shape[1] == 4
 
 
 def test_aux_ignore_index():
@@ -125,6 +125,131 @@ def test_aux_ignore_index():
     assert torch.isfinite(loss2) and float(loss2.detach()) == 0.0
     loss2.backward()  # must not raise (graph kept alive)
     assert aux_accuracy(model, out2, None, None, all_ignored, indices=indices)["typ"] == (0, 0)
+
+
+def test_aux_applies_to_roundtrip():
+    """A class-scoped head's applies_to survives checkpoint (de)serialization."""
+    from eomt.config import AuxHeadSpec, aux_specs_from_meta, aux_specs_to_meta
+
+    specs = [
+        AuxHeadSpec("posture", 2, {0: "sit", 1: "stand"}, frozenset({1, 3})),
+        AuxHeadSpec("coat", 3, {0: "short", 1: "long", 2: "curly"}, None),
+    ]
+    meta = aux_specs_to_meta(specs)
+    assert meta[0]["applies_to"] == [1, 3]
+    assert "applies_to" not in meta[1]  # unscoped -> key omitted
+    back = aux_specs_from_meta(meta)
+    assert back[0].applies_to == frozenset({1, 3})
+    assert back[1].applies_to is None
+
+
+def _write_mini_coco(tmp_path, with_applies_to: bool):
+    """Write a 2-instance COCO (cat + dog) + one image; return (img_dir, json_path)."""
+    import json
+
+    from PIL import Image
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    Image.fromarray(np.zeros((20, 20, 3), dtype=np.uint8)).save(img_dir / "im1.png")
+
+    def sq(x0, y0, x1, y1):  # polygon segmentation for a rectangle
+        return [[x0, y0, x1, y0, x1, y1, x0, y1]]
+
+    attr_def = {
+        "name": "posture",
+        "categories": [{"id": 0, "name": "sit"}, {"id": 1, "name": "stand"}, {"id": 2, "name": "lie"}],
+    }
+    if with_applies_to:
+        attr_def["applies_to"] = ["cat"]  # head applies to 'cat' only
+    coco = {
+        "images": [{"id": 1, "file_name": "im1.png", "width": 20, "height": 20}],
+        "categories": [{"id": 1, "name": "cat"}, {"id": 2, "name": "dog"}],
+        "attributes": [attr_def],
+        "annotations": [
+            {"id": 10, "image_id": 1, "category_id": 1, "iscrowd": 0,
+             "bbox": [1, 1, 8, 8], "area": 64, "segmentation": sq(1, 1, 9, 9),
+             "attributes": {"posture": 1}},   # cat, tagged 'stand'
+            {"id": 11, "image_id": 1, "category_id": 2, "iscrowd": 0,
+             "bbox": [10, 10, 8, 8], "area": 64, "segmentation": sq(10, 10, 18, 18),
+             "attributes": {"posture": 2}},   # dog, tagged 'lie' (out of scope)
+        ],
+    }
+    jf = tmp_path / "instances_train.json"
+    jf.write_text(json.dumps(coco))
+    return img_dir, jf
+
+
+def test_aux_class_routing_in_dataset(tmp_path):
+    """applies_to routes out-of-scope instances to -100 at label construction."""
+    from eomt.data.coco import CocoInstanceSeg
+    from eomt.data.transforms import build_val_transform
+
+    # cat ids sorted -> cat=contig 0, dog=contig 1; head 'posture' applies to cat.
+    img_dir, jf = _write_mini_coco(tmp_path, with_applies_to=True)
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=IMGSZ, transform=build_val_transform(IMGSZ))
+    assert ds.aux_specs[0].applies_to == frozenset({0})  # 'cat' resolved to contig 0
+    _, _, classes, attrs = ds[0]
+    posture = attrs["posture"]
+    # cat instance keeps its tagged id (1); dog instance is routed to -100.
+    cat_pos = (classes == 0).nonzero(as_tuple=True)[0]
+    dog_pos = (classes == 1).nonzero(as_tuple=True)[0]
+    assert posture[cat_pos].item() == 1
+    assert posture[dog_pos].item() == -100
+
+
+def test_aux_no_applies_to_trains_all_classes(tmp_path):
+    """Without applies_to (regression), the head is supervised on every class."""
+    from eomt.data.coco import CocoInstanceSeg
+    from eomt.data.transforms import build_val_transform
+
+    img_dir, jf = _write_mini_coco(tmp_path, with_applies_to=False)
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=IMGSZ, transform=build_val_transform(IMGSZ))
+    assert ds.aux_specs[0].applies_to is None
+    _, _, classes, attrs = ds[0]
+    # both instances keep their tagged posture (no routing to -100)
+    assert set(attrs["posture"].tolist()) == {1, 2}
+
+
+def test_postprocess_gates_aux_by_class():
+    """Class-scoped aux heads emit ids=-1 for detections whose class is out of scope."""
+    from eomt.postprocess import _build_aux_result
+
+    aux_logits = {"posture": torch.tensor([[[2.0, 0.0], [0.0, 3.0]]])}  # (1, Q=2, ns=2)
+    sel = torch.tensor([0, 1])
+    classes = torch.tensor([0, 1])  # det0 -> class 0 (in scope), det1 -> class 1 (out)
+    res = _build_aux_result(aux_logits, sel, classes, {"posture": frozenset({0})})
+    assert res["posture"]["ids"].tolist() == [0, -1]
+    assert float(res["posture"]["probs"][1].sum()) == 0.0
+    # unscoped -> unchanged
+    res2 = _build_aux_result(aux_logits, sel, classes, {})
+    assert res2["posture"]["ids"].tolist() == [0, 1]
+
+
+def test_attribute_sidecar_merge(tmp_path):
+    """A plain COCO + attributes.yaml + attributes/<split>.json is merged in memory."""
+    import json
+
+    from eomt.data.coco import _merge_attribute_sidecar
+
+    (tmp_path / "annotations").mkdir()
+    (tmp_path / "attributes").mkdir()
+    (tmp_path / "attributes.yaml").write_text(
+        "attributes:\n  - name: posture\n    categories: [sit, stand, lie]\n    applies_to: [cat]\n"
+    )
+    (tmp_path / "attributes" / "train.json").write_text(
+        json.dumps({"10": {"posture": "stand"}, "11": {"posture": 2}})
+    )
+
+    class FakeCoco:
+        dataset = {"annotations": [{"id": 10, "category_id": 1}, {"id": 11, "category_id": 2}]}
+
+    coco = FakeCoco()
+    _merge_attribute_sidecar(coco, tmp_path / "annotations" / "instances_train.json")
+    assert coco.dataset["attributes"][0]["name"] == "posture"
+    by_id = {a["id"]: a for a in coco.dataset["annotations"]}
+    assert by_id[10]["attributes"] == {"posture": 1}  # label 'stand' -> raw id 1
+    assert by_id[11]["attributes"] == {"posture": 2}  # raw id passthrough
 
 
 def test_resolve_checkpoint_folder(tmp_path):

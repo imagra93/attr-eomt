@@ -222,8 +222,32 @@ Notes:
 
 - Raw ids are remapped to a contiguous `0..n-1` per head (so `scale`'s `1`/`2`/`3` become
   `0`/`1`/`2`); `categories` may be omitted, in which case the id set is inferred.
-- A missing per-annotation value defaults to `0`; a JSON with **no** `attributes` ⇒
-  detection-only, exactly as before.
+- A **missing or out-of-vocab** per-annotation value is *ignored* (`-100`), not trained as
+  class `0` — so a **partially tagged** dataset is valid: each head learns only from the
+  instances that actually carry its value. A JSON with **no** `attributes` ⇒ detection-only,
+  exactly as before.
+
+**Class-conditional heads.** Give an attribute definition an optional `applies_to` list of
+primary-class names or ids, and that head is only trained on — and only emitted for —
+instances of those classes (hard routing on the primary class). Omit it and the head applies
+to every class. So different attributes can attach to different classes, each with its own
+label set, in one model:
+
+```jsonc
+"attributes": [
+  {"name": "posture", "categories": [...], "applies_to": ["cat", "dog"]}
+]
+```
+
+At inference a scoped head reports `ids = -1` ("not applicable") for detections whose class it
+does not cover. The scope is stored in the checkpoint, so it survives reload.
+
+**Sidecar format (optional).** You can keep the COCO JSON as plain, standard COCO and put the
+attributes beside it instead of inside it: an `attributes.yaml` schema in the dataset root plus
+`attributes/<split>.json` values keyed by annotation id (`{ann_id: {head: value}}`). If present
+(and the JSON has no embedded `attributes`), it is merged in memory at load — so a plain COCO
+dataset always works and the sidecar is picked up automatically when you add it. Embedded
+`attributes` in the JSON take precedence.
 
 A tiny, self-contained example (two heads, including a non-contiguous id set) lives in
 [sample_data/](sample_data/).
