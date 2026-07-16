@@ -415,7 +415,7 @@ matched  = gather_matched(out, indices)                          <span class="c"
 
   <div class="note" style="border-left-color:var(--warn)">
     <span class="ic" style="color:var(--warn)">⚑</span>
-    <p><strong>Laterality gotcha.</strong> If an attribute encodes left/right, train with <code>flip_prob=0</code> — a horizontal flip mirrors the pixels but <em>not</em> the label, silently corrupting it.</p>
+    <p><strong>Orientation gotcha.</strong> If an attribute encodes orientation, train with <code>flip_prob=0</code> — a horizontal flip mirrors the pixels but <em>not</em> the label, silently corrupting it.</p>
   </div>
 </section>
 

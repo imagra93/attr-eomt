@@ -159,17 +159,62 @@ def _compute_aux_class_weights(train_ds) -> dict:
     annotations (no image decode); missing / out-of-vocab values are ignored.
     """
     anns = getattr(train_ds.coco, "dataset", {}).get("annotations", []) or []
+    cat2contig = train_ds.cat2contig
     out: dict[str, torch.Tensor] = {}
     for spec in train_ds.aux_specs:
         id_map = train_ds._attr_id_maps[spec.name]
         counts = torch.zeros(spec.num_classes)
         for a in anns:
+            # Skip out-of-scope instances for class-scoped heads: they are routed to
+            # -100 and never contribute to the head's loss, so they must not skew its
+            # class-frequency weights either.
+            if spec.applies_to is not None:
+                cls = cat2contig.get(a.get("category_id"))
+                if cls is None or cls not in spec.applies_to:
+                    continue
             cid = id_map.get(a.get("attributes", {}).get(spec.name), -100)
             if 0 <= cid < spec.num_classes:
                 counts[cid] += 1
         w = 1.0 / counts.clamp(min=1).sqrt()
         out[spec.name] = w * (spec.num_classes / w.sum())  # mean weight ~ 1.0
     return out
+
+
+def _aux_coverage(train_ds) -> dict[str, tuple[int, int]]:
+    """Per head ``{name: (supervised, in_scope)}`` instance counts from train annotations.
+
+    ``in_scope`` counts instances whose primary class the head applies to (every
+    instance for an unscoped head); ``supervised`` counts those of them carrying a
+    tagged, in-vocab value (not ignored as ``-100``). Diagnostic only — mirrors the
+    routing / ignore logic in :func:`eomt.data.coco._attr_label` without decoding images.
+    """
+    anns = getattr(train_ds.coco, "dataset", {}).get("annotations", []) or []
+    cat2contig = train_ds.cat2contig
+    out: dict[str, tuple[int, int]] = {}
+    for spec in train_ds.aux_specs:
+        id_map = train_ds._attr_id_maps[spec.name]
+        supervised = in_scope = 0
+        for a in anns:
+            cls = cat2contig.get(a.get("category_id"))
+            if cls is None:
+                continue
+            if spec.applies_to is not None and cls not in spec.applies_to:
+                continue
+            in_scope += 1
+            if id_map.get(a.get("attributes", {}).get(spec.name), -100) >= 0:
+                supervised += 1
+        out[spec.name] = (supervised, in_scope)
+    return out
+
+
+def _aux_scope_str(spec, names: dict) -> str:
+    """Human-readable ``applies_to`` scope for the banner ("" when unscoped)."""
+    if spec.applies_to is None:
+        return ""
+    if len(spec.applies_to) > 6:
+        return f" on {len(spec.applies_to)} classes"
+    labels = sorted(names.get(c, str(c)) for c in spec.applies_to)
+    return " on {" + ",".join(labels) + "}"
 
 
 def _write_run_config(path: Path, cfg: dict) -> None:
@@ -478,9 +523,14 @@ def train(
     aux_specs = train_ds.aux_specs
     print(f"[data] train: {len(train_ds)} images, {nc} classes")
     if aux_specs:
+        cov = _aux_coverage(train_ds)
         print(
             "[data] aux heads: "
-            + ", ".join(f"{s.name}({s.num_classes})" for s in aux_specs)
+            + "; ".join(
+                f"{s.name}({s.num_classes}){_aux_scope_str(s, train_ds.names)}: "
+                f"{cov[s.name][0]}/{cov[s.name][1]} tagged"
+                for s in aux_specs
+            )
         )
     train_loader = DataLoader(
         train_ds,

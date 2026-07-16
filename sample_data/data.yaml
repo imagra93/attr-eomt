@@ -25,6 +25,29 @@
 #
 # The attribute names used here (`scale`, `viewpoint`) are only examples — use
 # whatever attributes your task needs, and as many heads as you like.
+#
+# Class-conditional heads (optional): give an attribute definition an
+# `applies_to` list of primary-class names or ids, and that head is only trained
+# on — and only emitted for — instances of those classes. This is hard routing on
+# the primary class, so different attributes can attach to different classes and
+# each keeps its own label vocabulary. Omit `applies_to` and the head applies to
+# every class (the original behaviour):
+#
+#   "attributes": [
+#     {"name": "posture", "categories": [...], "applies_to": ["cat", "dog"]}
+#   ]
+#
+# Missing / untagged values are always fine: an instance with no value for a head
+# (or an out-of-scope instance for an `applies_to` head) is ignored by that head's
+# loss (-100), never trained as class 0. So partially-tagged datasets just work.
+#
+# Sidecar format (optional): instead of embedding attributes in the COCO JSON you
+# may keep the JSON as plain COCO and drop, in the dataset root, an
+# `attributes.yaml` schema + `attributes/<split>.json` values keyed by annotation
+# id (`{ann_id: {head: value}}`, value = label or raw id). If present (and the JSON
+# has no embedded `attributes`), it is merged in memory before loading — so a plain
+# COCO dataset always works, and the sidecar is picked up automatically if you add
+# it. Embedded `attributes` in the JSON take precedence.
 
 path: .
 train_images: images/train

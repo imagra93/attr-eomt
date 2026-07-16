@@ -35,20 +35,159 @@ def _build_category_maps(coco):
     return cat2contig, contig2cat, names, len(cat_ids)
 
 
-def _build_attribute_maps(coco, only: list[str] | None = None):
+def _resolve_applies_to(raw, cat2contig, contig_names, attr_name):
+    """Resolve a definition's ``applies_to`` to a frozenset of contiguous primary ids.
+
+    Entries may be category **names** (matched against ``contig_names``) or raw COCO
+    category **ids** (mapped through ``cat2contig``). ``None`` ⇒ head applies to every
+    primary class (returns ``None``). Unresolvable entries are warned about and dropped.
+    """
+    if raw is None:
+        return None
+    name2contig = {v: k for k, v in contig_names.items()}
+    out: set[int] = set()
+    for entry in raw:
+        if isinstance(entry, str) and entry in name2contig:
+            out.add(name2contig[entry])
+        elif isinstance(entry, int) and entry in cat2contig:
+            out.add(cat2contig[entry])
+        else:
+            warnings.warn(
+                f"attribute {attr_name!r} 'applies_to' entry {entry!r} matches no "
+                "category (by name or raw id); ignoring it.",
+                stacklevel=2,
+            )
+    return frozenset(out)
+
+
+def _find_dataset_root(json_file: Path) -> Path:
+    """Dataset root that holds optional sidecar attribute files.
+
+    The JSON's directory, or its parent when the JSON sits in an ``annotations/``
+    subfolder (the COCO convention: ``<root>/annotations/instances_train.json``).
+    """
+    p = json_file.parent
+    return p.parent if p.name == "annotations" else p
+
+
+def _split_name(json_file: Path) -> str:
+    """Infer the split name from a COCO json filename (``train`` / ``val`` / stem)."""
+    stem = json_file.stem.lower()
+    if "train" in stem:
+        return "train"
+    if "val" in stem:
+        return "val"
+    return stem
+
+
+def _load_attr_schema(root: Path):
+    """Read ``<root>/attributes.yaml`` into a normalized top-level ``attributes`` list.
+
+    Each head is ``{name, categories:[{id,name}], applies_to?}``. ``categories`` may be
+    written as bare labels (auto-id 0..n-1) or explicit ``{id,name}`` dicts. Returns
+    ``None`` when the schema file is absent.
+    """
+    import yaml
+
+    schema_path = root / "attributes.yaml"
+    if not schema_path.exists():
+        return None
+    doc = yaml.safe_load(schema_path.read_text()) or {}
+    norm = []
+    for d in doc.get("attributes") or []:
+        cats = []
+        for i, c in enumerate(d.get("categories") or []):
+            if isinstance(c, dict):
+                cats.append({"id": int(c["id"]), "name": str(c.get("name", c["id"]))})
+            else:  # bare label -> auto id by position
+                cats.append({"id": i, "name": str(c)})
+        entry = {"name": d["name"], "categories": cats}
+        if d.get("applies_to") is not None:
+            entry["applies_to"] = list(d["applies_to"])
+        norm.append(entry)
+    return norm
+
+
+def _load_attr_values(root: Path, json_file: Path):
+    """Per-annotation attribute values keyed by **annotation id** (order-independent).
+
+    Reads ``<root>/attributes/<split>.json`` (``{ann_id: {head: value}}``); values may
+    be category labels or raw ids. Returns ``{int ann_id: {head: value}}`` or ``None``.
+    """
+    import json
+
+    cand = root / "attributes" / f"{_split_name(json_file)}.json"
+    if not cand.exists():
+        return None
+    raw = json.loads(cand.read_text())
+    return {int(k): v for k, v in raw.items()}
+
+
+def _merge_attribute_sidecar(coco, json_file) -> None:
+    """Merge an optional on-disk attribute sidecar into the in-memory COCO handle.
+
+    No-op unless ``<root>/attributes.yaml`` exists **and** the JSON has no embedded
+    ``attributes`` (embedded definitions win — one source of truth). When it applies,
+    the schema becomes the top-level ``attributes`` list and per-annotation values
+    (keyed by annotation id) are written into each ``ann["attributes"]`` as raw
+    category ids, after which discovery/loading is identical to the embedded case.
+    So a plain COCO dataset always works; drop in the sidecar and it is picked up.
+    """
+    dataset = getattr(coco, "dataset", {}) or {}
+    if dataset.get("attributes"):  # embedded schema present -> ignore sidecar
+        return
+    schema = _load_attr_schema(_find_dataset_root(Path(json_file)))
+    if not schema:
+        return
+    dataset["attributes"] = schema
+    name2id = {d["name"]: {c["name"]: c["id"] for c in d["categories"]} for d in schema}
+    valid_ids = {d["name"]: {c["id"] for c in d["categories"]} for d in schema}
+    values = _load_attr_values(_find_dataset_root(Path(json_file)), Path(json_file)) or {}
+    for ann in dataset.get("annotations", []) or []:
+        vals = values.get(ann["id"])
+        if not vals:
+            continue
+        merged = {}
+        for head, v in vals.items():
+            if head not in name2id:
+                continue
+            rid = name2id[head].get(v, v)  # value may be a label or a raw id
+            if isinstance(rid, int) and rid in valid_ids[head]:
+                merged[head] = rid
+        if merged:
+            ann["attributes"] = {**ann.get("attributes", {}), **merged}
+
+
+def _attr_label(spec: AuxHeadSpec, id_maps: dict, ann_attrs: dict, primary_cls: int) -> int:
+    """Contiguous attribute id for one instance, or ``-100`` (ignored by the aux CE).
+
+    ``-100`` when the attribute is missing / out-of-vocab (never silently trained as
+    class 0), **or** when the head is class-scoped (``applies_to``) and this instance's
+    primary class is out of scope — the hard-routing choke point, so the loss /
+    accuracy paths need no change (they already skip ``-100``).
+    """
+    if spec.applies_to is not None and primary_cls not in spec.applies_to:
+        return -100
+    return id_maps[spec.name].get(ann_attrs.get(spec.name), -100)
+
+
+def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=None, contig_names=None):
     """Discover secondary attributes from a COCO handle.
 
     Reads the (non-standard but valid) top-level ``attributes`` list::
 
         "attributes": [
-          {"name": "typology", "categories": [{"id": 0, "name": "scratch"}, ...]},
-          {"name": "severity", "categories": [...]},
+          {"name": "color", "categories": [{"id": 0, "name": "red"}, ...]},
+          {"name": "posture", "categories": [...], "applies_to": ["cat", 7]},
         ]
 
-    and the per-annotation ``"attributes": {"typology": 0, "severity": 2}`` field.
+    and the per-annotation ``"attributes": {"color": 0, "posture": 2}`` field.
     Falls back to inferring each attribute's id set from the annotations when a
-    definition omits ``categories``. Returns ``(specs, id_maps)`` where ``id_maps``
-    is ``{attr_name: {raw_id: contiguous_id}}``.
+    definition omits ``categories``. The optional ``applies_to`` scopes a head to a
+    subset of primary classes (category names or raw ids); it is resolved against
+    ``cat2contig`` / ``contig_names`` (pass them from ``_build_category_maps``).
+    Returns ``(specs, id_maps)`` where ``id_maps`` is ``{attr_name: {raw_id:
+    contiguous_id}}``.
     """
     dataset = getattr(coco, "dataset", {}) or {}
     defs = dataset.get("attributes") or []
@@ -57,6 +196,8 @@ def _build_attribute_maps(coco, only: list[str] | None = None):
     if not defs:
         return [], {}
 
+    cat2contig = cat2contig or {}
+    contig_names = contig_names or {}
     anns = dataset.get("annotations") or []
     specs: list[AuxHeadSpec] = []
     id_maps: dict[str, dict] = {}
@@ -81,7 +222,10 @@ def _build_attribute_maps(coco, only: list[str] | None = None):
             raw2contig = {r: i for i, r in enumerate(raw_ids)}
             disp = {r: str(r) for r in raw_ids}
         names = {raw2contig[r]: disp.get(r, str(r)) for r in raw_ids}
-        specs.append(AuxHeadSpec(name=name, num_classes=len(raw2contig), names=names))
+        applies_to = _resolve_applies_to(d.get("applies_to"), cat2contig, contig_names, name)
+        specs.append(
+            AuxHeadSpec(name=name, num_classes=len(raw2contig), names=names, applies_to=applies_to)
+        )
         id_maps[name] = raw2contig
     return specs, id_maps
 
@@ -112,6 +256,7 @@ class CocoInstanceSeg(Dataset):
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
         self.coco = COCO(str(json_file))
+        _merge_attribute_sidecar(self.coco, json_file)
         self.cat2contig, self.contig2cat, self.names, self.num_classes = (
             _build_category_maps(self.coco)
         )
@@ -124,7 +269,9 @@ class CocoInstanceSeg(Dataset):
         else:
             only = None if attributes is True else ([] if attributes is False else attributes)
             self.aux_specs, self._attr_id_maps = (
-                ([], {}) if only == [] else _build_attribute_maps(self.coco, only=only)
+                ([], {}) if only == [] else _build_attribute_maps(
+                    self.coco, only=only, cat2contig=self.cat2contig, contig_names=self.names
+                )
             )
         self.ids = [
             i
@@ -156,13 +303,11 @@ class CocoInstanceSeg(Dataset):
             if m.sum() == 0:
                 continue
             masks.append(torch.from_numpy(m))
-            classes.append(self.cat2contig[ann["category_id"]])
+            cls = self.cat2contig[ann["category_id"]]
+            classes.append(cls)
             ann_attrs = ann.get("attributes", {})
             for spec in self.aux_specs:
-                raw = ann_attrs.get(spec.name)
-                # Missing / out-of-vocab → -100 (ignored by the aux CE), never
-                # silently trained as class 0.
-                attrs[spec.name].append(self._attr_id_maps[spec.name].get(raw, -100))
+                attrs[spec.name].append(_attr_label(spec, self._attr_id_maps, ann_attrs, cls))
 
         image_tv = tv_tensors.Image(
             torch.from_numpy(np.array(img)).permute(2, 0, 1)  # (3, H, W) uint8
@@ -207,11 +352,6 @@ class CocoDetection(Dataset):
     **normalized ``cxcywh`` boxes** ``(num_inst, 4)`` in ``[0, 1]`` (relative to the
     square input) and their contiguous class ids. Boxes ride the **same** transforms
     as masks via ``tv_tensors.BoundingBoxes``, so LSJ/flip/crop apply identically.
-
-    .. warning::
-        Horizontal flip swaps left/right, which **corrupts laterality-style aux
-        labels** exactly as it does for the seg dataset. Train laterality detection
-        runs with ``flip_prob=0`` (see ``scripts/train_parts_large.sh``).
     """
 
     def __init__(
@@ -232,6 +372,7 @@ class CocoDetection(Dataset):
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
         self.coco = COCO(str(json_file))
+        _merge_attribute_sidecar(self.coco, json_file)
         self.cat2contig, self.contig2cat, self.names, self.num_classes = (
             _build_category_maps(self.coco)
         )
@@ -240,7 +381,9 @@ class CocoDetection(Dataset):
         else:
             only = None if attributes is True else ([] if attributes is False else attributes)
             self.aux_specs, self._attr_id_maps = (
-                ([], {}) if only == [] else _build_attribute_maps(self.coco, only=only)
+                ([], {}) if only == [] else _build_attribute_maps(
+                    self.coco, only=only, cat2contig=self.cat2contig, contig_names=self.names
+                )
             )
         self.ids = [
             i
@@ -279,11 +422,11 @@ class CocoDetection(Dataset):
             if w <= 0 or h <= 0:
                 continue
             boxes.append([x, y, x + w, y + h])  # xyxy
-            classes.append(self.cat2contig[ann["category_id"]])
+            cls = self.cat2contig[ann["category_id"]]
+            classes.append(cls)
             ann_attrs = ann.get("attributes", {})
             for spec in self.aux_specs:
-                raw = ann_attrs.get(spec.name)
-                attrs[spec.name].append(self._attr_id_maps[spec.name].get(raw, -100))
+                attrs[spec.name].append(_attr_label(spec, self._attr_id_maps, ann_attrs, cls))
 
         H, W = img.height, img.width
         image_tv = tv_tensors.Image(
@@ -357,6 +500,7 @@ class CocoValImages(Dataset):
         self.mean = mean
         self.std = std
         self.coco = COCO(str(json_file))
+        _merge_attribute_sidecar(self.coco, json_file)
         self.cat2contig, self.contig2cat, self.names, self.num_classes = (
             _build_category_maps(self.coco)
         )
@@ -365,7 +509,9 @@ class CocoValImages(Dataset):
         else:
             only = None if attributes is True else ([] if attributes is False else attributes)
             self.aux_specs, self._attr_id_maps = (
-                ([], {}) if only == [] else _build_attribute_maps(self.coco, only=only)
+                ([], {}) if only == [] else _build_attribute_maps(
+                    self.coco, only=only, cat2contig=self.cat2contig, contig_names=self.names
+                )
             )
         self.ids = sorted(self.coco.getImgIds())
 

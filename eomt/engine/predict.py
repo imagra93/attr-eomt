@@ -50,13 +50,22 @@ def predict_image(
     )
     tensor = torch.from_numpy(chw).unsqueeze(0).to(device)
     out = model(tensor)
+    # Class-scoped aux heads: pass their primary-class scope so postprocess emits
+    # ``ids = -1`` for detections the head does not apply to (the inference side of
+    # the hard class-routing). Unscoped heads (``applies_to=None``) are omitted here.
+    aux_scopes = {
+        s.name: s.applies_to
+        for s in getattr(model, "aux_specs", [])
+        if s.applies_to is not None
+    }
     if getattr(model, "family", "instance") == "detect":
         return postprocess_detection(
             out, conf_thres, (orig_w, orig_h), max_det=max_det, preprocess_meta=meta,
+            aux_scopes=aux_scopes,
         )
     return postprocess_instance(
         out, conf_thres, (orig_w, orig_h), max_det=max_det,
-        mask_thresh=mask_thresh, preprocess_meta=meta,
+        mask_thresh=mask_thresh, preprocess_meta=meta, aux_scopes=aux_scopes,
     )
 
 

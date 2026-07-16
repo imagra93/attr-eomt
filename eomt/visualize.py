@@ -48,6 +48,8 @@ def _aux_label(
     rows = []
     for head, pred in aux.items():
         idx = int(pred["ids"][i])
+        if idx < 0:  # -1 sentinel: class-scoped head does not apply to this instance
+            continue
         prob = float(pred["probs"][i][idx])
         label = str(idx)
         if aux_names and head in aux_names:
