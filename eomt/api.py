@@ -24,6 +24,7 @@ from .data import CocoValImages, load_data_config
 from .device import resolve_device
 from .engine import evaluate as _evaluate
 from .engine import evaluate_detection as _evaluate_detection
+from .engine import match as _match
 from .engine import predict as _predict
 from .engine import track as _track
 from .engine import train as _train
@@ -418,6 +419,46 @@ class EoMT:
             with_attr=with_attr, details=details, trace=trace,
             hud=hud, tracker_kwargs=tracker_kwargs, **kw,
         )
+
+    # ------------------------------------------------------------------ match
+    def infer_match(self, source: str | Path, *, plot: bool = True,
+                    save: str | None = "runs/match", conf_thres: float = 0.3,
+                    max_det: int = 30, mask_thresh: float = 0.5,
+                    imgsz: int | None = None,
+                    group_by: tuple[str, ...] | None = ("class",),
+                    sim_thres: float = 0.6, **kw) -> dict:
+        """Re-identify instances across a set of photos of the *same subject*.
+
+        Given several photos of one subject from different viewpoints, decides which
+        detections are the same physical instance — one instance seen from three
+        angles is one identity, not three. Inference only: the fingerprint is the
+        per-query embedding the detector already computes, so there is no second model
+        and nothing to retrain.
+
+        ``source`` is one folder of photos (non-recursive) = one subject; loop for
+        several subjects. Each detection is stamped with an ``identity_ids`` entry, and
+        ``identities`` summarizes each one (dominant class, smoothed attributes, how
+        many photos it appears in). With ``plot`` a grid image is written under
+        ``save`` — every photo, instances colored by identity, connectors between
+        matched pairs — alongside a ``<name>_identities.json`` summary.
+
+        ``group_by`` gates which pairs may match at all: ``("class",)`` by default, and
+        any aux head name may be added — useful when the primary class is coarser than
+        the distinction you care about, so ``("class", "position")`` keeps instances at
+        different places on the subject from matching each other. ``None`` disables
+        gating, which needs a higher ``sim_thres``. ``sim_thres`` is the cosine floor
+        for "same instance" — Hungarian always returns a full assignment, so the
+        threshold is what turns "best available partner" into "new instance".
+        """
+        return _match(
+            self.model, str(source), plot=plot, save=save, conf_thres=conf_thres,
+            max_det=max_det, mask_thresh=mask_thresh,
+            imgsz=_resolve_imgsz(imgsz, self.model), group_by=group_by,
+            sim_thres=sim_thres, **kw,
+        )
+
+    #: Alias so the method, the engine function and ``scripts/match.py`` agree.
+    match = infer_match
 
     # ------------------------------------------------------------------- save
     def save(self, path: str | Path) -> None:

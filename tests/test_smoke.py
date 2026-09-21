@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from eomt import build_eomt_config, build_model, postprocess_instance
+from eomt.postprocess import postprocess_detection as _postprocess_detection
 from eomt.config import EOMT_CONFIGS
 
 IMGSZ = 140  # 14 * 10 -> tiny patch grid keeps the test fast
@@ -34,10 +35,13 @@ def test_build_forward_shapes():
     x = torch.randn(2, 3, IMGSZ, IMGSZ)
     with torch.no_grad():
         out = model(x)
-    assert set(out) == {"masks_queries_logits", "class_queries_logits"}
+    # ``query_embed`` is emitted unconditionally — including for models with no aux
+    # heads, which is what lets cross-photo re-id run on any checkpoint.
+    assert set(out) == {"masks_queries_logits", "class_queries_logits", "query_embed"}
     q = EOMT_CONFIGS["s"].num_queries
     assert out["class_queries_logits"].shape == (2, q, NC + 1)
     assert out["masks_queries_logits"].shape[:2] == (2, q)
+    assert out["query_embed"].shape == (2, q, EOMT_CONFIGS["s"].hidden_size)
 
 
 def test_train_step_backward():
@@ -576,3 +580,262 @@ def test_checkpoint_stores_letterbox_mode(tmp_path):
     save_checkpoint(ckpt, path)
     loaded = load_model(path, device="cpu")
     assert loaded.preprocess_letterbox is True
+
+
+def test_query_embed_matches_class_predictor_input():
+    """``query_embed`` is the tensor the class head consumes — for both families.
+
+    It is produced by slicing the encoder's final hidden state rather than by a
+    forward hook; this pins that the slice is the same tensor the hook used to
+    capture, which is what makes the hook removable.
+    """
+    from eomt.config import EOMT_CONFIGS
+
+    torch.manual_seed(0)
+    q = EOMT_CONFIGS["s"].num_queries
+    for family in ("instance", "detect"):
+        model = build_model("s", nc=NC, imgsz=IMGSZ, family=family).eval()
+        captured = {}
+        handle = model.eomt.class_predictor.register_forward_hook(
+            lambda _m, inputs, _o: captured.__setitem__("q", inputs[0])
+        )
+        with torch.no_grad():
+            out = model(torch.randn(1, 3, IMGSZ, IMGSZ))
+        handle.remove()
+        assert out["query_embed"].shape == (1, q, EOMT_CONFIGS["s"].hidden_size)
+        assert torch.equal(out["query_embed"], captured["q"]), family
+
+
+def test_postprocess_returns_aligned_query_idx():
+    """``query_idx`` is the detection -> query mapping the whole re-id feature rests on."""
+    torch.manual_seed(0)
+    q, cls = 40, 3
+    logits = torch.randn(1, q, cls + 1)
+    out = {
+        "masks_queries_logits": torch.randn(1, q, 8, 8),
+        "class_queries_logits": logits,
+    }
+    res = postprocess_instance(out, 0.0, (16, 12), max_det=10, mask_thresh=0.5)
+    sel = res["query_idx"]
+    assert sel.dtype is torch.int64
+    assert sel.shape == (10,) == res["classes"].shape  # the topk path fired
+    assert len(set(sel.tolist())) == 10
+    assert sel.min() >= 0 and sel.max() < q
+    # The alignment guarantee: recomputing the class from the raw logits at the
+    # kept query indices must reproduce exactly what postprocess returned.
+    recomputed = logits[0].softmax(-1)[:, :-1].max(-1).indices[sel]
+    assert torch.equal(recomputed, res["classes"])
+
+
+def test_query_idx_empty_branches():
+    torch.manual_seed(0)
+    q = 8
+    out = {
+        "masks_queries_logits": torch.randn(1, q, 8, 8),
+        "class_queries_logits": torch.randn(1, q, NC + 1),
+        "pred_boxes": torch.rand(1, q, 4),
+    }
+    for fn, kwargs in (
+        (postprocess_instance, {"mask_thresh": 0.5}),
+        (_postprocess_detection, {}),
+    ):
+        res = fn(out, 1.1, (16, 12), max_det=5, **kwargs)  # nothing clears conf=1.1
+        assert res["num_detections"] == 0
+        assert res["query_idx"].shape == (0,) and res["query_idx"].dtype is torch.int64
+
+
+def test_query_idx_survives_min_mask_area():
+    torch.manual_seed(0)
+    q = 20
+    out = {
+        "masks_queries_logits": torch.randn(1, q, 8, 8) - 0.5,
+        "class_queries_logits": torch.randn(1, q, NC + 1),
+    }
+    res = postprocess_instance(
+        out, 0.0, (16, 12), max_det=q, mask_thresh=0.5, min_mask_area=20.0
+    )
+    n = res["num_detections"]
+    assert len(res["query_idx"]) == n == len(res["classes"]) == len(res["masks"])
+
+
+def test_predict_image_embed_is_aligned_and_unit_norm():
+    from PIL import Image
+
+    from eomt.config import EOMT_CONFIGS
+    from eomt.engine.predict import predict_image
+
+    torch.manual_seed(0)
+    model = build_model("s", nc=NC, imgsz=IMGSZ).eval()
+    image = Image.fromarray(
+        (torch.rand(40, 60, 3).numpy() * 255).astype("uint8"), mode="RGB"
+    )
+    res = predict_image(
+        model, image, device=torch.device("cpu"), imgsz=IMGSZ,
+        conf_thres=0.0, max_det=5, embed=True,
+    )
+    assert res["embed"].shape == (res["num_detections"], EOMT_CONFIGS["s"].hidden_size)
+    assert len(res["embed"]) == len(res["query_idx"])
+    assert res["embed"].dtype is torch.float32
+
+
+def test_draw_instances_color_ids_and_label_prefix_are_additive():
+    from PIL import Image
+
+    from eomt.visualize import draw_instances
+
+    torch.manual_seed(0)
+    image = Image.new("RGB", (40, 30), (10, 10, 10))
+    result = {
+        "num_detections": 1,
+        "boxes": torch.tensor([[4.0, 4.0, 20.0, 18.0]]),
+        "scores": torch.tensor([0.9]),
+        "classes": torch.tensor([1]),
+        "masks": (torch.rand(1, 30, 40) > 0.5),
+    }
+    base = draw_instances(image, result, {1: "widget"})
+    # Defaults left alone -> byte-identical to the pre-change path.
+    assert np.array_equal(np.asarray(base), np.asarray(draw_instances(image, result, {1: "widget"})))
+    # A different color index paints differently.
+    a = draw_instances(image, result, {1: "widget"}, color_ids=[5])
+    b = draw_instances(image, result, {1: "widget"}, color_ids=[6])
+    assert not np.array_equal(np.asarray(a), np.asarray(b))
+    # A label prefix changes the rendering too.
+    p = draw_instances(image, result, {1: "widget"}, label_prefix=["#7"])
+    assert not np.array_equal(np.asarray(p), np.asarray(base))
+
+
+def test_draw_identity_grid_geometry_and_degenerates():
+    from PIL import Image
+
+    from eomt.visualize import draw_identity_grid
+
+    torch.manual_seed(0)
+
+    def panel(n):
+        return {
+            "image": Image.new("RGB", (60, 40), (30, 30, 30)),
+            "result": {
+                "num_detections": n,
+                "boxes": torch.tensor([[2.0, 2.0, 30.0, 25.0]] * n).reshape(n, 4),
+                "scores": torch.ones(n),
+                "classes": torch.zeros(n, dtype=torch.long),
+                "masks": (torch.rand(n, 40, 60) > 0.5),
+            },
+            "identity_ids": list(range(n)),
+            "caption": "0. photo",
+        }
+
+    identities = [{"identity_id": 0, "class_name": "widget", "attributes": {},
+                   "num_photos": 2}]
+    arrows = [{"a_panel": 0, "a_det": 0, "b_panel": 1, "b_det": 0,
+               "similarity": 0.8, "identity_id": 0}]
+    grid = draw_identity_grid(
+        [panel(1), panel(1)], names={0: "widget"}, arrows=arrows,
+        identities=identities, cols=2, panel_size=64, title="t",
+    )
+    assert grid.mode == "RGB"
+    assert grid.width == 2 * (64 + 12) + 12
+    assert np.asarray(grid).std() > 0  # something was actually drawn
+
+    # A photo with no detections still gets its panel, and no arrows is fine.
+    grid2 = draw_identity_grid([panel(0), panel(1)], cols=2, panel_size=64, arrows=[])
+    assert grid2.size[0] == 2 * (64 + 12) + 12
+
+
+def test_draw_identity_grid_legend_attr_is_head_agnostic():
+    """The legend must not hardcode any one checkpoint's attribute head name."""
+    from PIL import Image
+
+    from eomt.visualize import draw_identity_grid
+
+    panels = [{
+        "image": Image.new("RGB", (40, 40), (30, 30, 30)),
+        "result": {
+            "num_detections": 0,
+            "boxes": torch.zeros((0, 4)),
+            "scores": torch.zeros(0),
+            "classes": torch.zeros(0, dtype=torch.long),
+        },
+        "identity_ids": [],
+        "caption": "0. photo",
+    }]
+    identities = [{
+        "identity_id": 0, "class_name": "widget", "num_photos": 1,
+        "attributes": {"alpha": "first", "beta": "second"},
+    }]
+
+    # panel_size drives the canvas width; too narrow and every legend string clips
+    # at the same character, making distinct labels compare equal.
+    def render(**kw):
+        return np.asarray(
+            draw_identity_grid(panels, identities=identities, cols=1, panel_size=320, **kw)
+        )
+
+    default = render()                          # -> first head ("alpha")
+    explicit_first = render(legend_attr="alpha")
+    explicit_second = render(legend_attr="beta")
+    assert np.array_equal(default, explicit_first)
+    assert not np.array_equal(explicit_first, explicit_second)
+
+    # A head no identity carries just omits the attribute instead of raising.
+    missing = render(legend_attr="not_a_head")
+    assert not np.array_equal(missing, explicit_first)
+    # ...and matches an identity that has no attributes at all.
+    bare = np.asarray(draw_identity_grid(
+        panels, cols=1, panel_size=320,
+        identities=[{"identity_id": 0, "class_name": "widget", "num_photos": 1,
+                     "attributes": {}}],
+    ))
+    assert np.array_equal(missing, bare)
+
+
+def test_draw_identity_grid_arrow_width_tracks_similarity():
+    """A confident link must draw thicker than a marginal one, on an absolute scale."""
+    from PIL import Image
+
+    from eomt.visualize import draw_identity_grid
+
+    torch.manual_seed(0)
+
+    def panel():
+        m = torch.zeros(1, 40, 60, dtype=torch.bool)
+        m[0, 18:22, 28:32] = True  # a small, centered blob -> a stable centroid
+        return {
+            "image": Image.new("RGB", (60, 40), (0, 0, 0)),
+            "result": {
+                "num_detections": 1,
+                "boxes": torch.tensor([[28.0, 18.0, 32.0, 22.0]]),
+                "scores": torch.ones(1),
+                "classes": torch.zeros(1, dtype=torch.long),
+                "masks": m,
+            },
+            "identity_ids": [0],
+            "caption": "",
+        }
+
+    def ink(sim, **kw):
+        """Pixels the connector overlay painted, i.e. how heavy the stroke is."""
+        grid = draw_identity_grid(
+            [panel(), panel()], cols=2, panel_size=240, legend=False,
+            draw_boxes=False, alpha=0.0,
+            arrows=[{"a_panel": 0, "a_det": 0, "b_panel": 1, "b_det": 0,
+                     "similarity": sim, "identity_id": 0}],
+            **kw,
+        )
+        return int((np.asarray(grid).sum(axis=2) > 0).sum())
+
+    band = {"sim_range": (0.6, 1.0)}
+    assert ink(0.98, **band) > ink(0.80, **band) > ink(0.61, **band)
+
+    # Absolute, not relative: a lone arrow's width depends only on its similarity,
+    # so a near-perfect match never renders hairline just because it is alone.
+    assert ink(0.99, **band) > ink(0.62, **band)
+
+    # Out-of-band similarities clamp instead of overshooting the width range.
+    assert ink(2.0, **band) == ink(1.0, **band)
+    assert ink(-1.0, **band) == ink(0.6, **band)
+
+    # An explicit width range is honored.
+    assert ink(0.9, sim_range=(0.6, 1.0), arrow_width=(1, 2)) < ink(
+        0.9, sim_range=(0.6, 1.0), arrow_width=(8, 16)
+    )

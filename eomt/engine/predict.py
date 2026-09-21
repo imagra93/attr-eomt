@@ -36,12 +36,20 @@ def predict_image(
     max_det: int = 100,
     mask_thresh: float = 0.5,
     letterbox: bool = True,
+    embed: bool = False,
 ) -> dict:
     """Run the model on one PIL image and return a postprocess dict.
 
     Returns a box-only :func:`~eomt.postprocess.postprocess_detection` dict for
     ``family="detect"`` models, else a :func:`~eomt.postprocess.postprocess_instance`
     dict (with masks).
+
+    With ``embed``, the result also carries ``"embed"`` ``(N, hidden)``: the per-query
+    embedding of each kept detection, sliced out of the same forward pass. It is the
+    appearance fingerprint cross-photo re-identification matches on
+    (:mod:`eomt.reid`). The vectors are **raw**, not normalized — normalizing (and
+    optionally mean-centering) is :func:`eomt.reid.similarity_matrix`'s job, and it
+    needs the raw vectors to do it.
     """
     orig_w, orig_h = image.size
     chw, meta = preprocess_numpy(
@@ -59,14 +67,27 @@ def predict_image(
         if s.applies_to is not None
     }
     if getattr(model, "family", "instance") == "detect":
-        return postprocess_detection(
+        result = postprocess_detection(
             out, conf_thres, (orig_w, orig_h), max_det=max_det, preprocess_meta=meta,
             aux_scopes=aux_scopes,
         )
-    return postprocess_instance(
-        out, conf_thres, (orig_w, orig_h), max_det=max_det,
-        mask_thresh=mask_thresh, preprocess_meta=meta, aux_scopes=aux_scopes,
-    )
+    else:
+        result = postprocess_instance(
+            out, conf_thres, (orig_w, orig_h), max_det=max_det,
+            mask_thresh=mask_thresh, preprocess_meta=meta, aux_scopes=aux_scopes,
+        )
+    if embed:
+        # Index with the returned ``query_idx``, never re-derive from the scores: the
+        # ``max_det`` topk reorders rows, so only ``query_idx`` is guaranteed aligned
+        # with the detections. ``.float()`` because the forward may run under autocast;
+        # ``.cpu()`` so a folder's worth of embeddings does not pin GPU memory.
+        qe = out.get("query_embed")
+        result["embed"] = (
+            qe[0, result["query_idx"]].detach().float().cpu()
+            if qe is not None
+            else torch.zeros((result["num_detections"], 0))
+        )
+    return result
 
 
 def predict(
@@ -85,6 +106,7 @@ def predict(
     show_scores: bool = True,
     color_by: str = "class",
     imgsz: int | None = None,
+    embed: bool = False,
 ) -> list[dict]:
     """Run inference on an image or a directory of images.
 
@@ -95,6 +117,9 @@ def predict(
     ``path``. When ``plot`` is set, every image is rendered with masks/boxes/labels
     and written under ``save`` (default ``runs/predict``); the output path is added
     to the result dict as ``plot_path``.
+
+    With ``embed``, each result also carries ``"embed"`` ``(N, hidden)`` — the
+    per-instance appearance fingerprint (see :func:`predict_image`).
     """
     if isinstance(model, (str, Path)):
         model = load_model(model, device=device)
@@ -123,7 +148,7 @@ def predict(
         result = predict_image(
             model, image, device=dev, imgsz=imgsz,
             conf_thres=conf_thres, max_det=max_det,
-            mask_thresh=mask_thresh, letterbox=letterbox,
+            mask_thresh=mask_thresh, letterbox=letterbox, embed=embed,
         )
         if dev.type == "cuda":
             torch.cuda.synchronize(dev)

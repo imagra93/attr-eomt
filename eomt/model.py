@@ -784,7 +784,8 @@ class EoMTModel(nn.Module):
         self.eomt = EoMTEncoder(config, family=family)
 
         # Secondary per-instance heads (attributes). Each reads the per-query
-        # embedding — the input to ``class_predictor`` — captured by a hook.
+        # embedding — the leading ``num_queries`` rows of the encoder's final hidden
+        # state, i.e. exactly what ``class_predictor`` is fed.
         # ``aux_head_arch`` (a small MLP by default) is the shared head shape; it is
         # persisted in the checkpoint so reload rebuilds the same modules.
         self.aux_specs: list[AuxHeadSpec] = list(aux_heads or [])
@@ -795,14 +796,6 @@ class EoMTModel(nn.Module):
                 for s in self.aux_specs
             }
         )
-        self._query_embed: torch.Tensor | None = None
-        if self.aux_heads:
-            self.eomt.class_predictor.register_forward_hook(self._capture_query_embed)
-
-    def _capture_query_embed(self, _module, inputs, _output):
-        # input to class_predictor is the per-query embedding [B, Q, hidden];
-        # the last call per forward is the final layer — exactly what we want.
-        self._query_embed = inputs[0]
 
     def forward(
         self,
@@ -811,7 +804,6 @@ class EoMTModel(nn.Module):
         class_labels: list[torch.Tensor] | None = None,
         box_labels: list[torch.Tensor] | None = None,
     ):
-        self._query_embed = None
         out = self.eomt(
             pixel_values=pixel_values,
             mask_labels=mask_labels,
@@ -830,9 +822,13 @@ class EoMTModel(nn.Module):
                 "masks_queries_logits": out.masks_queries_logits,
                 "class_queries_logits": out.class_queries_logits,
             }
-        if self.aux_heads and self._query_embed is not None:
-            q = self._query_embed
-            result["query_embed"] = q
+        # The per-query embedding [B, Q, hidden]: the leading queries of the final
+        # hidden state, which is precisely the tensor ``class_predictor`` consumes.
+        # Always exposed — aux heads read it, and so does cross-photo re-identification
+        # on checkpoints that carry no aux heads at all.
+        q = out.last_hidden_state[:, : self.config.num_queries, :]
+        result["query_embed"] = q
+        if self.aux_heads:
             # Per-query logits over ALL queries are only consumed by postprocess at
             # inference; in training the aux loss applies each head to the matched
             # subset only, so skip the full-query application here.

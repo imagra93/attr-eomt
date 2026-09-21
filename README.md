@@ -254,6 +254,98 @@ A tiny, self-contained example (two heads, including a non-contiguous id set) li
 
 ---
 
+## Cross-photo re-identification
+
+Several photos of the same scene from different viewpoints, and some instance appears
+in three of them — is that one instance seen three times, or three separate ones?
+`infer_match()` answers that at **inference time, with no second model and nothing
+retrained**: every detected instance already carries a fingerprint, the per-query
+embedding that feeds the class head, and two detections are the same physical instance
+when those embeddings agree.
+
+```python
+from eomt import EoMT
+
+model = EoMT("runs/train/eomt-l/weights/best.pt")
+result = model.infer_match("photos/subject_42/", group_by=("class",))
+
+for rec in result["identities"]:
+    print(rec["identity_id"], rec["class_name"], rec["attributes"], rec["num_photos"])
+```
+
+One call handles one folder = one subject. Each detection is stamped with an
+`identity_ids` entry, `identities` summarizes each identity (dominant class, smoothed
+attributes, how many photos it appears in), and `matches` records every candidate pair
+— accepted or not, with the reason — so a threshold can be retuned from the JSON
+without re-running inference. With `plot` you get a grid image: every photo, instances
+colored by identity, connectors between the matched pairs, and a legend.
+
+```bash
+python scripts/match.py weights/best.pt photos/subject_42/
+python scripts/match.py weights/best.pt photos/ --each-subdir   # a folder per subject
+```
+
+### How it works
+
+It is the DeepSORT recipe — detect, describe, associate — applied *between photos*
+instead of between video frames, which is also what [`track()`](eomt/engine/track.py)
+does for video. Three EoMT properties make the fingerprint free:
+
+1. the model is **NMS-free**, so two overlapping instances stay two distinct queries;
+2. each query owns one instance, so its embedding describes that instance alone;
+3. the embedding is already computed on the way to the class head.
+
+Matching runs the **Hungarian** matcher per pair of photos, then links the accepted
+pairs into identities with union-find. Two constraints keep that honest: one physical
+instance appears **at most once per photo** (union-find would otherwise chain two
+instances of the same photo together through a third), and a **merge guard** rejects a
+merge whose cross-cut similarity falls below the threshold — without it, A↔B and B↔C
+chain into one identity even when A and C are nothing alike.
+
+### Gating and thresholds
+
+`group_by` decides which pairs may match at all. The default `("class",)` means only
+same-class instances compete. Adding attribute heads tightens it, which matters
+whenever the primary class is coarser than the distinction you care about: if one class
+covers instances that sit at different places on the subject, an attribute head that
+separates them — `("class", "position")`, say — stops an instance in one location from
+ever matching one in another, however alike they look. Any head in the checkpoint can
+be named; unknown names raise before the first forward pass. `group_by=None` disables
+gating entirely and needs a much higher `sim_thres`, since far more pairs then compete
+with no structural prior ruling any of them out.
+
+`sim_thres` (default `0.6`) is the cosine floor for "same instance". Hungarian always
+returns a full assignment, so the threshold is what turns *best available partner* into
+*no partner — this is a new instance*. Measured on one checkpoint across four real
+photo sets, with the gate on:
+
+| | non-candidate pairs | true-match pairs |
+|---|---|---|
+| mean | 0.11 – 0.16 | 0.85 – 0.98 (the true-match mode) |
+| p99 / max | 0.40 – 0.67 / 0.49 – 0.79 | — |
+
+so `0.6` sits in a mostly empty region — but one of the four sets reached `0.785` on a
+non-candidate pair, which is exactly what the gate is there to suppress. Every run
+writes its own `diagnostics` (within-identity vs across-identity percentiles) into
+`<subject>_identities.json`; if those two distributions overlap, no threshold will
+save the run.
+
+### Limitations
+
+- **A gate group with one instance per photo gets no benefit from the embedding.**
+  Hungarian has no choice to make, and only `sim_thres` can veto the pairing. The
+  fingerprint earns its keep where several instances of one group compete in the same
+  photo.
+- **Small-instance recall caps what can be matched.** An instance that is never
+  detected in a view cannot be linked to it.
+- **One folder must be one subject.** A folder holding photos of more than one subject
+  will happily link generic-looking instances across them; that is a data problem, not
+  a matching one.
+- **Letterboxing shifts scale with orientation**, so a landscape and a portrait shot of
+  the same subject are not on quite equal footing.
+
+---
+
 ## Install
 
 ```bash
@@ -296,8 +388,11 @@ For the full training recipe, every `train()` knob, and int8 compression, see th
 - **Pretrained COCO checkpoints.** None are published yet. COCO-trained `s`/`b`/`l`
   weights will be released on the Hugging Face Hub (the `from_pretrained` / `hf://`
   loading plumbing is already in place and waiting for them).
-- **Multi-image re-ID via contrastive learning.** Train the auxiliary head with a
-  contrastive objective so each instance's query embedding becomes a **re-identification
-  vector** — matching the same object across images, frames and cameras for tracking and
-  retrieval. The aux head already produces a per-instance embedding from the detector's
-  own matched queries; re-ID reuses that signal instead of bolting on a separate model.
+- **Contrastive re-ID training.** Cross-photo re-identification already works at
+  inference time (see [above](#cross-photo-re-identification)) on the embedding the
+  detector computes anyway. What remains is *training* that embedding for the job: a
+  contrastive objective on the matched queries would make each one a purpose-built
+  re-identification vector rather than a by-product of the class head, which should
+  widen the margin between matches and non-matches and make `sim_thres` transferable
+  across datasets. Feeding those embeddings into the video tracker to re-associate
+  objects across occlusions is the same lever.
