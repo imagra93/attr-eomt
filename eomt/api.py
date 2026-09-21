@@ -426,7 +426,7 @@ class EoMT:
                     max_det: int = 30, mask_thresh: float = 0.5,
                     imgsz: int | None = None,
                     group_by: tuple[str, ...] | None = ("class",),
-                    sim_thres: float = 0.6, **kw) -> dict:
+                    sim_thres: float = 0.7, **kw) -> dict:
         """Re-identify instances across a set of photos of the *same subject*.
 
         Given several photos of one subject from different viewpoints, decides which

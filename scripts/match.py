@@ -26,7 +26,7 @@ def main() -> None:
     p.add_argument("--out", default="runs/match", help="Output directory.")
     p.add_argument("--conf", type=float, default=0.3, help="Detection confidence threshold.")
     p.add_argument("--max-det", type=int, default=30, help="Max detections per photo.")
-    p.add_argument("--sim-thres", type=float, default=0.6,
+    p.add_argument("--sim-thres", type=float, default=0.7,
                    help="Cosine-similarity floor for 'same instance'.")
     p.add_argument("--group-by", default="class",
                    help="Comma-separated gate keys, e.g. class,position.")
@@ -37,7 +37,8 @@ def main() -> None:
     p.add_argument("--guard-factor", type=float, default=1.0)
     p.add_argument("--center", action="store_true",
                    help="Mean-center embeddings before normalizing (transductive).")
-    p.add_argument("--arrows", default="chain", choices=("chain", "all", "none"))
+    p.add_argument("--links", default="chain", choices=("chain", "all", "none"),
+                   help="Connector lines between matched instances.")
     p.add_argument("--legend-attr", default=None,
                    help="Attribute head shown beside the class in the legend "
                         "(default: each identity's first attribute).")
@@ -67,7 +68,7 @@ def main() -> None:
             src, plot=not args.no_plot, save=args.out, conf_thres=args.conf,
             max_det=args.max_det, group_by=group_by, sim_thres=args.sim_thres,
             guard=args.guard, guard_factor=args.guard_factor, center=args.center,
-            arrow_mode=args.arrows, panel_size=args.panel_size,
+            link_mode=args.links, panel_size=args.panel_size,
             legend_attr=args.legend_attr,
         )
         total += result["num_identities"]

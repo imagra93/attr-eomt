@@ -727,18 +727,18 @@ def test_draw_identity_grid_geometry_and_degenerates():
 
     identities = [{"identity_id": 0, "class_name": "widget", "attributes": {},
                    "num_photos": 2}]
-    arrows = [{"a_panel": 0, "a_det": 0, "b_panel": 1, "b_det": 0,
+    links = [{"a_panel": 0, "a_det": 0, "b_panel": 1, "b_det": 0,
                "similarity": 0.8, "identity_id": 0}]
     grid = draw_identity_grid(
-        [panel(1), panel(1)], names={0: "widget"}, arrows=arrows,
+        [panel(1), panel(1)], names={0: "widget"}, links=links,
         identities=identities, cols=2, panel_size=64, title="t",
     )
     assert grid.mode == "RGB"
     assert grid.width == 2 * (64 + 12) + 12
     assert np.asarray(grid).std() > 0  # something was actually drawn
 
-    # A photo with no detections still gets its panel, and no arrows is fine.
-    grid2 = draw_identity_grid([panel(0), panel(1)], cols=2, panel_size=64, arrows=[])
+    # A photo with no detections still gets its panel, and no links is fine.
+    grid2 = draw_identity_grid([panel(0), panel(1)], cols=2, panel_size=64, links=[])
     assert grid2.size[0] == 2 * (64 + 12) + 12
 
 
@@ -789,7 +789,7 @@ def test_draw_identity_grid_legend_attr_is_head_agnostic():
     assert np.array_equal(missing, bare)
 
 
-def test_draw_identity_grid_arrow_width_tracks_similarity():
+def test_draw_identity_grid_link_width_tracks_similarity():
     """A confident link must draw thicker than a marginal one, on an absolute scale."""
     from PIL import Image
 
@@ -818,7 +818,7 @@ def test_draw_identity_grid_arrow_width_tracks_similarity():
         grid = draw_identity_grid(
             [panel(), panel()], cols=2, panel_size=240, legend=False,
             draw_boxes=False, alpha=0.0,
-            arrows=[{"a_panel": 0, "a_det": 0, "b_panel": 1, "b_det": 0,
+            links=[{"a_panel": 0, "a_det": 0, "b_panel": 1, "b_det": 0,
                      "similarity": sim, "identity_id": 0}],
             **kw,
         )
@@ -827,7 +827,7 @@ def test_draw_identity_grid_arrow_width_tracks_similarity():
     band = {"sim_range": (0.6, 1.0)}
     assert ink(0.98, **band) > ink(0.80, **band) > ink(0.61, **band)
 
-    # Absolute, not relative: a lone arrow's width depends only on its similarity,
+    # Absolute, not relative: a lone link's width depends only on its similarity,
     # so a near-perfect match never renders hairline just because it is alone.
     assert ink(0.99, **band) > ink(0.62, **band)
 
@@ -836,6 +836,61 @@ def test_draw_identity_grid_arrow_width_tracks_similarity():
     assert ink(-1.0, **band) == ink(0.6, **band)
 
     # An explicit width range is honored.
-    assert ink(0.9, sim_range=(0.6, 1.0), arrow_width=(1, 2)) < ink(
-        0.9, sim_range=(0.6, 1.0), arrow_width=(8, 16)
+    assert ink(0.9, sim_range=(0.6, 1.0), link_width=(1, 2)) < ink(
+        0.9, sim_range=(0.6, 1.0), link_width=(8, 16)
     )
+
+
+def test_link_width_is_independent_of_panel_size():
+    """The same similarity must draw the same stroke at any panel resolution.
+
+    Width encodes similarity and nothing else, so a grid rendered at 240 px and the
+    same grid at 720 px must put an identical number of pixels into the link. Deriving
+    the band from ``panel_size`` (as this once did) made a match look weaker simply
+    because the grid was rendered smaller.
+    """
+    from PIL import Image
+
+    from eomt.visualize import LINK_WIDTH_PX, draw_identity_grid
+
+    def panel(size):
+        h = w = size
+        m = torch.zeros(1, h, w, dtype=torch.bool)
+        m[0, h // 2 - 2:h // 2 + 2, w // 2 - 2:w // 2 + 2] = True
+        return {
+            "image": Image.new("RGB", (w, h), (0, 0, 0)),
+            "result": {
+                "num_detections": 1,
+                "boxes": torch.tensor([[w / 2 - 2, h / 2 - 2, w / 2 + 2, h / 2 + 2]]),
+                "scores": torch.ones(1),
+                "classes": torch.zeros(1, dtype=torch.long),
+                "masks": m,
+            },
+            "identity_ids": [0],
+            "caption": "",
+        }
+
+    def stroke_px(panel_size, pad=12):
+        """Link thickness, isolated by diffing against a link-free render.
+
+        Measured in the gutter between the two panels, where nothing else is drawn,
+        so panel content and the canvas background cancel out. Total ink would scale
+        with the link's *length* (panels sit farther apart in a bigger grid), which
+        is why this samples one column instead.
+        """
+        kw = dict(cols=2, panel_size=panel_size, legend=False, draw_boxes=False,
+                  alpha=0.0, sim_range=(0.7, 1.0), pad=pad)
+        bare = np.asarray(draw_identity_grid(
+            [panel(panel_size), panel(panel_size)], links=[], **kw)).astype(int)
+        with_link = np.asarray(draw_identity_grid(
+            [panel(panel_size), panel(panel_size)],
+            links=[{"a_panel": 0, "a_det": 0, "b_panel": 1, "b_det": 0,
+                    "similarity": 0.85, "identity_id": 0}], **kw)).astype(int)
+        gutter_x = pad + panel_size + pad // 2
+        changed = (np.abs(with_link - bare).sum(axis=2) > 0)[:, gutter_x]
+        return int(changed.sum())
+
+    widths = {p: stroke_px(p) for p in (240, 480, 720)}
+    assert len(set(widths.values())) == 1, f"stroke varies with panel_size: {widths}"
+    lo, hi = LINK_WIDTH_PX
+    assert lo <= next(iter(widths.values())) <= hi

@@ -95,14 +95,14 @@ def match(
     device: str = "auto",
     imgsz: int | None = None,
     group_by: tuple[str, ...] | None = ("class",),
-    sim_thres: float = 0.6,
+    sim_thres: float = 0.7,
     center: bool = False,
     guard: str = "mean",
     guard_factor: float = 1.0,
     keep_masks: bool = False,
     panel_size: int = 480,
     cols: int | None = None,
-    arrow_mode: str = "chain",
+    link_mode: str = "chain",
     legend_attr: str | None = None,
     alpha: float = 0.35,
     show_scores: bool = False,
@@ -120,7 +120,6 @@ def match(
             the subject never match, however alike they look). ``None`` disables
             gating, which needs a stricter ``sim_thres`` since far more pairs then
             compete.
-        sim_thres: cosine-similarity floor for "same instance".
         center: mean-center embeddings before normalizing (transductive; see
             :func:`eomt.reid.similarity_matrix`).
         guard / guard_factor: merge guard against transitive chaining
@@ -129,9 +128,12 @@ def match(
             Off by default — 30 photos of 20 instances at 4000x3000 is over 7 GB.
             The masks are released as each photo is processed, not at the end, so
             leaving this off caps peak memory rather than only trimming the result.
-        arrow_mode: ``"chain"`` draws one connector between panel-consecutive members
-            of each identity (same connectivity, far fewer lines), ``"all"`` draws
-            every accepted pair, ``"none"`` draws none.
+        sim_thres: cosine floor for "same instance"; also the low end of the link
+            width scale, so it changes what a hairline link means.
+        link_mode: ``"chain"`` draws one link between panel-consecutive members of
+            each identity (same connectivity, far fewer lines), ``"all"`` draws every
+            accepted pair, ``"none"`` draws none. Links are plain lines — the "same
+            object" relation is symmetric, so they carry no arrowheads.
         legend_attr: which attribute head the legend shows beside the class; ``None``
             uses each identity's first attribute.
 
@@ -282,13 +284,13 @@ def match(
             panel["identity_ids"] = res["identity_ids"].tolist()
             panel["caption"] = (f"{i}. {Path(res['path']).stem[:22]} "
                                 f"({res['num_detections']} inst)")
-        mode = arrow_mode
+        mode = link_mode
         if mode != "none" and len(panels) > 36:
             print(f"[match] {len(panels)} panels: connectors disabled for legibility")
             mode = "none"
-        arrows = _arrows_for(mode, accepted, origin, identity, sim)
+        links = _links_for(mode, accepted, origin, identity, sim)
         grid = draw_identity_grid(
-            panels, names=names, aux_names=None, arrows=arrows,
+            panels, names=names, aux_names=None, links=links,
             identities=identities, cols=cols, panel_size=panel_size,
             legend_attr=legend_attr, alpha=alpha, show_scores=show_scores,
             # Absolute width scale: an accepted link is >= sim_thres by definition,
@@ -326,7 +328,7 @@ def match(
     return result
 
 
-def _arrows_for(mode: str, accepted, origin, identity, sim) -> list[dict]:
+def _links_for(mode: str, accepted, origin, identity, sim) -> list[dict]:
     """Connectors to draw: every accepted pair, or one chain per identity."""
     if mode == "none":
         return []
@@ -354,16 +356,16 @@ def _arrows_for(mode: str, accepted, origin, identity, sim) -> list[dict]:
     by_identity: dict[int, list[int]] = {}
     for m, cid in enumerate(identity.tolist()):
         by_identity.setdefault(int(cid), []).append(m)
-    arrows = []
+    links = []
     for cid, members in sorted(by_identity.items()):
         if len(members) < 2:
             continue
         ordered = sorted(members, key=lambda m: origin[m])
         for a, b in zip(ordered, ordered[1:]):
-            arrows.append({
+            links.append({
                 "a_panel": origin[a][0], "a_det": origin[a][1],
                 "b_panel": origin[b][0], "b_det": origin[b][1],
                 "similarity": sims.get((a, b), float(s[a, b])),
                 "identity_id": cid,
             })
-    return arrows
+    return links

@@ -140,12 +140,12 @@ def test_infer_match_rejects_unknown_group_by(tmp_path):
     model.infer_match(src, plot=False, save=None, conf_thres=0.0, max_det=2)
 
 
-def test_chain_arrows_report_the_true_similarity_of_a_transitive_link():
+def test_chain_links_report_the_true_similarity_of_a_transitive_link():
     # An identity built from a-c and b-c puts a next to b in panel order, but that
     # cut was never matched directly. Defaulting it to 0.0 would clamp to hairline
     # under sim_range=(sim_thres, 1.0) and paint a confidently linked pair as a
     # barely-made match; the real cosine is what gets drawn.
-    from eomt.engine.match import _arrows_for
+    from eomt.engine.match import _links_for
     from eomt.reid import cluster, pairwise_matches
 
     sim = torch.tensor([[1.0, 0.50, 0.95], [0.50, 1.0, 0.90], [0.95, 0.90, 1.0]])
@@ -159,7 +159,7 @@ def test_chain_arrows_report_the_true_similarity_of_a_transitive_link():
     origin = [(0, 0), (1, 0), (2, 0)]
     drawn = {
         (a["a_panel"], a["b_panel"]): a["similarity"]
-        for a in _arrows_for("chain", accepted, origin, identity, sim)
+        for a in _links_for("chain", accepted, origin, identity, sim)
     }
     assert drawn[(0, 1)] == pytest.approx(0.50, abs=1e-5)  # not 0.0
     assert drawn[(1, 2)] == pytest.approx(0.90, abs=1e-5)

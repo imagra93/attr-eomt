@@ -278,7 +278,8 @@ One call handles one folder = one subject. Each detection is stamped with an
 attributes, how many photos it appears in), and `matches` records every candidate pair
 — accepted or not, with the reason — so a threshold can be retuned from the JSON
 without re-running inference. With `plot` you get a grid image: every photo, instances
-colored by identity, connectors between the matched pairs, and a legend.
+colored by identity, plain lines linking the matched pairs (thickness = similarity, on
+an absolute scale that does not vary with panel size), and a legend.
 
 ```bash
 python scripts/match.py weights/best.pt photos/subject_42/
@@ -314,7 +315,7 @@ be named; unknown names raise before the first forward pass. `group_by=None` dis
 gating entirely and needs a much higher `sim_thres`, since far more pairs then compete
 with no structural prior ruling any of them out.
 
-`sim_thres` (default `0.6`) is the cosine floor for "same instance". Hungarian always
+`sim_thres` (default `0.7`) is the cosine floor for "same instance". Hungarian always
 returns a full assignment, so the threshold is what turns *best available partner* into
 *no partner — this is a new instance*. Measured on one checkpoint across four real
 photo sets, with the gate on:
@@ -324,8 +325,9 @@ photo sets, with the gate on:
 | mean | 0.11 – 0.16 | 0.85 – 0.98 (the true-match mode) |
 | p99 / max | 0.40 – 0.67 / 0.49 – 0.79 | — |
 
-so `0.6` sits in a mostly empty region — but one of the four sets reached `0.785` on a
-non-candidate pair, which is exactly what the gate is there to suppress. Every run
+The default was raised from `0.6` to `0.7` after a 30-case run showed non-candidate
+pairs reaching `0.73` and the two distributions overlapping in over half the cases —
+`0.6` was admitting matches with no margin at all. Every run
 writes its own `diagnostics` (within-identity vs across-identity percentiles) into
 `<subject>_identities.json`; if those two distributions overlap, no threshold will
 save the run.

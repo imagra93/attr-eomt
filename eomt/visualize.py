@@ -192,31 +192,25 @@ def _centroid(result: dict, i: int) -> tuple[float, float] | None:
     return None
 
 
-def _arrow(draw, p0, p1, color, width: int, head: int | None = None) -> None:
-    """A double-headed connector: line plus a filled triangle at each end."""
+#: Absolute link stroke band in pixels, mapped from ``sim_range``. Deliberately a
+#: constant rather than a function of ``panel_size``: the same similarity must be the
+#: same thickness in every grid, whatever resolution the panels were rendered at.
+LINK_WIDTH_PX = (2, 12)
+
+
+def _connector(draw, p0, p1, color, width: int) -> None:
+    """A plain straight link between two instance centroids.
+
+    No arrowheads. "These two are the same object" is a symmetric relation, so a head
+    at each end carried no information — and because the head was clamped to half the
+    connector's length, two links of equal similarity drew differently depending only
+    on how far apart their panels happened to sit. Stroke width alone now encodes
+    similarity, and it encodes nothing else.
+    """
     (x0, y0), (x1, y1) = p0, p1
-    dx, dy = x1 - x0, y1 - y0
-    length = math.hypot(dx, dy)
-    if length < 1e-6:  # both instances land on the same canvas point
+    if math.hypot(x1 - x0, y1 - y0) < 1e-6:  # both land on the same canvas point
         return
-    ux, uy = dx / length, dy / length
-    h = head if head is not None else max(6, 4 * width)
-    h = min(h, length / 2)
-    px, py = -uy, ux  # perpendicular
-    # Shorten the stroke so it does not poke through either head.
-    draw.line(
-        [(x0 + 0.8 * h * ux, y0 + 0.8 * h * uy), (x1 - 0.8 * h * ux, y1 - 0.8 * h * uy)],
-        fill=color, width=width,
-    )
-    for (tx, ty), (sx, sy) in (((x1, y1), (ux, uy)), ((x0, y0), (-ux, -uy))):
-        draw.polygon(
-            [
-                (tx, ty),
-                (tx - h * sx + 0.4 * h * px, ty - h * sy + 0.4 * h * py),
-                (tx - h * sx - 0.4 * h * px, ty - h * sy - 0.4 * h * py),
-            ],
-            fill=color,
-        )
+    draw.line([(x0, y0), (x1, y1)], fill=color, width=width)
 
 
 def draw_identity_grid(
@@ -224,7 +218,7 @@ def draw_identity_grid(
     *,
     names: dict[int, str] | None = None,
     aux_names: dict[str, dict[int, str]] | None = None,
-    arrows: list[dict] | None = None,
+    links: list[dict] | None = None,
     identities: list[dict] | None = None,
     cols: int | None = None,
     panel_size: int = 480,
@@ -236,8 +230,8 @@ def draw_identity_grid(
     draw_boxes: bool = True,
     show_scores: bool = False,
     aux_multiline: bool = False,
-    arrow_alpha: float = 0.55,
-    arrow_width: tuple[int, int] | None = None,
+    link_alpha: float = 0.55,
+    link_width: tuple[int, int] | None = None,
     sim_range: tuple[float, float] | None = None,
     legend: bool = True,
     legend_cols: int = 3,
@@ -266,18 +260,21 @@ def draw_identity_grid(
         legend_attr: which attribute head to show beside the class in the legend.
             ``None`` (default) uses each identity's first attribute, which is the
             first head the checkpoint declares.
-        arrows: connectors to draw, each ``{"a_panel", "a_det", "b_panel", "b_det",
-            "similarity", "identity_id"}``. Stroke thickness scales with similarity:
-            a confident match is drawn thick, a marginal one hairline.
-        arrow_width: ``(thinnest, thickest)`` stroke width in pixels. ``None``
-            derives a pair from ``panel_size`` so arrows stay proportionate.
-        sim_range: the ``(low, high)`` similarity band mapped onto ``arrow_width``.
+        links: plain lines to draw between matched instances, each ``{"a_panel",
+            "a_det", "b_panel", "b_det", "similarity", "identity_id"}``. Stroke
+            thickness scales with similarity: a confident match is drawn thick, a
+            marginal one hairline. No arrowheads — the relation is symmetric.
+        link_width: ``(thinnest, thickest)`` stroke width in pixels. ``None`` uses
+            the absolute :data:`LINK_WIDTH_PX` band, so a given similarity draws at
+            the same thickness no matter what ``panel_size`` the grid was rendered
+            at. Pass an explicit pair only to override that deliberately.
+        sim_range: the ``(low, high)`` similarity band mapped onto ``link_width``.
             Pass ``(sim_thres, 1.0)`` — as :func:`eomt.engine.match.match` does — to
             make widths **absolute**, so the same similarity is the same thickness in
             every grid and a link drawn at threshold is visibly hairline. ``None``
-            falls back to min-maxing over the arrows actually drawn, which maximizes
+            falls back to min-maxing over the links actually drawn, which maximizes
             contrast within one grid but means nothing across grids (and makes a lone
-            arrow thinnest regardless of how good the match is).
+            link thinnest regardless of how good the match is).
         identities: records from :func:`eomt.reid.summarize_identities`, used for the
             legend only.
 
@@ -349,22 +346,23 @@ def draw_identity_grid(
     # --- connectors -------------------------------------------------------
     # Drawn on an overlay and composited, so they never fully obliterate the
     # instances they point at.
-    if arrows:
+    if links:
         # Cosine similarities bunch up well below 1.0 in practice (a strong match is
         # ~0.85, not ~0.99), so the top of the band is rarely reached — a generous
-        # span is what makes "thick = confident" legible at a glance.
-        w_min, w_max = arrow_width or (
-            max(1, panel_size // 240), max(4, panel_size // 40)
-        )
+        # span is what makes "thick = confident" legible at a glance. The band is a
+        # constant, NOT a function of ``panel_size``: width means similarity and
+        # nothing else, so rendering the same set at a different panel resolution
+        # must not change how thick a given match draws.
+        w_min, w_max = link_width or LINK_WIDTH_PX
         if sim_range is not None:
             lo, hi = (float(v) for v in sim_range)
         else:
-            sims = [float(a.get("similarity", 0.0)) for a in arrows]
+            sims = [float(a.get("similarity", 0.0)) for a in links]
             lo, hi = min(sims), max(sims)
         span = (hi - lo) or 1.0
         overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
         odraw = ImageDraw.Draw(overlay)
-        for a in arrows:
+        for a in links:
             ia, ib = int(a["a_panel"]), int(a["b_panel"])
             if not (0 <= ia < n and 0 <= ib < n):
                 continue
@@ -375,8 +373,8 @@ def draw_identity_grid(
             p0 = (origins[ia][0] + ca[0], origins[ia][1] + ca[1])
             p1 = (origins[ib][0] + cb[0], origins[ib][1] + cb[1])
             norm = min(1.0, max(0.0, (float(a.get("similarity", 0.0)) - lo) / span))
-            color = (*class_color(int(a.get("identity_id", 0))), int(255 * arrow_alpha))
-            _arrow(odraw, p0, p1, color, max(1, round(w_min + (w_max - w_min) * norm)))
+            color = (*class_color(int(a.get("identity_id", 0))), int(255 * link_alpha))
+            _connector(odraw, p0, p1, color, max(1, round(w_min + (w_max - w_min) * norm)))
         canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
         draw = ImageDraw.Draw(canvas)
 
