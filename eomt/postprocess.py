@@ -132,7 +132,8 @@ def postprocess_detection(
 
     Returns:
         ``{"num_detections", "boxes": (N,4) xyxy original px, "scores": (N,),
-        "classes": (N,)}``. If the model has secondary heads, ``output`` also carries
+        "classes": (N,), "query_idx": (N,)}``, where ``query_idx`` holds the kept
+        query indices into ``[0, Q)`` — the mapping back to per-query embeddings. If the model has secondary heads, ``output`` also carries
         ``"aux_queries_logits": {name: (1, Q, ns)}`` and the result gains
         ``"aux": {name: {"ids": (N,), "probs": (N, ns)}}`` for the same kept queries.
     """
@@ -151,6 +152,7 @@ def postprocess_detection(
             "boxes": torch.zeros((0, 4)),
             "scores": torch.zeros((0,)),
             "classes": torch.zeros((0,), dtype=torch.long),
+            "query_idx": torch.zeros((0,), dtype=torch.long),
         }
         if aux_logits is not None:
             empty["aux"] = {
@@ -172,6 +174,7 @@ def postprocess_detection(
         "boxes": boxes,
         "scores": scores,
         "classes": classes.long(),
+        "query_idx": sel,
     }
     if aux_logits is not None:
         result["aux"] = _build_aux_result(aux_logits, sel, classes, aux_scopes)
@@ -208,7 +211,8 @@ def postprocess_instance(
 
     Returns:
         ``{"num_detections", "boxes": (N,4), "scores": (N,), "classes": (N,),
-        "masks": (N,H,W)}``. If the model has secondary heads, ``output`` also
+        "masks": (N,H,W), "query_idx": (N,)}``, where ``query_idx`` holds the kept
+        query indices into ``[0, Q)`` — the mapping back to per-query embeddings. If the model has secondary heads, ``output`` also
         carries ``"aux_queries_logits": {name: (1, Q, ns)}`` and the result gains
         ``"aux": {name: {"ids": (N,), "probs": (N, ns)}}`` for the same kept queries.
     """
@@ -237,6 +241,7 @@ def postprocess_instance(
             "scores": torch.zeros((0,)),
             "classes": torch.zeros((0,), dtype=torch.long),
             "masks": torch.zeros((0, orig_h, orig_w), dtype=torch.bool),
+            "query_idx": torch.zeros((0,), dtype=torch.long),
         }
         if aux_logits is not None:
             empty["aux"] = {
@@ -270,6 +275,7 @@ def postprocess_instance(
         "scores": scores,
         "classes": classes.long(),
         "masks": masks,
+        "query_idx": sel,
     }
     if aux_logits is not None:
         result["aux"] = _build_aux_result(aux_logits, sel, classes, aux_scopes)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import colorsys
+import math
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -70,6 +72,8 @@ def draw_instances(
     aux_multiline: bool = True,
     show_scores: bool = True,
     color_by: str = "class",
+    color_ids: Sequence[int] | None = None,
+    label_prefix: Sequence[str] | None = None,
 ) -> Image.Image:
     """Overlay masks, boxes and labels from a ``postprocess_instance`` result.
 
@@ -89,8 +93,15 @@ def draw_instances(
         color_by: ``"class"`` colors masks/boxes by class index (instances of the
             same class share a color); ``"instance"`` colors each instance distinctly
             by its position, so same-class instances stand apart.
+        color_ids: optional per-instance color index, overriding ``color_by``. Pass
+            cross-photo identity ids to color each instance by *which object it is*
+            rather than what class it is (see :func:`draw_identity_grid`).
+        label_prefix: optional per-instance string prepended to the first label row,
+            e.g. ``"#3"`` for an identity id.
     """
     def _color(i: int, cls: int) -> tuple[int, int, int]:
+        if color_ids is not None:
+            return class_color(int(color_ids[i]))
         return class_color(i if color_by == "instance" else cls)
 
     img = np.array(image.convert("RGB")).astype(np.float32)
@@ -146,6 +157,8 @@ def draw_instances(
             text = f"{label} ({score:.2f})" if aux_multiline else f"{label} {score:.2f}"
         else:
             text = label
+        if label_prefix is not None:
+            text = f"{label_prefix[i]} {text}"
         aux = _aux_label(result, aux_names, i, multiline=aux_multiline, show_scores=show_scores)
         if aux:
             text += "\n" + aux
@@ -159,3 +172,238 @@ def draw_instances(
             draw.multiline_text((lx - tb[0], ly - tb[1]), text, fill=(0, 0, 0), font=font)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Cross-photo identity grid
+# ---------------------------------------------------------------------------
+def _centroid(result: dict, i: int) -> tuple[float, float] | None:
+    """Mask centroid for instance ``i``, falling back to the box center."""
+    masks = result.get("masks")
+    if isinstance(masks, torch.Tensor) and i < masks.shape[0]:
+        m = masks[i].cpu().numpy().astype(bool)
+        if m.any():
+            ys, xs = np.nonzero(m)
+            return float(xs.mean()), float(ys.mean())
+    boxes = result.get("boxes")
+    if boxes is not None and i < len(boxes):
+        x1, y1, x2, y2 = (float(v) for v in boxes[i].tolist())
+        return (x1 + x2) / 2, (y1 + y2) / 2
+    return None
+
+
+#: Absolute link stroke band in pixels, mapped from ``sim_range``. Deliberately a
+#: constant rather than a function of ``panel_size``: the same similarity must be the
+#: same thickness in every grid, whatever resolution the panels were rendered at.
+LINK_WIDTH_PX = (2, 12)
+
+
+def _connector(draw, p0, p1, color, width: int) -> None:
+    """A plain straight link between two instance centroids.
+
+    No arrowheads. "These two are the same object" is a symmetric relation, so a head
+    at each end carried no information — and because the head was clamped to half the
+    connector's length, two links of equal similarity drew differently depending only
+    on how far apart their panels happened to sit. Stroke width alone now encodes
+    similarity, and it encodes nothing else.
+    """
+    (x0, y0), (x1, y1) = p0, p1
+    if math.hypot(x1 - x0, y1 - y0) < 1e-6:  # both land on the same canvas point
+        return
+    draw.line([(x0, y0), (x1, y1)], fill=color, width=width)
+
+
+def draw_identity_grid(
+    panels: list[dict],
+    *,
+    names: dict[int, str] | None = None,
+    aux_names: dict[str, dict[int, str]] | None = None,
+    links: list[dict] | None = None,
+    identities: list[dict] | None = None,
+    cols: int | None = None,
+    panel_size: int = 480,
+    pad: int = 12,
+    caption_h: int | None = None,
+    bg: tuple[int, int, int] = (22, 22, 26),
+    fg: tuple[int, int, int] = (235, 235, 235),
+    alpha: float = 0.35,
+    draw_boxes: bool = True,
+    show_scores: bool = False,
+    aux_multiline: bool = False,
+    link_alpha: float = 0.55,
+    link_width: tuple[int, int] | None = None,
+    sim_range: tuple[float, float] | None = None,
+    legend: bool = True,
+    legend_cols: int = 3,
+    legend_attr: str | None = None,
+    max_legend: int = 24,
+    title: str | None = None,
+) -> Image.Image:
+    """Render one grid image for a set of photos linked by cross-photo identity.
+
+    Each panel is one photo with its instances outlined and colored by identity id
+    (so the same physical object wears the same color in every photo it appears in),
+    labelled ``#id class``. Connectors are drawn between the matched instances of an
+    identity, so the actual pairwise links are visible and not just the final
+    clustering. A legend strip summarizes each identity.
+
+    Args:
+        panels: one dict per photo, ``{"image": PIL.Image, "result": dict,
+            "identity_ids": sequence[int], "caption": str}``. Images and results must
+            already be at panel scale — see the note below.
+        draw_boxes: :func:`draw_instances` renders labels only alongside boxes, so
+            turning this off also hides the ``#id class`` labels the grid exists to
+            show. Leave it on unless you want outlines alone.
+        aux_names: pass to label each instance with its attributes too. ``None``
+            (the default from :func:`eomt.engine.match.match`) keeps panel labels to
+            ``#id class``; the legend already carries the dominant attribute.
+        legend_attr: which attribute head to show beside the class in the legend.
+            ``None`` (default) uses each identity's first attribute, which is the
+            first head the checkpoint declares.
+        links: plain lines to draw between matched instances, each ``{"a_panel",
+            "a_det", "b_panel", "b_det", "similarity", "identity_id"}``. Stroke
+            thickness scales with similarity: a confident match is drawn thick, a
+            marginal one hairline. No arrowheads — the relation is symmetric.
+        link_width: ``(thinnest, thickest)`` stroke width in pixels. ``None`` uses
+            the absolute :data:`LINK_WIDTH_PX` band, so a given similarity draws at
+            the same thickness no matter what ``panel_size`` the grid was rendered
+            at. Pass an explicit pair only to override that deliberately.
+        sim_range: the ``(low, high)`` similarity band mapped onto ``link_width``.
+            Pass ``(sim_thres, 1.0)`` — as :func:`eomt.engine.match.match` does — to
+            make widths **absolute**, so the same similarity is the same thickness in
+            every grid and a link drawn at threshold is visibly hairline. ``None``
+            falls back to min-maxing over the links actually drawn, which maximizes
+            contrast within one grid but means nothing across grids (and makes a lone
+            link thinnest regardless of how good the match is).
+        identities: records from :func:`eomt.reid.summarize_identities`, used for the
+            legend only.
+
+    Note:
+        Panels must be pre-scaled by the caller. :func:`draw_instances` derives its
+        line width and font size from the image it is handed, so drawing on a 4000 px
+        photo and downscaling afterwards turns every label to mush.
+
+    Note:
+        Identity colors come from :func:`class_color`, a golden-angle hue ramp. Past
+        roughly 20 identities adjacent hues stop being distinguishable in a small
+        legend swatch, so the ``#id`` text is the real key, not the color.
+    """
+    n = len(panels)
+    cols = cols or max(1, math.ceil(math.sqrt(max(n, 1))))
+    rows = max(1, math.ceil(n / cols)) if n else 1
+    caption_h = caption_h or max(16, panel_size // 22)
+    cell_h = panel_size + caption_h
+    cap_font = _font(max(10, caption_h - 5))
+
+    legend_rows = 0
+    swatch = 14
+    legend_row_h = swatch + 10
+    shown = (identities or [])[:max_legend] if legend else []
+    if shown:
+        legend_rows = math.ceil(len(shown) / legend_cols) + (
+            1 if identities and len(identities) > max_legend else 0
+        )
+    title_h = (max(18, panel_size // 18) + pad) if title else 0
+    legend_h = (legend_rows * legend_row_h + 2 * pad) if legend_rows else 0
+
+    W = cols * (panel_size + pad) + pad
+    H = title_h + rows * (cell_h + pad) + pad + legend_h
+    canvas = Image.new("RGB", (W, H), bg)
+    draw = ImageDraw.Draw(canvas)
+
+    if title:
+        draw.text((pad, pad // 2), title, fill=fg, font=_font(max(14, panel_size // 22)))
+
+    # --- panels -----------------------------------------------------------
+    origins: list[tuple[int, int]] = []
+    for k, panel in enumerate(panels):
+        r, c = divmod(k, cols)
+        ox = pad + c * (panel_size + pad)
+        oy = title_h + pad + r * (cell_h + pad)
+        image, result = panel["image"], panel["result"]
+        if aux_names is None:
+            # _aux_label falls back to raw numeric ids when it has no name map, which
+            # would tack an unreadable "0 0 1 4 3" row onto every label. No name map
+            # here means "no attribute rows", so drop the key outright.
+            result = {k: v for k, v in result.items() if k != "aux"}
+        ids = [int(v) for v in panel.get("identity_ids", [])]
+        rendered = draw_instances(
+            image, result, names=names, aux_names=aux_names,
+            alpha=alpha, draw_boxes=draw_boxes, aux_multiline=aux_multiline,
+            show_scores=show_scores,
+            color_ids=ids or None,
+            label_prefix=[f"#{i}" for i in ids] or None,
+        )
+        # Center the (already panel-scaled) photo in its cell.
+        px = ox + (panel_size - rendered.width) // 2
+        py = oy + (panel_size - rendered.height) // 2
+        canvas.paste(rendered, (px, py))
+        origins.append((px, py))
+        caption = str(panel.get("caption", ""))
+        if caption:
+            draw.text((ox + 2, oy + panel_size + 2), caption, fill=fg, font=cap_font)
+
+    # --- connectors -------------------------------------------------------
+    # Drawn on an overlay and composited, so they never fully obliterate the
+    # instances they point at.
+    if links:
+        # Cosine similarities bunch up well below 1.0 in practice (a strong match is
+        # ~0.85, not ~0.99), so the top of the band is rarely reached — a generous
+        # span is what makes "thick = confident" legible at a glance. The band is a
+        # constant, NOT a function of ``panel_size``: width means similarity and
+        # nothing else, so rendering the same set at a different panel resolution
+        # must not change how thick a given match draws.
+        w_min, w_max = link_width or LINK_WIDTH_PX
+        if sim_range is not None:
+            lo, hi = (float(v) for v in sim_range)
+        else:
+            sims = [float(a.get("similarity", 0.0)) for a in links]
+            lo, hi = min(sims), max(sims)
+        span = (hi - lo) or 1.0
+        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        odraw = ImageDraw.Draw(overlay)
+        for a in links:
+            ia, ib = int(a["a_panel"]), int(a["b_panel"])
+            if not (0 <= ia < n and 0 <= ib < n):
+                continue
+            ca = _centroid(panels[ia]["result"], int(a["a_det"]))
+            cb = _centroid(panels[ib]["result"], int(a["b_det"]))
+            if ca is None or cb is None:
+                continue
+            p0 = (origins[ia][0] + ca[0], origins[ia][1] + ca[1])
+            p1 = (origins[ib][0] + cb[0], origins[ib][1] + cb[1])
+            norm = min(1.0, max(0.0, (float(a.get("similarity", 0.0)) - lo) / span))
+            color = (*class_color(int(a.get("identity_id", 0))), int(255 * link_alpha))
+            _connector(odraw, p0, p1, color, max(1, round(w_min + (w_max - w_min) * norm)))
+        canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(canvas)
+
+    # --- legend -----------------------------------------------------------
+    if shown:
+        lfont = _font(max(11, swatch))
+        base_y = title_h + rows * (cell_h + pad) + pad
+        col_w = (W - 2 * pad) // max(1, legend_cols)
+        for i, rec in enumerate(shown):
+            r, c = divmod(i, legend_cols)
+            x = pad + c * col_w
+            y = base_y + r * legend_row_h
+            cid = int(rec["identity_id"])
+            draw.rectangle([x, y, x + swatch, y + swatch], fill=class_color(cid))
+            attrs = rec.get("attributes") or {}
+            # Which attribute to put beside the class. Defaulting to the first one
+            # keeps this working on any checkpoint; naming a head that does not exist
+            # (or that this identity has no value for) just omits it.
+            key = legend_attr if legend_attr is not None else next(iter(attrs), None)
+            value = attrs.get(key) if key is not None else None
+            label = f"#{cid}  {rec.get('class_name', '?')}"
+            if value:
+                label += f"/{value}"
+            label += f"  ·  {rec.get('num_photos', 0)}/{n} photos"
+            draw.text((x + swatch + 6, y), label, fill=fg, font=lfont)
+        if identities and len(identities) > max_legend:
+            y = base_y + math.ceil(len(shown) / legend_cols) * legend_row_h
+            draw.text(
+                (pad, y), f"+{len(identities) - max_legend} more identities",
+                fill=fg, font=lfont,
+            )
+    return canvas
