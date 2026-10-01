@@ -15,6 +15,7 @@ Lower-level building blocks (``build_model`` / ``load_model`` / ``EoMTModel`` /
 from __future__ import annotations
 
 from .api import EoMT
+from .data.transforms import AugConfig
 from .config import EOMT_CONFIGS, SIZES, build_eomt_config
 from .model import EoMTEncoder, EoMTModel, build_model, load_dinov2_backbone
 from .postprocess import postprocess_instance
@@ -33,6 +34,7 @@ from .serialization import (
 
 __all__ = [
     "EoMT",
+    "AugConfig",
     "EOMT_CONFIGS",
     "SIZES",
     "build_eomt_config",

@@ -7,6 +7,11 @@ Defaults to COCO 2017 instance segmentation, which is auto-downloaded on first r
     python scripts/train.py --size s --epochs 50 --batch 16
     python scripts/train.py --data sample_data/data.yaml --epochs 1
 
+Augmentation defaults are a strong general recipe (see ``eomt.data.transforms.AugConfig``). Override any knob:
+
+    python scripts/train.py --data my/data.yaml --aug min_scale=0.6 --aug max_scale=1.6 --aug instance_crop_prob=0.8
+    python scripts/train.py --data my/data.yaml --aug-preset legacy      # the original flip + LSJ + crop + colour jitter
+
 To train on a dataset with secondary per-instance attributes (the auxiliary-class
 feature), just point --data at it; the heads are discovered from the COCO JSON.
 """
@@ -15,7 +20,20 @@ from __future__ import annotations
 
 import argparse
 
+import yaml
+
 from eomt import EoMT
+
+
+def _parse_aug(items: list[str], preset: str | None) -> dict | None:
+    """``["rotate_prob=0.5", "blur_sigma=[0.3,1]"]`` -> ``{"rotate_prob": 0.5, "blur_sigma": [0.3, 1]}`` (YAML values)."""
+    aug: dict = {"preset": preset} if preset else {}
+    for item in items:
+        key, sep, value = item.partition("=")
+        if not sep or not key.strip():
+            raise SystemExit(f"--aug expects KEY=VALUE, got {item!r}")
+        aug[key.strip()] = yaml.safe_load(value)
+    return aug or None
 
 
 def main() -> None:
@@ -38,6 +56,15 @@ def main() -> None:
         help="B1 multi-scale SimpleFPN scales relative to the native grid (default "
              "'2,1,0.5', on by default). Pass 'none'/'off' for the single-scale model.",
     )
+    p.add_argument(
+        "--aug", action="append", default=[], metavar="KEY=VALUE",
+        help="Augmentation override (repeatable), e.g. --aug rotate_prob=0.5 --aug 'blur_sigma=[0.3,1.0]'. "
+             "Any eomt.data.transforms.AugConfig field; beats the data.yaml `train_aug` block.",
+    )
+    p.add_argument(
+        "--aug-preset", choices=["default", "legacy"], default=None,
+        help="Start from the strong default recipe or from the original flip + LSJ + crop + colour-jitter recipe.",
+    )
     args = p.parse_args()
 
     if args.fpn_scales.strip().lower() in ("", "none", "off", "0"):
@@ -56,6 +83,7 @@ def main() -> None:
         name=args.name,
         resume=bool(args.resume),
         fpn_scales=fpn_scales,
+        aug=_parse_aug(args.aug, args.aug_preset),
     )
     if result["best_metric"] >= 0:
         metric = "bbox mAP" if args.task == "detect" else "segm mAP"

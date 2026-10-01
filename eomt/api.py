@@ -249,6 +249,11 @@ class EoMT:
         ``resume=True`` continues the original run; otherwise the checkpoint warm-starts
         a fresh run (fine-tune). Returns the engine's result dict and reloads the best
         weights into this object.
+
+        Augmentation: the dataset YAML may carry a ``train_aug`` mapping (any
+        :class:`~eomt.data.transforms.AugConfig` field, or ``preset: legacy``); an ``aug=`` passed here is merged
+        over it key by key, and the explicit ``flip_prob`` / ``min_scale`` / ``max_scale`` keywords beat both.
+        ``train_transform=`` replaces the built-in pipeline with your own callable.
         """
         cfg = _resolve_data(data)
         if not (cfg["train_images"] and cfg["train_json"]):
@@ -256,6 +261,12 @@ class EoMT:
 
         if self._ckpt is not None:
             hp["resume" if resume else "init_weights"] = self._ckpt
+
+        yaml_aug = cfg.get("train_aug")
+        if yaml_aug:
+            code_aug = hp.get("aug")
+            code_aug = code_aug.to_dict() if hasattr(code_aug, "to_dict") else dict(code_aug or {})
+            hp["aug"] = {**yaml_aug, **code_aug}
 
         result = _train(
             train_images=cfg["train_images"],

@@ -9,6 +9,14 @@ whether to auto-download COCO 2017 if missing::
     val_images: val2017
     val_json: annotations/instances_val2017.json
     download: true            # fetch COCO 2017 from cocodataset.org if absent
+
+An optional ``train_aug`` mapping overrides the augmentation defaults for *this dataset* (any
+:class:`~eomt.data.transforms.AugConfig` field, plus ``preset: legacy``); explicit ``train()`` keywords still win::
+
+    train_aug:
+      min_scale: 0.6          # thin / tiny objects: keep the effective scale within ~[0.4, 1.0]
+      max_scale: 1.6
+      instance_crop_prob: 0.8 # optional instance-aware crop (off by default)
 """
 
 from __future__ import annotations
@@ -61,10 +69,15 @@ def load_data_config(yaml_path: str | Path, *, autodownload: bool = True) -> dic
         val_images = val_images or paths["val_images"]
         val_json = val_json or paths["val_json"]
 
+    train_aug = cfg.get("train_aug")
+    if train_aug is not None and not isinstance(train_aug, dict):
+        raise ValueError(f"`train_aug` in {yaml_path} must be a mapping, got {type(train_aug).__name__}")
+
     return {
         "path": str(root),
         "train_images": str(train_images) if train_images else None,
         "train_json": str(train_json) if train_json else None,
         "val_images": str(val_images) if val_images else None,
         "val_json": str(val_json) if val_json else None,
+        "train_aug": train_aug,
     }

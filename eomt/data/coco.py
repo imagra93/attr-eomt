@@ -13,6 +13,7 @@ to convert predictions back to original ids for ``COCOeval``.
 from __future__ import annotations
 
 import warnings
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +23,7 @@ from torch.utils.data import Dataset
 
 from ..config import AuxHeadSpec
 from ..preprocess import preprocess_numpy
-from .transforms import build_train_transform, build_val_transform
+from .transforms import AugConfig, TrainAugment, build_val_transform
 
 
 def _build_category_maps(coco):
@@ -230,12 +231,61 @@ def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=Non
     return specs, id_maps
 
 
-class CocoInstanceSeg(Dataset):
+class _InstanceWeights:
+    """Per-instance sampling weights for the instance-aware crop: ``freq(key) ** -power``.
+
+    ``key`` is the instance's primary class, or its value of the attribute named by
+    ``aug.instance_crop_rarity_attr`` (e.g. ``"typology"``), so rare kinds are chosen as the crop's focus more often.
+    Only built when the instance-aware crop is enabled (``instance_crop_prob`` / ``instance_crop_empty_prob`` > 0).
+    """
+
+    def _init_weights(self) -> None:
+        c = self.aug
+        self._rarity = None
+        if c.instance_crop_prob <= 0 and c.instance_crop_empty_prob <= 0:
+            return
+        spec = None
+        if c.instance_crop_rarity_attr:
+            spec = next((s for s in self.aux_specs if s.name == c.instance_crop_rarity_attr), None)
+            if spec is None:
+                warnings.warn(
+                    f"instance_crop_rarity_attr={c.instance_crop_rarity_attr!r} is not an attribute of this dataset "
+                    f"({[s.name for s in self.aux_specs]}); weighting by primary class instead.",
+                    stacklevel=3,
+                )
+        counts: Counter = Counter()
+        for img_id in self.ids:
+            for ann in self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id, iscrowd=False)):
+                counts[self._rarity_key(ann, spec)] += 1
+        total = sum(counts.values()) or 1
+        self._rarity = (spec, {k: v / total for k, v in counts.items()})
+
+    def _rarity_key(self, ann: dict, spec) -> int:
+        cls = self.cat2contig[ann["category_id"]]
+        if spec is None:
+            return cls
+        return _attr_label(spec, self._attr_id_maps, ann.get("attributes", {}), cls)
+
+    def _instance_weights(self, keys: list[int]) -> np.ndarray | None:
+        if self._rarity is None or not keys:
+            return None
+        _, freq = self._rarity
+        common = max(freq.values())
+        power = self.aug.instance_crop_rarity_power
+        return np.array([freq.get(k, common) ** (-power) for k in keys], dtype=np.float64)
+
+
+class CocoInstanceSeg(_InstanceWeights, Dataset):
     """COCO instance segmentation -> ``(pixel_values, masks, class_labels)``.
 
     Each item is an augmented, ImageNet-normalized square tensor plus a stack of
-    binary instance masks ``(num_inst, imgsz, imgsz)`` and their contiguous class
-    ids. Images with no instances are filtered out at construction.
+    instance masks ``(num_inst, imgsz, imgsz)`` (float; soft, area-averaged values in
+    [0, 1] by default, see :class:`~eomt.data.transforms.AugConfig` ``mask_resize``) and
+    their contiguous class ids. Images with no instances are filtered out at construction.
+
+    Augmentation: ``aug`` (an :class:`~eomt.data.transforms.AugConfig` or a mapping) holds every knob;
+    ``flip_prob`` / ``min_scale`` / ``max_scale`` override it when given; ``transform`` replaces the built-in
+    pipeline altogether.
     """
 
     def __init__(
@@ -245,9 +295,10 @@ class CocoInstanceSeg(Dataset):
         imgsz: int = 644,
         *,
         transform=None,
-        flip_prob: float = 0.5,
-        min_scale: float = 0.5,
-        max_scale: float = 1.0,
+        flip_prob: float | None = None,
+        min_scale: float | None = None,
+        max_scale: float | None = None,
+        aug: AugConfig | dict | None = None,
         attributes: list[str] | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
     ):
@@ -255,6 +306,9 @@ class CocoInstanceSeg(Dataset):
 
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
+        # One source of truth for the augmentation defaults (:class:`AugConfig`); the explicit keywords
+        # (``flip_prob`` / ``min_scale`` / ``max_scale``) override ``aug`` when given.
+        self.aug = AugConfig.resolve(aug, flip_prob=flip_prob, min_scale=min_scale, max_scale=max_scale)
         self.coco = COCO(str(json_file))
         _merge_attribute_sidecar(self.coco, json_file)
         self.cat2contig, self.contig2cat, self.names, self.num_classes = (
@@ -278,9 +332,10 @@ class CocoInstanceSeg(Dataset):
             for i in self.coco.getImgIds()
             if len(self.coco.getAnnIds(imgIds=i, iscrowd=False)) > 0
         ]
-        self.transform = transform or build_train_transform(
-            imgsz, flip_prob=flip_prob, min_scale=min_scale, max_scale=max_scale
-        )
+        self._init_weights()
+        # ``transform`` replaces the built-in pipeline (any ``(image, masks) -> (image, masks)`` callable, e.g. a
+        # torchvision v2 ``Compose``); by default :class:`TrainAugment` built from ``self.aug``.
+        self.transform = transform or TrainAugment(imgsz, self.aug)
         # No-crop resize used as a fallback when augmentation crops every
         # instance away, so a sample is never forced to a fabricated empty mask.
         self._fallback_transform = build_val_transform(imgsz)
@@ -288,7 +343,8 @@ class CocoInstanceSeg(Dataset):
     def __len__(self) -> int:
         return len(self.ids)
 
-    def __getitem__(self, idx: int):
+    def _load_raw(self, idx: int):
+        """Decode one sample *before* augmentation: ``(image_tv, masks_tv, class_t, attr_t, rarity_keys)``."""
         from torchvision import tv_tensors
 
         img_id = self.ids[idx]
@@ -296,8 +352,9 @@ class CocoInstanceSeg(Dataset):
         img = Image.open(self.img_dir / info["file_name"]).convert("RGB")
 
         anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id, iscrowd=False))
-        masks, classes = [], []
+        masks, classes, keys = [], [], []
         attrs: dict[str, list[int]] = {s.name: [] for s in self.aux_specs}
+        rarity_spec = self._rarity[0] if self._rarity is not None else None
         for ann in anns:
             m = self.coco.annToMask(ann)  # (H, W) uint8 at original resolution
             if m.sum() == 0:
@@ -305,6 +362,8 @@ class CocoInstanceSeg(Dataset):
             masks.append(torch.from_numpy(m))
             cls = self.cat2contig[ann["category_id"]]
             classes.append(cls)
+            if self._rarity is not None:
+                keys.append(self._rarity_key(ann, rarity_spec))
             ann_attrs = ann.get("attributes", {})
             for spec in self.aux_specs:
                 attrs[spec.name].append(_attr_label(spec, self._attr_id_maps, ann_attrs, cls))
@@ -320,19 +379,48 @@ class CocoInstanceSeg(Dataset):
             masks_tv = tv_tensors.Mask(torch.zeros((1, *image_tv.shape[1:]), dtype=torch.uint8))
             class_t = torch.zeros((1,), dtype=torch.long)
             attr_t = {s.name: torch.full((1,), -100, dtype=torch.long) for s in self.aux_specs}
+        return image_tv, masks_tv, class_t, attr_t, keys
+
+    def _sample_other(self) -> dict:
+        """A random raw sample, for the multi-image augmentations (mosaic / mixup / copy-paste)."""
+        j = int(torch.randint(0, len(self.ids), (1,)))
+        image_tv, masks_tv, class_t, attr_t, keys = self._load_raw(j)
+        return {"image": image_tv, "target": masks_tv, "labels": class_t, "attrs": attr_t, "weights": self._instance_weights(keys)}
+
+    def __getitem__(self, idx: int):
+        image_tv, masks_tv, class_t, attr_t, keys = self._load_raw(idx)
 
         # Apply augmentation; if a random crop removes every instance, retry a few
         # times, then fall back to a plain resize (no crop) that always preserves
         # them — only as a last resort emit a single empty placeholder instance.
         image_t = masks_t = keep = None
-        for _ in range(3):
-            image_t, masks_t = self.transform(image_tv, masks_tv)
-            keep = masks_t.flatten(1).sum(1) > 0
-            if keep.any():
-                break
-        else:
-            image_t, masks_t = self._fallback_transform(image_tv, masks_tv)
-            keep = masks_t.flatten(1).sum(1) > 0
+        if getattr(self.transform, "is_train_augment", False):
+            tf = self.transform
+            c = tf.cfg
+            weights = self._instance_weights(keys)
+            multi = c.mosaic_prob > 0 or c.mixup_prob > 0 or c.copy_paste_prob > 0
+            class_o, attr_o = class_t, attr_t
+            for _ in range(3):
+                image_t, masks_t, class_o, attr_o = tf(
+                    image_tv, masks_tv, class_t, attr_t, weights=weights, sampler=self._sample_other if multi else None
+                )
+                keep = masks_t.flatten(1).sum(1) >= c.min_mask_mass
+                if keep.any():
+                    break
+            else:
+                image_t, masks_t = self._fallback_transform(image_tv, masks_tv)
+                class_o, attr_o = class_t, attr_t
+                keep = masks_t.flatten(1).sum(1) > 0
+            class_t, attr_t = class_o, attr_o
+        else:  # a user-supplied ``(image, masks) -> (image, masks)`` transform
+            for _ in range(3):
+                image_t, masks_t = self.transform(image_tv, masks_tv)
+                keep = masks_t.flatten(1).sum(1) > 0
+                if keep.any():
+                    break
+            else:
+                image_t, masks_t = self._fallback_transform(image_tv, masks_tv)
+                keep = masks_t.flatten(1).sum(1) > 0
 
         masks_t, class_t = masks_t[keep], class_t[keep]
         attr_t = {k: v[keep] for k, v in attr_t.items()}
@@ -344,7 +432,7 @@ class CocoInstanceSeg(Dataset):
         return image_t, masks_t.float(), class_t, attr_t
 
 
-class CocoDetection(Dataset):
+class CocoDetection(_InstanceWeights, Dataset):
     """COCO object detection -> ``(pixel_values, boxes, class_labels, attrs)``.
 
     The detection counterpart to :class:`CocoInstanceSeg` for ``family="detect"``.
@@ -361,9 +449,10 @@ class CocoDetection(Dataset):
         imgsz: int = 644,
         *,
         transform=None,
-        flip_prob: float = 0.5,
-        min_scale: float = 0.1,
-        max_scale: float = 2.0,
+        flip_prob: float | None = None,
+        min_scale: float | None = None,
+        max_scale: float | None = None,
+        aug: AugConfig | dict | None = None,
         attributes: list[str] | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
     ):
@@ -371,6 +460,7 @@ class CocoDetection(Dataset):
 
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
+        self.aug = AugConfig.resolve(aug, flip_prob=flip_prob, min_scale=min_scale, max_scale=max_scale)
         self.coco = COCO(str(json_file))
         _merge_attribute_sidecar(self.coco, json_file)
         self.cat2contig, self.contig2cat, self.names, self.num_classes = (
@@ -390,9 +480,8 @@ class CocoDetection(Dataset):
             for i in self.coco.getImgIds()
             if len(self.coco.getAnnIds(imgIds=i, iscrowd=False)) > 0
         ]
-        self.transform = transform or build_train_transform(
-            imgsz, flip_prob=flip_prob, min_scale=min_scale, max_scale=max_scale
-        )
+        self._init_weights()
+        self.transform = transform or TrainAugment(imgsz, self.aug)
         self._fallback_transform = build_val_transform(imgsz)
 
     def __len__(self) -> int:
@@ -415,8 +504,9 @@ class CocoDetection(Dataset):
         img = Image.open(self.img_dir / info["file_name"]).convert("RGB")
 
         anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id, iscrowd=False))
-        boxes, classes = [], []
+        boxes, classes, keys = [], [], []
         attrs: dict[str, list[int]] = {s.name: [] for s in self.aux_specs}
+        rarity_spec = self._rarity[0] if self._rarity is not None else None
         for ann in anns:
             x, y, w, h = ann["bbox"]  # COCO xywh, absolute pixels
             if w <= 0 or h <= 0:
@@ -424,6 +514,8 @@ class CocoDetection(Dataset):
             boxes.append([x, y, x + w, y + h])  # xyxy
             cls = self.cat2contig[ann["category_id"]]
             classes.append(cls)
+            if self._rarity is not None:
+                keys.append(self._rarity_key(ann, rarity_spec))
             ann_attrs = ann.get("attributes", {})
             for spec in self.aux_specs:
                 attrs[spec.name].append(_attr_label(spec, self._attr_id_maps, ann_attrs, cls))
@@ -452,8 +544,13 @@ class CocoDetection(Dataset):
         # Apply augmentation; if a crop removes every box, retry, then fall back to a
         # plain resize that preserves them (mirrors CocoInstanceSeg).
         image_t = boxes_t = keep = None
+        built_in = getattr(self.transform, "is_train_augment", False)
+        weights = self._instance_weights(keys) if built_in else None
         for _ in range(3):
-            image_t, boxes_t = self.transform(image_tv, boxes_tv)
+            if built_in:
+                image_t, boxes_t = self.transform(image_tv, boxes_tv, weights=weights)
+            else:
+                image_t, boxes_t = self.transform(image_tv, boxes_tv)
             boxes_t = torch.as_tensor(boxes_t)
             keep = ((boxes_t[:, 2] - boxes_t[:, 0]) > 1) & ((boxes_t[:, 3] - boxes_t[:, 1]) > 1)
             if keep.any():

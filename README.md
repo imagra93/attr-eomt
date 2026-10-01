@@ -381,6 +381,62 @@ For the full training recipe, every `train()` knob, and int8 compression, see th
 
 ---
 
+## Augmentation
+
+Training augmentation is one config, [`AugConfig`](eomt/data/transforms.py), run by one pipeline
+(`TrainAugment`) for both model families. The defaults are a **strong general recipe**: the original
+EoMT/Mask2Former one (horizontal flip, Large-Scale Jitter 0.1–2.0, random crop, colour jitter) **plus** small
+rotation / shear / perspective, gamma, grayscale, Gaussian blur, sensor noise, JPEG recompression, glare and
+"safe" random erasing (a rectangle that never overlaps an instance). Masks are resized by area averaging (soft,
+mass-preserving), so thin objects are not shredded into dots by nearest-neighbour resampling.
+
+| group | knobs (default probability) |
+|---|---|
+| geometry | `flip_prob` 0.5 · `vflip_prob` 0 · `rot90_prob` 0 · LSJ `min_scale`/`max_scale` 0.1–2.0 · `rotate_prob` 0.3 (±10°) · `shear_prob` 0.2 (±5°) · `perspective_prob` 0.15 |
+| optics / sensor | colour jitter 1.0 · `gamma_prob` 0.3 · `grayscale_prob` 0.05 · `blur_prob` 0.2 · `noise_prob` 0.2 · `jpeg_prob` 0.3 · `glare_prob` 0.15 · `erasing_prob` 0.2 |
+| multi-image (instance family) | `mosaic_prob` 0 · `mixup_prob` 0 · `copy_paste_prob` 0 |
+| crop | `instance_crop_prob` 0 (instance-aware crop) · `instance_crop_empty_prob` 0 |
+| masks | `mask_resize="area"` (or `"nearest"`) |
+
+Override per run, per dataset, or from the CLI — precedence is explicit keywords (`flip_prob`, `min_scale`,
+`max_scale`) **>** `aug=` **>** the dataset YAML's `train_aug` block **>** defaults:
+
+```python
+model.train(data="coco", aug={"rotate_prob": 0.5, "blur_prob": 0})   # in code
+model.train(data="coco", aug={"preset": "legacy"})                    # the original recipe (hard masks, no extras)
+model.train(data="coco", train_transform=my_callable)                 # bring your own (image, masks) -> (image, masks)
+```
+
+```yaml
+# data.yaml — settings for THIS dataset
+train_aug:
+  min_scale: 0.6                  # thin / tiny objects: keep the effective scale r = imgsz/long_side * s in ~[0.4, 1.0]
+  max_scale: 1.6
+  instance_crop_prob: 0.8         # optional instance-aware crop: window placed around a (rarity-weighted) instance
+  instance_crop_rarity_attr: typology
+```
+
+```bash
+python scripts/train.py --data my/data.yaml --aug min_scale=0.6 --aug instance_crop_prob=0.8 --aug-preset default
+```
+
+Things worth knowing:
+
+- **Orientation.** Flips, 90° turns and rotations change the pixels but not the label. If an attribute encodes
+  orientation (e.g. a `viewpoint` head) set `flip_prob=0` and `rotate_prob=0`; `vflip_prob` / `rot90_prob` stay off
+  unless your scenes have no canonical "up".
+- **Thin or tiny objects.** Large-Scale Jitter at 0.1 shrinks a 5 px crack to under a pixel; keep the effective
+  scale within ~[0.4, 1.0] (`min_scale = 0.4·long_side/imgsz`, `max_scale = 1.0·long_side/imgsz`). The instance-aware
+  crop pays off when the crop is much smaller than the image (high zoom, small `imgsz`), and
+  `instance_crop_rarity_attr` makes rare attribute values the crop's focus more often.
+- **Multi-image ops** (`mosaic`, `mixup`, `copy_paste`) add instances from other samples and are *off*: they splice or
+  blend long thin structures, so try them deliberately and look at the result.
+- `args.yaml` of a run records the resolved `aug` dict; the log prints the active ops at start.
+- `build_train_transform(imgsz, aug=...)` returns the same pipeline for use in your own loaders
+  (`tf(image_uint8, masks) -> (image, masks)`).
+
+---
+
 ## Roadmap / future work
 
 - **Model export.** ONNX / TensorRT (and friends) for deployment — currently out of

@@ -9,9 +9,11 @@ from .coco import (
 )
 from .config import load_data_config
 from .download import ensure_coco
-from .transforms import build_train_transform, build_val_transform
+from .transforms import AugConfig, TrainAugment, build_train_transform, build_val_transform
 
 __all__ = [
+    "AugConfig",
+    "TrainAugment",
     "CocoDetection",
     "CocoInstanceSeg",
     "CocoValImages",

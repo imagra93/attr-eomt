@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import math
+import warnings
 from pathlib import Path
 
 import torch
@@ -28,7 +29,7 @@ from ..aux_cls import (
 )
 from ..config import normalize_loss_weights
 from ..data import CocoDetection, CocoInstanceSeg, CocoValImages, collate_train
-from ..data.transforms import build_val_transform
+from ..data.transforms import AugConfig, build_val_transform
 from ..ema import ModelEMA, _unwrap
 from ..model import DEFAULT_FPN_SCALES, build_model, load_dinov2_backbone
 from ..plotting import plot_aux_per_class, plot_metrics_csv
@@ -323,9 +324,11 @@ def train(
     tf32: bool = True,
     seed: int | None = None,
     pretrained: bool = True,
-    flip_prob: float = 0.5,
-    min_scale: float = 0.1,
-    max_scale: float = 2.0,
+    flip_prob: float | None = None,
+    min_scale: float | None = None,
+    max_scale: float | None = None,
+    aug: AugConfig | dict | None = None,
+    train_transform=None,
     letterbox: bool = True,
     project: str = "runs/train",
     name: str | None = None,
@@ -370,6 +373,14 @@ def train(
     original single-scale model. Resuming ignores this and keeps the checkpoint's
     architecture; warm-starting (``init_weights``) honors it, so fine-tuning a
     single-scale checkpoint into a multi-scale one is the default warm-start path.
+
+    **Augmentation.** ``aug`` is an :class:`~eomt.data.transforms.AugConfig` (or a plain mapping, e.g. the ``train_aug``
+    block of the dataset YAML) holding every augmentation knob; the defaults are a strong general recipe (flip,
+    large-scale jitter, small rotation / shear / perspective, gamma, grayscale, blur, noise, JPEG, glare and
+    "safe" erasing; mosaic / mixup / copy-paste and the instance-aware crop are off). ``flip_prob`` / ``min_scale``
+    / ``max_scale`` override it when given. ``aug={"preset": "legacy"}`` restores the original flip + LSJ + crop +
+    colour-jitter recipe with hard masks. ``train_transform`` replaces the whole built-in pipeline with your own
+    ``(image, masks) -> (image, masks)`` callable (``aug`` is then ignored for that dataset).
 
     ``freeze_backbone_epochs`` trains the task head only for the first N epochs
     (DINOv2 frozen), then unfreezes — the LP-FT recipe. With a from-scratch head
@@ -510,14 +521,24 @@ def train(
     # skipped by the warm-start loader below) while the ViT + heads load 1:1.
 
     # --- data ---
+    aug_cfg = AugConfig.resolve(aug, flip_prob=flip_prob, min_scale=min_scale, max_scale=max_scale)
+    active = aug_cfg.active()
+    if is_detect:
+        if aug_cfg.mosaic_prob or aug_cfg.mixup_prob or aug_cfg.copy_paste_prob:
+            warnings.warn("mosaic / mixup / copy-paste are instance-family augmentations; ignored for family='detect'.", stacklevel=2)
+        active = [a for a in active if a not in ("mosaic", "mixup", "copy_paste")]
+    if train_transform is not None:
+        print("[aug] using the custom train_transform; the `aug` settings are ignored")
+    else:
+        masks = "" if is_detect else f"; masks: {aug_cfg.mask_resize}"
+        print(f"[aug] active: {', '.join(active)}; LSJ {aug_cfg.min_scale}-{aug_cfg.max_scale}{masks}")
     Dataset = CocoDetection if is_detect else CocoInstanceSeg
     train_ds = Dataset(
         train_images,
         train_json,
         imgsz=imgsz,
-        flip_prob=flip_prob,
-        min_scale=min_scale,
-        max_scale=max_scale,
+        transform=train_transform,
+        aug=aug_cfg,
     )
     nc, names = train_ds.num_classes, train_ds.names
     aux_specs = train_ds.aux_specs
@@ -598,9 +619,10 @@ def train(
             "mask_anneal": mask_anneal,
             "mask_anneal_start": mask_anneal_start,
             "mask_anneal_end": mask_anneal_end,
-            "flip_prob": flip_prob,
-            "min_scale": min_scale,
-            "max_scale": max_scale,
+            "flip_prob": aug_cfg.flip_prob,
+            "min_scale": aug_cfg.min_scale,
+            "max_scale": aug_cfg.max_scale,
+            "aug": aug_cfg.to_dict() if train_transform is None else "custom train_transform",
             "letterbox": letterbox,
             "val_interval": val_interval,
             "conf_thres": conf_thres,

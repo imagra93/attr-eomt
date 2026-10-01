@@ -405,9 +405,11 @@ matched  = gather_matched(out, indices)                          <span class="c"
       <tr><td><code>nominal_batch</code> / <code>accum</code></td><td><code>16</code> / <code>0</code></td><td>gradient accumulation to an effective batch of <code>nominal_batch</code>; <code>accum=N</code> sets the step count explicitly</td></tr>
       <tr><td><code>ema</code> / <code>ema_decay</code> / <code>ema_tau</code></td><td><code>True</code> / <code>0.9999</code> / <code>2000</code></td><td>validate &amp; export <code>best.pt</code> from an EMA of the weights</td></tr>
       <tr><td><code>llrd</code></td><td><code>0.85</code></td><td>layer-wise LR decay on the DINOv2 backbone (<code>1.0</code> = flat <code>backbone_lr_mult</code>)</td></tr>
-      <tr><td><code>min_scale</code> / <code>max_scale</code></td><td><code>0.1</code> / <code>2.0</code></td><td>Large-Scale Jitter range</td></tr>
+      <tr><td><code>aug</code></td><td>strong recipe</td><td>every augmentation knob (<code>AugConfig</code>): flip, Large-Scale Jitter, rotate / shear / perspective, gamma, grayscale, blur, noise, JPEG, glare, safe erasing; mosaic / mixup / copy-paste and the instance-aware crop are off. A mapping, or a <code>train_aug</code> block in the dataset YAML; <code>{"preset": "legacy"}</code> restores the original recipe</td></tr>
+      <tr><td><code>min_scale</code> / <code>max_scale</code></td><td><code>0.1</code> / <code>2.0</code></td><td>Large-Scale Jitter range (explicit values beat <code>aug</code>)</td></tr>
       <tr><td><code>letterbox</code></td><td><code>True</code></td><td>aspect-preserving letterbox eval (vs legacy square stretch); recorded in the checkpoint</td></tr>
-      <tr><td><code>flip_prob</code></td><td><code>0.5</code></td><td>horizontal-flip probability</td></tr>
+      <tr><td><code>flip_prob</code></td><td><code>0.5</code></td><td>horizontal-flip probability (explicit values beat <code>aug</code>)</td></tr>
+      <tr><td><code>train_transform</code></td><td><code>None</code></td><td>your own <code>(image, masks) &rarr; (image, masks)</code> callable, replacing the built-in pipeline</td></tr>
       <tr><td><code>mask_anneal</code></td><td><code>True</code></td><td>anneal masked attention <code>1→0</code> over training</td></tr>
       <tr><td><code>aux_w</code></td><td><code>1.0</code></td><td>weight on the summed secondary-head loss</td></tr>
     </tbody>
@@ -415,7 +417,7 @@ matched  = gather_matched(out, indices)                          <span class="c"
 
   <div class="note" style="border-left-color:var(--warn)">
     <span class="ic" style="color:var(--warn)">⚑</span>
-    <p><strong>Orientation gotcha.</strong> If an attribute encodes orientation, train with <code>flip_prob=0</code> — a horizontal flip mirrors the pixels but <em>not</em> the label, silently corrupting it.</p>
+    <p><strong>Orientation gotcha.</strong> If an attribute encodes orientation, train with <code>flip_prob=0</code> — a horizontal flip mirrors the pixels but <em>not</em> the label, silently corrupting it. The same goes for <code>vflip_prob</code> / <code>rot90_prob</code> (off by default) and, to a lesser degree, the small rotations (<code>rotate_prob</code>).</p>
   </div>
 </section>
 
