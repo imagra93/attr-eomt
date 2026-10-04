@@ -431,6 +431,9 @@ Things worth knowing:
   `instance_crop_rarity_attr` makes rare attribute values the crop's focus more often.
 - **Multi-image ops** (`mosaic`, `mixup`, `copy_paste`) add instances from other samples and are *off*: they splice or
   blend long thin structures, so try them deliberately and look at the result.
+- **Negatives.** Images with no annotations are dropped from the train set by default. `train(keep_empty=True)` keeps
+  them as zero-target samples (masks `(0, imgsz, imgsz)`, every query is trained as "no object"); validation already
+  includes them. Instance family only.
 - `args.yaml` of a run records the resolved `aug` dict; the log prints the active ops at start.
 - `build_train_transform(imgsz, aug=...)` returns the same pipeline for use in your own loaders
   (`tf(image_uint8, masks) -> (image, masks)`).

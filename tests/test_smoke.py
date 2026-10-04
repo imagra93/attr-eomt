@@ -104,6 +104,32 @@ def test_aux_heads_train_and_infer():
     assert res["aux"]["color"]["probs"].shape[1] == 4
 
 
+def test_negatives_have_zero_targets_through_loss_and_aux_heads():
+    """Images with no instances (empty masks / labels) train every query as "no object"; no NaN, grads still flow."""
+    from eomt.aux_cls import aux_accuracy, aux_loss, gate_indices, match_queries
+    from eomt.config import AuxHeadSpec
+
+    torch.manual_seed(0)
+    model = build_model("s", nc=NC, imgsz=IMGSZ, aux_heads=[AuxHeadSpec("typ", 4)]).train()
+    x = torch.randn(2, 3, IMGSZ, IMGSZ)
+    empty_m, empty_c, empty_a = torch.zeros(0, IMGSZ, IMGSZ), torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.long)
+    one_m = (torch.rand(1, IMGSZ, IMGSZ) > 0.5).float()
+    for masks, classes, attrs in (
+        ([empty_m, empty_m], [empty_c, empty_c], [empty_a, empty_a]),                               # all-negative batch
+        ([empty_m, one_m], [empty_c, torch.tensor([2])], [empty_a, torch.tensor([1])]),             # mixed batch
+    ):
+        model.zero_grad()
+        out = model(x, mask_labels=masks, class_labels=classes)
+        idx = gate_indices(out, match_queries(model, out, masks, classes), masks, classes, iou_thr=0.0, require_class=False)
+        a_loss, _ = aux_loss(model, out, masks, classes, {"typ": attrs}, indices=idx)
+        total = out["loss"] + a_loss
+        assert torch.isfinite(total)
+        total.backward()
+        assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+        assert out["loss"].item() > 0  # the class CE still pushes every query towards "no object"
+        aux_accuracy(model, out, masks, classes, {"typ": attrs}, indices=idx)
+
+
 def test_aux_ignore_index():
     """Missing/OOV attributes (label -100) contribute no loss and are not counted."""
     from eomt.aux_cls import aux_accuracy, aux_loss

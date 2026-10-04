@@ -286,6 +286,10 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
     Augmentation: ``aug`` (an :class:`~eomt.data.transforms.AugConfig` or a mapping) holds every knob;
     ``flip_prob`` / ``min_scale`` / ``max_scale`` override it when given; ``transform`` replaces the built-in
     pipeline altogether.
+
+    ``keep_empty=True`` keeps the images with no annotations as **negatives**: they yield zero targets (``masks``
+    ``(0, imgsz, imgsz)``, empty ``class_t`` / attribute tensors), so every query is trained as "no object". The default
+    (``False``) drops them, as before.
     """
 
     def __init__(
@@ -299,6 +303,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
         min_scale: float | None = None,
         max_scale: float | None = None,
         aug: AugConfig | dict | None = None,
+        keep_empty: bool = False,
         attributes: list[str] | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
     ):
@@ -306,6 +311,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
 
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
+        self.keep_empty = keep_empty
         # One source of truth for the augmentation defaults (:class:`AugConfig`); the explicit keywords
         # (``flip_prob`` / ``min_scale`` / ``max_scale``) override ``aug`` when given.
         self.aug = AugConfig.resolve(aug, flip_prob=flip_prob, min_scale=min_scale, max_scale=max_scale)
@@ -330,7 +336,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
         self.ids = [
             i
             for i in self.coco.getImgIds()
-            if len(self.coco.getAnnIds(imgIds=i, iscrowd=False)) > 0
+            if keep_empty or len(self.coco.getAnnIds(imgIds=i, iscrowd=False)) > 0
         ]
         self._init_weights()
         # ``transform`` replaces the built-in pipeline (any ``(image, masks) -> (image, masks)`` callable, e.g. a
@@ -375,6 +381,10 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
             masks_tv = tv_tensors.Mask(torch.stack(masks))  # (N, H, W) uint8
             class_t = torch.tensor(classes, dtype=torch.long)
             attr_t = {k: torch.tensor(v, dtype=torch.long) for k, v in attrs.items()}
+        elif self.keep_empty:  # a negative image: genuinely zero targets
+            masks_tv = tv_tensors.Mask(torch.zeros((0, *image_tv.shape[1:]), dtype=torch.uint8))
+            class_t = torch.zeros((0,), dtype=torch.long)
+            attr_t = {s.name: torch.zeros((0,), dtype=torch.long) for s in self.aux_specs}
         else:  # should not happen (filtered), but stay safe
             masks_tv = tv_tensors.Mask(torch.zeros((1, *image_tv.shape[1:]), dtype=torch.uint8))
             class_t = torch.zeros((1,), dtype=torch.long)
@@ -389,6 +399,17 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
 
     def __getitem__(self, idx: int):
         image_tv, masks_tv, class_t, attr_t, keys = self._load_raw(idx)
+
+        if self.keep_empty and class_t.numel() == 0:  # negative: augment once, keep the empty target
+            if getattr(self.transform, "is_train_augment", False):
+                c = self.transform.cfg
+                multi = c.mosaic_prob > 0 or c.mixup_prob > 0 or c.copy_paste_prob > 0
+                image_t, masks_t, class_t, attr_t = self.transform(
+                    image_tv, masks_tv, class_t, attr_t, sampler=self._sample_other if multi else None
+                )
+            else:
+                image_t, masks_t = self.transform(image_tv, masks_tv)
+            return image_t, masks_t.float(), class_t, attr_t
 
         # Apply augmentation; if a random crop removes every instance, retry a few
         # times, then fall back to a plain resize (no crop) that always preserves

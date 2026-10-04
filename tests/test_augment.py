@@ -429,8 +429,9 @@ def test_copy_paste_occludes_existing_masks():
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _mini_coco(tmp_path, n_images=4, bbox_only=False):
-    """n tiny images, each with a wide and a thin instance of different 'typology'; returns (img_dir, json)."""
+def _mini_coco(tmp_path, n_images=4, bbox_only=False, n_negatives=0):
+    """n tiny images, each with a wide and a thin instance of different 'typology' (plus ``n_negatives`` images with
+    no annotations at all); returns (img_dir, json)."""
     img_dir = tmp_path / "images"
     img_dir.mkdir()
     anns, imgs, aid = [], [], 1
@@ -443,6 +444,9 @@ def _mini_coco(tmp_path, n_images=4, bbox_only=False):
                          "area": (x1 - x0) * (y1 - y0), "segmentation": [[x0, y0, x1, y0, x1, y1, x0, y1]],
                          "attributes": {"typology": typ}})
             aid += 1
+    for i in range(n_images + 1, n_images + n_negatives + 1):
+        Image.fromarray(rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)).save(img_dir / f"im{i}.png")
+        imgs.append({"id": i, "file_name": f"im{i}.png", "width": 160, "height": 120})
     coco = {"images": imgs, "categories": [{"id": 1, "name": "damage"}], "annotations": anns,
             "attributes": [{"name": "typology", "categories": [{"id": 0, "name": "blob"}, {"id": 1, "name": "line"}]}]}
     jf = tmp_path / "instances_train.json"
@@ -463,6 +467,46 @@ def test_dataset_defaults_are_the_same_as_the_trainers(tmp_path):
     sig = inspect.signature(train).parameters
     assert sig["flip_prob"].default is None and sig["min_scale"].default is None and sig["max_scale"].default is None
     assert "aug" in sig and "train_transform" in sig
+
+
+def test_keep_empty_keeps_negatives_as_zero_target_samples(tmp_path):
+    img_dir, jf = _mini_coco(tmp_path, n_images=4, n_negatives=3)
+    assert len(CocoInstanceSeg(img_dir, jf, imgsz=112)) == 4  # default: images without annotations are dropped
+    aug = {"rotate_prob": 1.0, "shear_prob": 1.0, "perspective_prob": 1.0, "erasing_prob": 1.0,
+           "instance_crop_prob": 1.0, "instance_crop_empty_prob": 0.5, "instance_crop_rarity_attr": "typology"}
+    custom = lambda image, masks: build_val_transform(112)(image, masks)  # noqa: E731
+    for ds in (CocoInstanceSeg(img_dir, jf, imgsz=112, aug=aug, keep_empty=True),
+               CocoInstanceSeg(img_dir, jf, imgsz=112, transform=custom, keep_empty=True)):
+        assert len(ds) == 7
+        torch.manual_seed(0)
+        for _ in range(5):
+            for i in range(len(ds)):
+                x, m, c, a = ds[i]
+                assert x.shape == (3, 112, 112) and m.dtype == torch.float32
+                if i < 4:  # positives are untouched by the option
+                    assert m.shape[0] == c.shape[0] == a["typology"].shape[0] >= 1
+                else:      # negatives: genuinely zero targets, not a fabricated placeholder instance
+                    assert m.shape == (0, 112, 112) and c.shape == (0,) and a["typology"].shape == (0,)
+                    assert c.dtype == torch.long and a["typology"].dtype == torch.long
+
+
+def test_collate_and_train_handle_negatives(tmp_path):
+    from eomt.data import collate_train
+
+    img_dir, jf = _mini_coco(tmp_path, n_images=2, n_negatives=6)
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=112, keep_empty=True)
+    px, masks, classes, aux = collate_train([ds[2], ds[3]])  # an all-negative batch
+    assert px.shape == (2, 3, 112, 112) and [m.shape[0] for m in masks] == [0, 0] and aux["typology"][0].numel() == 0
+    # the real trainer: batch 2 over 2 positives + 6 negatives (so all-negative micro-batches occur), with the aux head
+    from eomt.engine.train import train
+
+    res = train(train_images=str(img_dir), train_json=str(jf), size="s", imgsz=112, epochs=1, batch=2, accum=1, workers=0,
+                device="cpu", amp=False, pretrained=False, ema=False, seed=0, keep_empty=True, project=str(tmp_path / "runs"), name="neg")
+    args = yaml.safe_load((tmp_path / "runs" / "neg" / "args.yaml").read_text())
+    assert args["keep_empty"] is True and res["last"].endswith("last.pt")
+    with pytest.raises(ValueError, match="keep_empty"):
+        train(train_images=str(img_dir), train_json=str(jf), size="s", family="detect", imgsz=112, epochs=1, batch=2, workers=0,
+              device="cpu", amp=False, pretrained=False, keep_empty=True, project=str(tmp_path / "runs"), name="det")
 
 
 def test_dataset_items_are_valid_with_the_default_pipeline(tmp_path):

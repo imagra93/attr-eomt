@@ -329,6 +329,7 @@ def train(
     max_scale: float | None = None,
     aug: AugConfig | dict | None = None,
     train_transform=None,
+    keep_empty: bool = False,
     letterbox: bool = True,
     project: str = "runs/train",
     name: str | None = None,
@@ -381,6 +382,8 @@ def train(
     / ``max_scale`` override it when given. ``aug={"preset": "legacy"}`` restores the original flip + LSJ + crop +
     colour-jitter recipe with hard masks. ``train_transform`` replaces the whole built-in pipeline with your own
     ``(image, masks) -> (image, masks)`` callable (``aug`` is then ignored for that dataset).
+    ``keep_empty=True`` trains on the images that have no annotations too (negatives: zero targets, every query is
+    pushed to "no object"); by default they are dropped. Instance family only.
 
     ``freeze_backbone_epochs`` trains the task head only for the first N epochs
     (DINOv2 frozen), then unfreezes — the LP-FT recipe. With a from-scratch head
@@ -533,16 +536,20 @@ def train(
         masks = "" if is_detect else f"; masks: {aug_cfg.mask_resize}"
         print(f"[aug] active: {', '.join(active)}; LSJ {aug_cfg.min_scale}-{aug_cfg.max_scale}{masks}")
     Dataset = CocoDetection if is_detect else CocoInstanceSeg
+    if keep_empty and is_detect:
+        raise ValueError("keep_empty=True is only supported for family='instance'.")
     train_ds = Dataset(
         train_images,
         train_json,
         imgsz=imgsz,
         transform=train_transform,
         aug=aug_cfg,
+        **({"keep_empty": True} if keep_empty else {}),
     )
     nc, names = train_ds.num_classes, train_ds.names
     aux_specs = train_ds.aux_specs
-    print(f"[data] train: {len(train_ds)} images, {nc} classes")
+    n_neg = sum(1 for i in train_ds.ids if not train_ds.coco.getAnnIds(imgIds=i, iscrowd=False)) if keep_empty else 0
+    print(f"[data] train: {len(train_ds)} images, {nc} classes" + (f" (incl. {n_neg} negatives)" if keep_empty else ""))
     if aux_specs:
         cov = _aux_coverage(train_ds)
         print(
@@ -623,6 +630,7 @@ def train(
             "min_scale": aug_cfg.min_scale,
             "max_scale": aug_cfg.max_scale,
             "aug": aug_cfg.to_dict() if train_transform is None else "custom train_transform",
+            "keep_empty": keep_empty,
             "letterbox": letterbox,
             "val_interval": val_interval,
             "conf_thres": conf_thres,
