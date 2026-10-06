@@ -56,6 +56,9 @@ def main() -> None:
         help="B1 multi-scale SimpleFPN scales relative to the native grid (default "
              "'2,1,0.5', on by default). Pass 'none'/'off' for the single-scale model.",
     )
+    p.add_argument("--box-head", action="store_true", help="Auxiliary box head: L1 + GIoU loss and a box term in the matcher.")
+    p.add_argument("--no-deep-supervision", action="store_true", help="Stop supervising a query block once its masked attention is annealed away (it stays supervised while it masks).")
+    p.add_argument("--upscale-blocks", type=int, default=None, help="Mask-head upscale blocks (2 = 184x184 logits at 644 px, 3 = 368x368).")
     p.add_argument(
         "--aug", action="append", default=[], metavar="KEY=VALUE",
         help="Augmentation override (repeatable), e.g. --aug rotate_prob=0.5 --aug 'blur_sigma=[0.3,1.0]'. "
@@ -83,6 +86,9 @@ def main() -> None:
         name=args.name,
         resume=bool(args.resume),
         fpn_scales=fpn_scales,
+        box_head=args.box_head,
+        deep_supervision=not args.no_deep_supervision,
+        num_upscale_blocks=args.upscale_blocks,
         aug=_parse_aug(args.aug, args.aug_preset),
     )
     if result["best_metric"] >= 0:

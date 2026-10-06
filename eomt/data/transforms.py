@@ -74,7 +74,7 @@ class AugConfig:
     **Geometry**
 
     * ``flip_prob`` / ``vflip_prob`` / ``rot90_prob`` — horizontal flip, vertical flip, random 90° turns.
-      Vertical flips and 90° turns are *off*: sky/hood/windscreen orientation usually carries information, and any
+      Vertical flips and 90° turns are *off*: sky/ground orientation usually carries information, and any
       flip/rotation silently corrupts attributes that encode orientation.
     * ``min_scale`` / ``max_scale`` — Large-Scale Jitter: the image is resized aspect-preservingly so its long side
       is ``imgsz × s`` with ``s ~ U(min_scale, max_scale)``. The effective scale relative to the original photo is
@@ -110,7 +110,7 @@ class AugConfig:
       when it fits) instead of at random. ``instance_crop_empty_prob`` — probability of searching an instance-free
       window instead (a hard-negative crop; only possible when the crop is much smaller than the image).
       ``instance_crop_rarity_power`` weights the focus choice by ``1/freq**power`` of the instance's class or of the
-      attribute named by ``instance_crop_rarity_attr`` (e.g. ``"typology"``); ``instance_crop_visibility_px`` raises
+      attribute named by ``instance_crop_rarity_attr`` (e.g. ``"material"``); ``instance_crop_visibility_px`` raises
       the scale so the focus instance's band is at least this wide at the model input (``0`` = off).
 
     **Masks**

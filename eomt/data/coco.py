@@ -235,7 +235,7 @@ class _InstanceWeights:
     """Per-instance sampling weights for the instance-aware crop: ``freq(key) ** -power``.
 
     ``key`` is the instance's primary class, or its value of the attribute named by
-    ``aug.instance_crop_rarity_attr`` (e.g. ``"typology"``), so rare kinds are chosen as the crop's focus more often.
+    ``aug.instance_crop_rarity_attr`` (e.g. ``"material"``), so rare kinds are chosen as the crop's focus more often.
     Only built when the instance-aware crop is enabled (``instance_crop_prob`` / ``instance_crop_empty_prob`` > 0).
     """
 

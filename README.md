@@ -379,6 +379,62 @@ EoMT("runs/train/eomt-l").predict("images/", plot=True)   # writes annotated ima
 For the full training recipe, every `train()` knob, and int8 compression, see the
 **[annotated explainer →](https://imagra93.github.io/attr-eomt)** — it's the deep dive.
 
+### Optimisation recipe
+
+`train()` follows the reference EoMT recipe (checked numerically against the official code: every parameter group's
+LR, every step of the LR schedule, and the masked-attention annealing agree exactly):
+
+| | default |
+|---|---|
+| optimizer | AdamW, `lr0=1e-4`, `weight_decay=0.05` (not applied to norms, biases and embeddings) |
+| head LR | `lr0` |
+| encoder LR | layer-wise decay `llrd=0.8`, `backbone_lr_mult=1.0`: the **top ViT block is at the full `lr0`** and each block below is 0.8× the one above; embeddings follow the first block, the final norm is at `lr0` |
+| schedule | polynomial decay (`poly_power=0.9`) to 0 after a two-stage warmup in optimizer steps `warmup_steps=(500, 1000)`: the head warms up while the ViT LR is held at 0, then the ViT ramps up |
+| masked attention | annealed block by block (`mask_anneal_start/end`, fractions of training: 1/6–2/6, 2/6–3/6, 3/6–4/6, 4/6–5/6, polynomial); the last sixth of training is mask-free |
+
+In EoMT the last four transformer blocks are the ones that process the queries and predict the masks, so they must learn at
+close to the head's speed: scaling the whole encoder by 0.1 (as detector-style recipes do for a backbone) starves them. The
+LR decay and the annealing span `epochs`, and validation runs mask-free, so metrics logged early in a long run understate
+the model. The official COCO recipe trains for 12 epochs (about 89k optimizer steps at batch 16).
+
+### Architecture options
+
+All are keyword arguments of `train()` (and flags of `scripts/train.py`); checkpoints record them, so `EoMT(path)` rebuilds
+the model with the same modules, and checkpoints without them load as before.
+
+| option | what it does | cost, ViT-L at 644 px, batch 2, bf16 (measured, relative to the default) |
+|---|---|---|
+| `fpn_scales=None` | drop the multi-scale FPN (default `(2, 1, 0.5)`) | +12 % throughput, −0.5 GB |
+| `box_head=True` | auxiliary box head: L1 + GIoU loss on the matched queries, and the same terms in the matching cost (a localisation signal that does not depend on the mask grid). Predicted boxes are returned as `aux_boxes` / `head_boxes` | −7 % |
+| `deep_supervision=False` | stop supervising a query block's prediction once that block's masked attention is annealed away (while it masks, the prediction builds its attention mask and stays supervised: unsupervised, it made noise masks). Blocks drop out at 2/6, 3/6, 4/6, 5/6 of training | none while blocks mask; +26 % per step once all are annealed (last sixth) |
+| `num_upscale_blocks=3` | 368² mask logits at 644 px (small masks); the block predictions stay at 184² (they only build 46² attention masks), only the output is 368²; cannot warm-start a 2-block checkpoint | −17 % (10.1 vs 12.1 img/s), 22.2 GB |
+| `stop_after_epochs=N` | stop after N epochs while the LR schedule and mask annealing still span `epochs` (truncated A/B runs) | |
+
+Always on (training-side; inference of existing checkpoints is unchanged):
+
+- **Masked attention keeps small objects in view.** A query may attend to every patch its predicted mask touches (max-pool of
+  the mask logits onto the patch grid), and a query whose mask touches no patch attends to all of them, as in Mask2Former. The
+  reference EoMT downsamples bilinearly (only the centre of each patch counts) and leaves an empty-mask query blind, which in
+  practice blinded the queries of most objects smaller than a patch during the masked phase. The mask is a boolean
+  `[B, 1, N, N]` and is not built in a block whose annealing probability has reached 0.
+- **Mask terms that see small objects.** Matching scores every query on every cell of the mask-logit grid against the GT
+  area-averaged onto it, instead of on 12,544 random points (one per ~33 px² at 644 px, so an object of a few dozen pixels often
+  got no point and its assigned query changed from step to step). The mask loss keeps the reference's BCE on 12,544 points
+  concentrated where the prediction is uncertain (the boundaries), and computes dice on every GT pixel against the upsampled
+  logits, so every instance is supervised however small. A fully dense loss gave coarser masks (AP75 down) on thin objects;
+  dropping the points altogether lost the boundaries. The `train_num_points` / `oversample_ratio` / `importance_sample_ratio`
+  settings are gone (fixed at the reference values; checkpoints that carry them still load).
+- **Attribute IoU gate at full resolution.** The gate that decides which matched queries train the attribute heads compares the
+  upsampled prediction with the GT, instead of shrinking the GT to the logit grid with "nearest" (which erased many objects of a
+  few pixels, so they never trained the attribute heads).
+
+Inference: `predict_image(..., amp=True)` (and `predict(..., amp=True)`) runs the network under bf16 autocast, ~2.5x faster at 644 px
+on an RTX 5090 with the same accuracy on a trained ViT-L model (AP within 0.002 in every size bucket). Off by default.
+
+**What is not established:** the accuracy effect of `box_head`, `deep_supervision=False`, dropping the
+FPN and the always-on changes above depends on the data. Measure it with truncated runs (`stop_after_epochs`), which follow the schedule of a full run, against a reference run at equal
+epochs.
+
 ---
 
 ## Augmentation
@@ -413,7 +469,7 @@ train_aug:
   min_scale: 0.6                  # thin / tiny objects: keep the effective scale r = imgsz/long_side * s in ~[0.4, 1.0]
   max_scale: 1.6
   instance_crop_prob: 0.8         # optional instance-aware crop: window placed around a (rarity-weighted) instance
-  instance_crop_rarity_attr: typology
+  instance_crop_rarity_attr: material
 ```
 
 ```bash

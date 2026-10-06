@@ -1,21 +1,23 @@
-"""Pure-PyTorch EoMT loss: Hungarian matcher + point-sampled mask/dice + class CE.
+"""Pure-PyTorch EoMT loss: Hungarian matcher + mask BCE/dice + class CE.
 
-A faithful reimplementation of ``transformers.models.eomt.modeling_eomt``'s loss
-stack (``EomtHungarianMatcher`` / ``EomtLoss`` and the PointRend helpers), with no
-dependency on the transformers *model code* — only ``scipy`` (already a project
-dep) and ``torch``. Numerics match the upstream loss; the only intentional
-deviations are:
+A reimplementation of ``transformers.models.eomt.modeling_eomt``'s loss stack (``EomtHungarianMatcher`` /
+``EomtLoss``) with no dependency on the transformers *model code* — only ``scipy`` (already a project dep) and
+``torch``. Deliberate deviations:
 
-* ``sample_point`` casts the sampling grid to the feature dtype, so CUDA+AMP
-  training works without the external monkeypatch (``grid_sample`` requires the
-  grid and input to share a dtype).
-* ``get_num_masks`` drops the ``accelerate`` all-reduce branch — training here is
-  single-process (no ``PartialState`` is initialised). Re-add a reduce if DDP is
-  introduced.
+* **Mask terms.** Matching is dense and deterministic: every query is scored on every cell of the mask-logit grid
+  against the GT area-averaged onto it (:func:`grid_targets`). The reference scores 12,544 random points instead, one
+  per ~33 px^2 at a 644 px input, so an instance of a few dozen pixels often got no point and its assigned query changed
+  from one draw to the next. The mask loss of the matched queries has two parts with different jobs: dice on every GT
+  pixel against the logits bilinearly upsampled to the GT resolution (:func:`upsample_logits`, as inference reads
+  them), so every instance is supervised however small; and the reference's BCE on 12,544 points, three quarters of
+  them where the prediction is least certain (:func:`uncertain_points`), which concentrates it on the boundaries. A
+  dense BCE spread that weight over every pixel and gave coarser masks (AP75 halved on thin structures).
+* ``get_num_masks`` drops the ``accelerate`` all-reduce branch — training here is single-process (no
+  ``PartialState`` is initialised). Re-add a reduce if DDP is introduced.
 
 The matcher is exposed as ``EoMTLoss.matcher`` with the exact
-``(masks_queries_logits, class_queries_logits, mask_labels, class_labels)`` ->
-list-of-(src, tgt) signature that :func:`eomt.aux_cls.match_queries` calls.
+``(masks_queries_logits, class_queries_logits, mask_labels, class_labels)`` -> list-of-(src, tgt) signature that
+:func:`eomt.aux_cls.match_queries` calls.
 """
 
 from __future__ import annotations
@@ -26,20 +28,42 @@ import torch.nn.functional as F  # noqa: N812
 from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 
+from .box_loss import box_cxcywh_to_xyxy, generalized_box_iou, masks_to_norm_boxes
 
-def sample_point(
-    input_features: torch.Tensor, point_coordinates: torch.Tensor, add_dim: bool = False, **kwargs
-) -> torch.Tensor:
-    """``grid_sample`` wrapper supporting 3D point coords; AMP-safe (casts grid dtype)."""
-    if point_coordinates.dim() == 3:
-        add_dim = True
-        point_coordinates = point_coordinates.unsqueeze(2)
-    if point_coordinates.dtype != input_features.dtype:
-        point_coordinates = point_coordinates.to(input_features.dtype)
-    point_features = F.grid_sample(input_features, 2.0 * point_coordinates - 1.0, **kwargs)
-    if add_dim:
-        point_features = point_features.squeeze(3)
-    return point_features
+
+def upsample_logits(logits: Tensor, size) -> Tensor:
+    """Mask logits ``(N, h, w)`` bilinearly upsampled to the GT resolution ``size``, as inference reads them."""
+    if tuple(logits.shape[-2:]) == tuple(size):
+        return logits
+    return F.interpolate(logits[:, None], size=tuple(size), mode="bilinear", align_corners=False)[:, 0]
+
+
+def sample_point(features: Tensor, coords: Tensor) -> Tensor:
+    """Bilinear samples of ``features`` ``(N, C, H, W)`` at ``coords`` ``(N, P, 2)`` in [0, 1] -> ``(N, C, P)``."""
+    return F.grid_sample(features, 2.0 * coords[:, :, None].to(features.dtype) - 1.0, align_corners=False)[..., 0]
+
+
+@torch.no_grad()
+def uncertain_points(logits: Tensor, num_points: int = 12544, oversample: float = 3.0, importance: float = 0.75) -> Tensor:
+    """PointRend importance sampling: ``importance`` of the points where ``|logit|`` is smallest among ``oversample`` x
+    as many random candidates, the rest uniform. ``logits`` ``(N, 1, h, w)`` -> coords ``(N, num_points, 2)``."""
+    n = logits.shape[0]
+    cand = torch.rand(n, int(num_points * oversample), 2, device=logits.device)
+    k = int(importance * num_points)
+    idx = (-sample_point(logits, cand)[:, 0].abs()).topk(k, dim=1).indices
+    picked = torch.gather(cand, 1, idx[..., None].expand(-1, -1, 2))
+    return torch.cat([picked, torch.rand(n, num_points - k, 2, device=logits.device)], dim=1)
+
+
+def grid_targets(masks: Tensor, size) -> Tensor:
+    """GT masks ``(N, H, W)`` area-averaged onto the ``size`` mask-logit grid: the share of each cell an instance covers.
+
+    Every instance keeps its whole mass however small (a 15 px chip at a 644 px input is ~1.2 cells of a 184 x 184 grid).
+    """
+    size = tuple(size)
+    if masks.shape[0] == 0:
+        return masks.new_zeros((0, *size), dtype=torch.float32)
+    return F.interpolate(masks[:, None].float(), size=size, mode="area")[:, 0]
 
 
 def pair_wise_dice_loss(inputs: Tensor, labels: Tensor) -> Tensor:
@@ -74,15 +98,22 @@ def sigmoid_cross_entropy_loss(inputs: Tensor, labels: Tensor, num_masks: int) -
 
 
 class HungarianMatcher(nn.Module):
-    """1-to-1 assignment between queries and GT masks via class + mask + dice cost."""
+    """1-to-1 assignment between queries and GT masks via class + mask + dice cost (dense, on the logit grid).
+
+    ponytail: an instance smaller than a grid cell has a near-flat mask cost on the grid, so its class cost picks its
+    query. Scoring the masks at the GT resolution fixes that but nearly doubles the step (all queries x every pixel).
+    """
 
     def __init__(
-        self, cost_class: float = 1.0, cost_mask: float = 1.0, cost_dice: float = 1.0, num_points: int = 12544
+        self, cost_class: float = 1.0, cost_mask: float = 1.0, cost_dice: float = 1.0,
+        cost_bbox: float = 0.0, cost_giou: float = 0.0,
     ):
         super().__init__()
         if cost_class == 0 and cost_mask == 0 and cost_dice == 0:
             raise ValueError("All costs can't be 0")
-        self.num_points = num_points
+        # Optional box terms (L1 + GIoU on normalized cxcywh): 0 = the original mask-only matcher.
+        self.cost_bbox = cost_bbox
+        self.cost_giou = cost_giou
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
@@ -94,27 +125,33 @@ class HungarianMatcher(nn.Module):
         class_queries_logits: Tensor,
         mask_labels: list[Tensor],
         class_labels: list[Tensor],
+        pred_boxes: Tensor | None = None,
+        box_labels: list[Tensor] | None = None,
     ) -> list[tuple[Tensor, Tensor]]:
+        """``pred_boxes`` ``(B, Q, 4)`` (normalized cxcywh) adds an L1 + GIoU term to the cost; the GT boxes are
+        ``box_labels`` or, when omitted, the tight boxes of ``mask_labels``."""
         indices: list[tuple[np.ndarray, np.ndarray]] = []
         batch_size = masks_queries_logits.shape[0]
+        grid = masks_queries_logits.shape[-2:]
         for i in range(batch_size):
             pred_probs = class_queries_logits[i].softmax(-1)
-            pred_mask = masks_queries_logits[i]
-
             cost_class = -pred_probs[:, class_labels[i]]
-            target_mask = mask_labels[i].to(pred_mask)
-            target_mask = target_mask[:, None]
-            pred_mask = pred_mask[:, None]
-
-            point_coordinates = torch.rand(1, self.num_points, 2, device=pred_mask.device)
-            target_coordinates = point_coordinates.repeat(target_mask.shape[0], 1, 1)
-            target_mask = sample_point(target_mask, target_coordinates, align_corners=False).squeeze(1)
-            pred_coordinates = point_coordinates.repeat(pred_mask.shape[0], 1, 1)
-            pred_mask = sample_point(pred_mask, pred_coordinates, align_corners=False).squeeze(1)
+            pred_mask = masks_queries_logits[i].flatten(1).float()  # [Q, cells]
+            target_mask = grid_targets(mask_labels[i], grid).flatten(1).to(pred_mask)  # [G, cells]
 
             cost_mask = pair_wise_sigmoid_cross_entropy_loss(pred_mask, target_mask)
             cost_dice = pair_wise_dice_loss(pred_mask, target_mask)
             cost_matrix = self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice
+            if pred_boxes is not None and (self.cost_bbox or self.cost_giou) and mask_labels[i].shape[0] > 0:
+                tgt_boxes = (box_labels[i] if box_labels is not None else masks_to_norm_boxes(mask_labels[i])).to(
+                    device=pred_boxes.device, dtype=torch.float32
+                )
+                out_boxes = pred_boxes[i].float()
+                cost_matrix = (
+                    cost_matrix
+                    + self.cost_bbox * torch.cdist(out_boxes, tgt_boxes, p=1)
+                    - self.cost_giou * generalized_box_iou(box_cxcywh_to_xyxy(out_boxes), box_cxcywh_to_xyxy(tgt_boxes))
+                )
             cost_matrix = torch.minimum(cost_matrix, torch.tensor(1e10))
             cost_matrix = torch.maximum(cost_matrix, torch.tensor(-1e10))
             cost_matrix = torch.nan_to_num(cost_matrix, 0)
@@ -127,7 +164,7 @@ class HungarianMatcher(nn.Module):
 
 
 class EoMTLoss(nn.Module):
-    """EoMT mask-classification loss (class CE + point-sampled mask BCE + dice)."""
+    """EoMT mask-classification loss (class CE + mask BCE + dice on the logit grid)."""
 
     def __init__(self, config, weight_dict: dict[str, float]):
         super().__init__()
@@ -139,35 +176,19 @@ class EoMTLoss(nn.Module):
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
 
-        self.num_points = config.train_num_points
-        self.oversample_ratio = config.oversample_ratio
-        self.importance_sample_ratio = config.importance_sample_ratio
+        # Auxiliary box head (instance family): L1 + GIoU on the matched queries, and the same two terms in
+        # the matching cost. Off unless ``config.aux_box_head`` is set.
+        self.use_boxes = bool(getattr(config, "aux_box_head", False))
+        self.l1_weight = float(getattr(config, "l1_weight", 5.0)) if self.use_boxes else 0.0
+        self.giou_weight = float(getattr(config, "giou_weight", 2.0)) if self.use_boxes else 0.0
 
         self.matcher = HungarianMatcher(
             cost_class=config.class_weight,
             cost_dice=config.dice_weight,
             cost_mask=config.mask_weight,
-            num_points=self.num_points,
+            cost_bbox=self.l1_weight,
+            cost_giou=self.giou_weight,
         )
-
-    def _max_by_axis(self, sizes: list[list[int]]) -> list[int]:
-        maxes = sizes[0]
-        for sublist in sizes[1:]:
-            for index, item in enumerate(sublist):
-                maxes[index] = max(maxes[index], item)
-        return maxes
-
-    def _pad_images_to_max_in_batch(self, tensors: list[Tensor]) -> tuple[Tensor, Tensor]:
-        max_size = self._max_by_axis([list(t.shape) for t in tensors])
-        batch_shape = [len(tensors)] + max_size
-        batch_size, _, height, width = batch_shape
-        dtype, device = tensors[0].dtype, tensors[0].device
-        padded = torch.zeros(batch_shape, dtype=dtype, device=device)
-        padding_masks = torch.ones((batch_size, height, width), dtype=torch.bool, device=device)
-        for tensor, pad, pmask in zip(tensors, padded, padding_masks):
-            pad[: tensor.shape[0], : tensor.shape[1], : tensor.shape[2]].copy_(tensor)
-            pmask[: tensor.shape[1], : tensor.shape[2]] = False
-        return padded, padding_masks
 
     def loss_labels(self, class_queries_logits, class_labels, indices) -> dict[str, Tensor]:
         pred_logits = class_queries_logits
@@ -183,70 +204,43 @@ class EoMTLoss(nn.Module):
         return {"loss_cross_entropy": loss_ce}
 
     def loss_masks(self, masks_queries_logits, mask_labels, indices, num_masks) -> dict[str, Tensor]:
+        """Mask loss of the matched queries: dice on every GT pixel (see :func:`upsample_logits`), so every instance is
+        supervised however small; BCE on 12,544 points, three quarters of them where the prediction is least certain
+        (:func:`uncertain_points`), which concentrates it on the boundaries."""
+        targets = [t[j.to(t.device)] for t, (_, j) in zip(mask_labels, indices) if len(j)]
+        if not targets:  # no matched query this batch: keep the graph alive
+            zero = masks_queries_logits.sum() * 0.0
+            return {"loss_mask": zero, "loss_dice": zero}
         src_idx = self._get_predictions_permutation_indices(indices)
-        tgt_idx = self._get_targets_permutation_indices(indices)
-        pred_masks = masks_queries_logits[src_idx]
-        target_masks, _ = self._pad_images_to_max_in_batch(mask_labels)
-        target_masks = target_masks[tgt_idx]
-
-        pred_masks = pred_masks[:, None]
-        target_masks = target_masks[:, None]
-
-        with torch.no_grad():
-            point_coordinates = self.sample_points_using_uncertainty(
-                pred_masks,
-                lambda logits: self.calculate_uncertainty(logits),
-                self.num_points,
-                self.oversample_ratio,
-                self.importance_sample_ratio,
-            )
-            point_labels = sample_point(target_masks, point_coordinates, align_corners=False).squeeze(1)
-
-        point_logits = sample_point(pred_masks, point_coordinates, align_corners=False).squeeze(1)
-
-        losses = {
+        target_masks = torch.cat(targets).float()
+        logits = masks_queries_logits[src_idx].float()
+        pred_masks = upsample_logits(logits, target_masks.shape[-2:]).flatten(1)
+        coords = uncertain_points(logits[:, None])
+        point_labels = sample_point(target_masks[:, None], coords)[:, 0]
+        point_logits = sample_point(logits[:, None], coords)[:, 0]
+        return {
             "loss_mask": sigmoid_cross_entropy_loss(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss(point_logits, point_labels, num_masks),
+            "loss_dice": dice_loss(pred_masks, target_masks.flatten(1).to(pred_masks), num_masks),
         }
-        del pred_masks, target_masks
-        return losses
+
+    def loss_boxes(self, pred_boxes, box_labels, indices, num_boxes) -> dict[str, Tensor]:
+        """Box L1 + GIoU on the matched queries (normalized cxcywh)."""
+        idx = self._get_predictions_permutation_indices(indices)
+        src = pred_boxes[idx].float()
+        tgt = torch.cat([t[j.to(t.device)] for t, (_, j) in zip(box_labels, indices)]).to(src)
+        if src.numel() == 0:  # no matched query this batch: keep the graph alive
+            zero = pred_boxes.sum() * 0.0
+            return {"loss_bbox": zero, "loss_giou": zero}
+        giou = generalized_box_iou(box_cxcywh_to_xyxy(src), box_cxcywh_to_xyxy(tgt)).diagonal()
+        return {
+            "loss_bbox": F.l1_loss(src, tgt, reduction="sum") / num_boxes,
+            "loss_giou": (1 - giou).sum() / num_boxes,
+        }
 
     def _get_predictions_permutation_indices(self, indices):
         batch_indices = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         predictions_indices = torch.cat([src for (src, _) in indices])
         return batch_indices, predictions_indices
-
-    def _get_targets_permutation_indices(self, indices):
-        batch_indices = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
-        target_indices = torch.cat([tgt for (_, tgt) in indices])
-        return batch_indices, target_indices
-
-    def calculate_uncertainty(self, logits: Tensor) -> Tensor:
-        return -(torch.abs(logits))
-
-    def sample_points_using_uncertainty(
-        self, logits, uncertainty_function, num_points, oversample_ratio, importance_sample_ratio
-    ) -> Tensor:
-        num_boxes = logits.shape[0]
-        num_points_sampled = int(num_points * oversample_ratio)
-        point_coordinates = torch.rand(num_boxes, num_points_sampled, 2, device=logits.device)
-        point_logits = sample_point(logits, point_coordinates, align_corners=False)
-        point_uncertainties = uncertainty_function(point_logits)
-
-        num_uncertain_points = int(importance_sample_ratio * num_points)
-        num_random_points = num_points - num_uncertain_points
-
-        idx = torch.topk(point_uncertainties[:, 0, :], k=num_uncertain_points, dim=1)[1]
-        shift = num_points_sampled * torch.arange(num_boxes, dtype=torch.long, device=logits.device)
-        idx += shift[:, None]
-        point_coordinates = point_coordinates.view(-1, 2)[idx.view(-1), :].view(
-            num_boxes, num_uncertain_points, 2
-        )
-        if num_random_points > 0:
-            point_coordinates = torch.cat(
-                [point_coordinates, torch.rand(num_boxes, num_random_points, 2, device=logits.device)], dim=1
-            )
-        return point_coordinates
 
     def forward(
         self,
@@ -255,13 +249,24 @@ class EoMTLoss(nn.Module):
         mask_labels: list[Tensor],
         class_labels: list[Tensor],
         auxiliary_predictions: dict[str, Tensor] | None = None,
+        pred_boxes: Tensor | None = None,
+        box_labels: list[Tensor] | None = None,
     ) -> dict[str, Tensor]:
-        indices = self.matcher(masks_queries_logits, class_queries_logits, mask_labels, class_labels)
+        """``pred_boxes`` (with the model built with ``aux_box_head``) adds the box terms to the matching and the loss."""
+        use_boxes = self.use_boxes and pred_boxes is not None
+        if use_boxes and box_labels is None:
+            box_labels = [masks_to_norm_boxes(m) for m in mask_labels]
+        indices = self.matcher(
+            masks_queries_logits, class_queries_logits, mask_labels, class_labels,
+            pred_boxes=pred_boxes if use_boxes else None, box_labels=box_labels if use_boxes else None,
+        )
         num_masks = self.get_num_masks(class_labels, device=class_labels[0].device)
         losses: dict[str, Tensor] = {
             **self.loss_masks(masks_queries_logits, mask_labels, indices, num_masks),
             **self.loss_labels(class_queries_logits, class_labels, indices),
         }
+        if use_boxes:
+            losses.update(self.loss_boxes(pred_boxes, box_labels, indices, num_masks))
         if auxiliary_predictions is not None:
             for idx, aux_outputs in enumerate(auxiliary_predictions):
                 loss_dict = self.forward(

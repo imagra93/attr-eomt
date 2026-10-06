@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import math
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -67,33 +68,34 @@ def _count_encoder_layers(model) -> int:
 
 
 def _llrd_scale(name: str, num_layers: int, llrd: float) -> float:
-    """Layer-wise LR decay factor for a backbone param (1.0 at the top layer).
+    """Layer-wise LR decay factor for a backbone param, as in the reference EoMT recipe.
 
-    Maps embeddings→0, ``eomt.layers.i``→i+1, post-encoder norm→num_layers+1, then
-    scales by ``llrd ** (depth from the top)`` so deeper (later) layers — closer to
-    the task head — get a higher LR than the early, generic DINOv2 layers.
+    Block ``i`` scales by ``llrd ** (num_layers - 1 - i)``: the **top block gets exactly the
+    base LR** and each block below it is ``llrd`` times the one above. The patch / position
+    embeddings follow the first block, and the post-encoder norm gets the base LR. In EoMT the
+    last ``num_blocks`` transformer blocks are the ones that process the queries and predict the
+    masks, so they must not be starved of learning rate.
     """
     if llrd >= 1.0 or num_layers <= 0:
         return 1.0
-    top = num_layers + 1
+    if name.startswith("eomt.layers."):
+        return llrd ** (num_layers - 1 - int(name.split("eomt.layers.")[1].split(".")[0]))
     if name.startswith("eomt.embeddings"):
-        layer_id = 0
-    elif name.startswith("eomt.layers."):
-        layer_id = int(name.split("eomt.layers.")[1].split(".")[0]) + 1
-    else:  # post-encoder layernorm / anything else in the backbone
-        layer_id = top
-    return llrd ** (top - layer_id)
+        return llrd ** (num_layers - 1)
+    return 1.0  # post-encoder layernorm / anything else in the backbone
 
 
 def build_optimizer(
     model, lr: float, weight_decay: float, backbone_lr_mult: float, llrd: float = 1.0
 ):
-    """AdamW with backbone LR scaling, layer-wise LR decay, and no-WD on norms/biases.
+    """AdamW with layer-wise LR decay, an optional backbone multiplier, and no-WD on norms/biases.
 
-    Param groups are keyed by ``(lr, weight_decay)``: the DINOv2 encoder gets
-    ``lr * backbone_lr_mult`` further scaled per layer by ``llrd`` (``1.0`` = the
-    legacy flat multiplier); the task head gets full ``lr``. 1-D tensors and
-    positional/token embeddings are placed in weight-decay-free groups.
+    Param groups are keyed by ``(lr, weight_decay)``. The task head gets ``lr``. The DINOv2
+    encoder gets ``lr * backbone_lr_mult`` scaled per block by ``llrd`` (see :func:`_llrd_scale`:
+    the top block is at ``lr * backbone_lr_mult``). The reference EoMT recipe uses
+    ``backbone_lr_mult=1.0`` and ``llrd=0.8``; ``llrd=1.0`` is a flat encoder LR. 1-D tensors and
+    positional/token embeddings are placed in weight-decay-free groups (the reference decays
+    everything; this is the usual ViT fine-tuning policy and a second-order difference).
     """
     num_layers = _count_encoder_layers(model)
     groups: dict[tuple, dict] = {}
@@ -105,9 +107,10 @@ def build_optimizer(
         lr_i = base * (_llrd_scale(name, num_layers, llrd) if is_backbone else 1.0)
         no_decay = p.ndim <= 1 or any(tok in name for tok in _NO_DECAY_TOKENS)
         wd_i = 0.0 if no_decay else weight_decay
-        key = (round(lr_i, 12), wd_i)
-        # Groups are homogeneous (backbone LR != head LR), so ``is_backbone`` set at
-        # creation labels the whole group — used for the post-unfreeze LR re-warmup.
+        # ``is_backbone`` is part of the key: with the reference recipe the top ViT block and the final
+        # norm have exactly the head's LR, and a shared group would give head parameters the ViT warmup
+        # (LR held at 0) or the other way round. ``is_backbone`` labels the whole group for the schedule.
+        key = (round(lr_i, 12), wd_i, is_backbone)
         groups.setdefault(
             key, {"params": [], "lr": lr_i, "weight_decay": wd_i, "is_backbone": is_backbone}
         )["params"].append(p)
@@ -117,29 +120,67 @@ def build_optimizer(
     return opt
 
 
-def _lr_factor(it, total_iters, warmup_iters, warmup_start_factor, min_ratio):
-    if it < warmup_iters:
-        return warmup_start_factor + (1.0 - warmup_start_factor) * it / max(1, warmup_iters)
-    progress = (it - warmup_iters) / max(1, total_iters - warmup_iters)
-    cos = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-    return min_ratio + (1.0 - min_ratio) * cos
+def _poly_two_stage_factors(opt_step, total_steps, warmup_steps, power):
+    """``(head_factor, vit_factor)`` of the reference two-stage warmup + polynomial schedule.
+
+    ``warmup_steps = (head, vit)`` in optimizer steps. The head warms up linearly while the ViT
+    LR is held at **0**; the ViT then ramps up linearly over its own warmup. Both then decay as
+    ``(1 - progress) ** power`` to 0 over the remaining steps (each group measured from the end of
+    its own warmup), exactly like ``TwoStageWarmupPolySchedule`` in the official EoMT code.
+    """
+    w_head, w_vit = int(warmup_steps[0]), int(warmup_steps[1])
+
+    def poly(adjusted, span):
+        return (1.0 - min(1.0, adjusted / max(1, span))) ** power
+
+    if w_head > 0 and opt_step < w_head:
+        head = opt_step / w_head
+    else:
+        head = poly(max(0, opt_step - w_head), total_steps - w_head)
+    if opt_step < w_head:
+        vit = 0.0
+    elif w_vit > 0 and opt_step < w_head + w_vit:
+        vit = (opt_step - w_head) / w_vit
+    else:
+        vit = poly(max(0, opt_step - w_head - w_vit), total_steps - w_head - w_vit)
+    return head, vit
 
 
-def _attn_mask_prob(it, total_iters, start_frac, end_frac):
-    """Masked-attention annealing schedule (EoMT, CVPR 2025).
+def _attn_mask_prob(it, total_iters, start_frac, end_frac, power=1.0):
+    """Masked-attention annealing schedule of one query block (EoMT, CVPR 2025).
 
     Returns the probability of applying masked attention to each query at
-    iteration ``it``: held at 1.0, then linearly annealed to 0.0 across the
-    ``[start_frac, end_frac]`` fraction of training so the final stretch trains
-    mask-free and matches efficient (mask-less) inference.
+    iteration ``it``: held at 1.0 until the start of the block's window, then
+    ``(1 - progress) ** power`` down to 0.0 at its end (the reference recipe uses the
+    polynomial power 0.9), so the final stretch trains mask-free and matches efficient
+    (mask-less) inference.
     """
     start = start_frac * total_iters
     end = end_frac * total_iters
-    if it <= start:
+    if it < start:
         return 1.0
     if it >= end:
         return 0.0
-    return 1.0 - (it - start) / max(1.0, end - start)
+    return (1.0 - (it - start) / max(1.0, end - start)) ** power
+
+
+#: Per-block masked-attention annealing windows (fractions of training) of the reference recipe: the
+#: four query blocks are annealed one after the other, and the last sixth of training is mask-free.
+EOMT_MASK_ANNEAL_START = (1 / 6, 2 / 6, 3 / 6, 4 / 6)
+EOMT_MASK_ANNEAL_END = (2 / 6, 3 / 6, 4 / 6, 5 / 6)
+
+
+def _per_block(value, n_blocks: int, what: str) -> list[float]:
+    """One fraction of training per query block."""
+    vals = [float(v) for v in value]
+    if len(vals) != n_blocks:
+        raise ValueError(f"{what} needs {n_blocks} values (one per query block), got {len(vals)}")
+    return vals
+
+
+def _attn_mask_probs(it, total_iters, starts, ends, power=1.0) -> list[float]:
+    """Masked-attention probability of every query block at iteration ``it`` (one window each)."""
+    return [_attn_mask_prob(it, total_iters, a, b, power) for a, b in zip(starts, ends)]
 
 
 def _aux_w_factor(it, total_iters, warmup_frac):
@@ -303,18 +344,16 @@ def train(
     accum: int = 0,
     lr0: float = 1e-4,
     weight_decay: float = 0.05,
-    backbone_lr_mult: float = 0.1,
-    llrd: float = 0.85,
-    warmup_epochs: float = 1.0,
-    warmup_lr_start: float = 1e-6,
-    min_lr_ratio: float = 0.01,
-    freeze_backbone_epochs: int = 2,
+    backbone_lr_mult: float = 1.0,
+    llrd: float = 0.8,
+    poly_power: float = 0.9,
+    warmup_steps: tuple[int, int] = (500, 1000),
     ema: bool = True,
     ema_decay: float = 0.9999,
     ema_tau: float = 2000.0,
     mask_anneal: bool = True,
-    mask_anneal_start: float = 0.0,
-    mask_anneal_end: float = 0.9,
+    mask_anneal_start: Sequence[float] = EOMT_MASK_ANNEAL_START,
+    mask_anneal_end: Sequence[float] = EOMT_MASK_ANNEAL_END,
     clip_norm: float = 0.01,
     workers: int = 8,
     prefetch: int = 4,
@@ -349,13 +388,13 @@ def train(
     class_weight: float = 2.0,
     mask_weight: float = 5.0,
     dice_weight: float = 5.0,
-    train_num_points: int = 12544,
-    oversample_ratio: float = 3.0,
-    importance_sample_ratio: float = 0.75,
     l1_weight: float = 5.0,
     giou_weight: float = 2.0,
     num_upscale_blocks: int | None = None,
     fpn_scales: tuple[float, ...] | list[float] | None = DEFAULT_FPN_SCALES,
+    box_head: bool = False,
+    deep_supervision: bool = True,
+    stop_after_epochs: int | None = None,
     logger: str = "none",
     resume: str | None = None,
     init_weights: str | None = None,
@@ -375,6 +414,18 @@ def train(
     architecture; warm-starting (``init_weights``) honors it, so fine-tuning a
     single-scale checkpoint into a multi-scale one is the default warm-start path.
 
+    **Architecture options** (instance family). ``box_head=True`` adds an auxiliary box head trained with L1 +
+    GIoU (``l1_weight`` / ``giou_weight``) whose boxes also enter the matching cost. ``deep_supervision=False``
+    stops supervising a query block's prediction once that block's masked attention is annealed away; while the
+    block masks, its prediction builds the attention mask and stays supervised (unsupervised, it made noise masks).
+    With the default windows the blocks drop out at 2/6, 3/6, 4/6 and 5/6 of training (~40 % fewer intermediate
+    predictions overall) and only the last sixth runs final-only (~25 % faster steps); the reference recipe
+    supervises every block throughout. Resuming keeps the checkpoint's ``box_head``; warm starts honor the argument.
+
+    ``stop_after_epochs`` ends the run once that many epochs have completed (counted from the start of the run,
+    so it composes with ``resume``) while the LR schedule and mask annealing still span ``epochs``: it is for
+    truncated A/B comparisons that must follow exactly the schedule of a full run.
+
     **Augmentation.** ``aug`` is an :class:`~eomt.data.transforms.AugConfig` (or a plain mapping, e.g. the ``train_aug``
     block of the dataset YAML) holding every augmentation knob; the defaults are a strong general recipe (flip,
     large-scale jitter, small rotation / shear / perspective, gamma, grayscale, blur, noise, JPEG, glare and
@@ -385,15 +436,20 @@ def train(
     ``keep_empty=True`` trains on the images that have no annotations too (negatives: zero targets, every query is
     pushed to "no object"); by default they are dropped. Instance family only.
 
-    ``freeze_backbone_epochs`` trains the task head only for the first N epochs
-    (DINOv2 frozen), then unfreezes — the LP-FT recipe. With a from-scratch head
-    this protects the pretrained features from early noisy-gradient corruption and
-    tends to give better *final* metrics (not just faster early epochs). On
-    unfreeze the backbone groups get a short LR re-warmup so they don't take the
-    full cosine LR in one step. ``amp_dtype`` selects the autocast dtype:
+    **Optimisation recipe** (the reference EoMT recipe): AdamW at ``lr0`` for the head; the DINOv2
+    encoder uses layer-wise LR decay ``llrd`` (0.8) with the top block at the base LR
+    (``backbone_lr_mult=1.0``, no extra backbone multiplier), so the last blocks, which process the
+    queries and predict the masks, learn as fast as the head. The LR follows a polynomial decay
+    (``poly_power`` 0.9) to 0 with a two-stage warmup in optimizer steps, ``warmup_steps=(head, vit)``
+    = (500, 1000): the head warms up while the ViT LR is held at 0, then the ViT ramps up. Masked
+    attention is annealed per query block, one window after the other (``mask_anneal_start`` /
+    ``mask_anneal_end``: one fraction of training per block; ``(1 - progress) ** poly_power`` inside a
+    window), and the last sixth of training is mask-free. ``amp_dtype`` selects the autocast dtype:
     ``"auto"`` uses bf16 on hardware that supports it (no GradScaler, more stable),
     else fp16; force with ``"bf16"`` / ``"fp16"``.
     """
+    if len(warmup_steps) != 2:
+        raise ValueError("warmup_steps must be (head_steps, vit_steps)")
     if imgsz % 14:
         raise ValueError(f"imgsz={imgsz} must be divisible by 14 (DINOv2 grid).")
 
@@ -503,9 +559,8 @@ def train(
             "class_weight": class_weight,
             "mask_weight": mask_weight,
             "dice_weight": dice_weight,
-            "train_num_points": train_num_points,
-            "oversample_ratio": oversample_ratio,
-            "importance_sample_ratio": importance_sample_ratio,
+            "l1_weight": l1_weight,
+            "giou_weight": giou_weight,
         }
     loss_weights = normalize_loss_weights(cli_loss_weights, family=family)
     if resume_ckpt is not None:
@@ -516,6 +571,7 @@ def train(
         # An absent key means the checkpoint is single-scale — do NOT fall back to the
         # (now multi-scale) default, or resuming an old run would build a mismatched head.
         fpn_scales = resume_ckpt.get("fpn_scales")
+        box_head = bool(resume_ckpt.get("aux_box_head"))
     elif init_ckpt is not None and init_ckpt.get("num_upscale_blocks") is not None:
         num_upscale_blocks = int(init_ckpt["num_upscale_blocks"])
     # Warm-start (init_weights) deliberately keeps the CLI ``fpn_scales``: enabling
@@ -611,9 +667,8 @@ def train(
             "weight_decay": weight_decay,
             "backbone_lr_mult": backbone_lr_mult,
             "llrd": llrd,
-            "warmup_epochs": warmup_epochs,
-            "min_lr_ratio": min_lr_ratio,
-            "freeze_backbone_epochs": freeze_backbone_epochs,
+            "poly_power": poly_power,
+            "warmup_steps": list(warmup_steps),
             "clip_norm": clip_norm,
             "ema": ema,
             "ema_decay": ema_decay,
@@ -624,8 +679,8 @@ def train(
             "seed": seed,
             "pretrained": pretrained,
             "mask_anneal": mask_anneal,
-            "mask_anneal_start": mask_anneal_start,
-            "mask_anneal_end": mask_anneal_end,
+            "mask_anneal_start": list(mask_anneal_start),
+            "mask_anneal_end": list(mask_anneal_end),
             "flip_prob": aug_cfg.flip_prob,
             "min_scale": aug_cfg.min_scale,
             "max_scale": aug_cfg.max_scale,
@@ -646,6 +701,8 @@ def train(
             "loss_weights": loss_weights,
             "num_upscale_blocks": num_upscale_blocks,
             "fpn_scales": list(fpn_scales) if fpn_scales else None,
+            "box_head": box_head,
+            "deep_supervision": deep_supervision,
         },
     )
 
@@ -661,10 +718,16 @@ def train(
         loss_weights=loss_weights,
         num_upscale_blocks=num_upscale_blocks,
         fpn_scales=fpn_scales,
+        aux_box_head=box_head,
     ).to(dev)
+    model.eomt.deep_supervision = bool(deep_supervision)
     print(f"[model] loss weights: {loss_weights}; upscale blocks: {model.num_upscale_blocks}")
     if model.fpn_scales:
         print(f"[model] multi-scale FPN enabled: scales={model.fpn_scales}")
+    if model.aux_box_head:
+        print(f"[model] auxiliary box head: L1 {loss_weights['l1_weight']} / GIoU {loss_weights['giou_weight']} (also in the matching cost)")
+    if not deep_supervision:
+        print("[model] deep supervision off: a query block is supervised only while it uses masked attention")
     if aux_specs:
         print(f"[model] aux head arch: {model.aux_head_arch}")
     start_epoch, best_metric = 0, -1.0
@@ -716,15 +779,6 @@ def train(
     # produced constant graph breaks/recompiles: no net speedup and highly variable
     # step times. Keep the encoder eager.
 
-    # LP-FT: the optimizer was built (above) with every param trainable, so the
-    # backbone groups exist; we toggle their ``requires_grad`` per epoch. Frozen
-    # params yield ``grad=None``, which AdamW skips — no optimizer rebuild needed.
-    backbone_params = [p for n, p in core.named_parameters() if n.startswith(_ENCODER_PREFIXES)]
-
-    def _set_backbone_requires_grad(flag: bool) -> None:
-        for p in backbone_params:
-            p.requires_grad_(flag)
-
     # Precision: bf16 (Ampere+/Blackwell) needs no GradScaler and is more stable
     # than fp16; "auto" picks bf16 when supported, else fp16. The GradScaler is
     # only ever enabled for fp16 — with bf16 its scale/unscale/step/update calls
@@ -746,12 +800,16 @@ def train(
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
     iters_per_epoch = max(1, len(train_loader))
     total_iters = epochs * iters_per_epoch
-    warmup_iters = int(warmup_epochs * iters_per_epoch)
-    warmup_start_factor = warmup_lr_start / lr0 if lr0 > 0 else 0.0
-    # LP-FT unfreeze: global iter at which the backbone thaws, and the length of the
-    # linear backbone-LR re-warmup that follows (~1 epoch). 0 when no freezing.
-    unfreeze_it = freeze_backbone_epochs * iters_per_epoch
-    unfreeze_warmup_iters = iters_per_epoch if freeze_backbone_epochs > 0 else 0
+    total_opt_steps = max(1, math.ceil(total_iters / accum_steps))
+    n_q_blocks = int(core.eomt.attn_mask_probs.numel())
+    anneal_starts = _per_block(mask_anneal_start, n_q_blocks, "mask_anneal_start")
+    anneal_ends = _per_block(mask_anneal_end, n_q_blocks, "mask_anneal_end")
+
+    head_group = next(g for g in reversed(optimizer.param_groups) if not g.get("is_backbone"))  # shown in the log
+
+    def lr_factors(it: int) -> tuple[float, float]:
+        """(head, backbone) multiplier of each group's ``initial_lr`` at micro-iteration ``it``."""
+        return _poly_two_stage_factors(it // accum_steps, total_opt_steps, warmup_steps, poly_power)
 
     tb = _Logger(logger, run_dir, name) if logger != "none" else None
 
@@ -778,6 +836,7 @@ def train(
             loss_weights=loss_weights,
             num_upscale_blocks=core.num_upscale_blocks,
             fpn_scales=core.fpn_scales,
+            aux_box_head=core.aux_box_head,
             norm_mean=getattr(core, "pixel_mean", None),
             norm_std=getattr(core, "pixel_std", None),
             patch_size=getattr(core, "patch_size", None),
@@ -802,17 +861,6 @@ def train(
     # --- epochs ---
     for epoch in range(start_epoch, epochs):
         model.train()
-        # LP-FT: head-only while frozen, then unfreeze. Re-applied every epoch so it
-        # is correct after a resume that lands past the unfreeze boundary.
-        if freeze_backbone_epochs > 0:
-            frozen = epoch < freeze_backbone_epochs
-            _set_backbone_requires_grad(not frozen)
-            if epoch == 0 and frozen:
-                print(f"[freeze] backbone frozen for epochs 0..{freeze_backbone_epochs - 1} "
-                      f"(head-only / LP-FT)")
-            elif epoch == freeze_backbone_epochs:
-                print(f"[freeze] backbone unfrozen at epoch {epoch}; "
-                      f"re-warming backbone LR over ~1 epoch")
         running = 0.0
         # matched-query accuracy per aux head, accumulated over the epoch
         aux_hits = {s.name: 0 for s in aux_specs}
@@ -822,20 +870,13 @@ def train(
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs - 1}", unit="batch")
         for step, (pixel_values, geom_labels, class_labels, aux_labels) in enumerate(pbar):
             it = epoch * iters_per_epoch + step
-            factor = _lr_factor(it, total_iters, warmup_iters, warmup_start_factor, min_lr_ratio)
-            # After unfreezing, linearly ramp the backbone groups from ~0 to full LR
-            # over unfreeze_warmup_iters so the thawed DINOv2 isn't hit at full LR.
-            bb_factor = 1.0
-            if unfreeze_warmup_iters and unfreeze_it <= it < unfreeze_it + unfreeze_warmup_iters:
-                bb_factor = warmup_start_factor + (1.0 - warmup_start_factor) * (
-                    it - unfreeze_it
-                ) / unfreeze_warmup_iters
+            head_factor, vit_factor = lr_factors(it)
             for g in optimizer.param_groups:
-                g["lr"] = g["initial_lr"] * factor * (bb_factor if g.get("is_backbone") else 1.0)
+                g["lr"] = g["initial_lr"] * (vit_factor if g.get("is_backbone") else head_factor)
 
             if mask_anneal:
-                p = _attn_mask_prob(it, total_iters, mask_anneal_start, mask_anneal_end)
-                core.eomt.attn_mask_probs.fill_(p)
+                probs = _attn_mask_probs(it, total_iters, anneal_starts, anneal_ends, poly_power)
+                core.eomt.set_attn_mask_probs(probs)
 
             pixel_values = pixel_values.to(dev)
             geom_labels = [g.to(dev) for g in geom_labels]
@@ -904,7 +945,7 @@ def train(
             postfix = {
                 "loss": f"{loss_item:.3f}",
                 "avg": f"{avg:.3f}",
-                "lr": f"{optimizer.param_groups[-1]['lr']:.2e}",
+                "lr": f"{head_group['lr']:.2e}",
             }
             if aux_specs:  # running matched-query accuracy per head
                 postfix["aux_acc"] = " ".join(
@@ -912,7 +953,7 @@ def train(
                 )
             pbar.set_postfix(postfix)
             if tb is not None and step % 20 == 0:
-                scalars = {"train/loss": loss_item, "lr/head": optimizer.param_groups[-1]["lr"]}
+                scalars = {"train/loss": loss_item, "lr/head": head_group["lr"]}
                 if mask_anneal:
                     scalars["train/attn_mask_prob"] = float(core.eomt.attn_mask_probs[0])
                 tb.log(scalars, it)
@@ -980,11 +1021,15 @@ def train(
         # --- checkpoints ---
         # last.pt holds the live weights + trainer state (optimizer/EMA) for resume;
         # best.pt holds the eval weights (EMA when enabled) for inference.
-        _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True)
+        # The best metric is updated BEFORE last.pt is written, so a resumed run starts from the right value
+        # (it used to lag one epoch and could overwrite a better best.pt).
         best_key = "bbox/mAP" if is_detect else "segm/mAP"
         cur = metrics.get(best_key, None)
-        if cur is not None and cur > best_metric:
+        improved = cur is not None and cur > best_metric
+        if improved:
             best_metric = cur
+        _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True)
+        if improved:
             _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False)
             print(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
 
@@ -1010,6 +1055,10 @@ def train(
                     plot_aux_per_class(epoch_aux_pc, names, run_dir / "aux_per_class.png")
                 except Exception as e:  # noqa: BLE001
                     print(f"[plot] aux_per_class.png failed: {e}")
+
+        if stop_after_epochs is not None and epoch + 1 >= stop_after_epochs:
+            print(f"[stop] stopping after {epoch + 1} epoch(s) as requested; the schedule spans {epochs}")
+            break
 
     if tb is not None:
         tb.close()

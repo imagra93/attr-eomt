@@ -14,7 +14,7 @@ wrapper around it:
   from transformers.
 * :class:`EoMTModel` is a thin ``nn.Module`` around :class:`EoMTEncoder`. Its
   forward returns the segmentation loss during training (class CE + mask CE + dice,
-  computed with Hungarian matching, PointRend point sampling and per-layer deep
+  computed with Hungarian matching on the mask-logit grid and per-layer deep
   supervision) and the raw query logits dict at inference. It also owns the
   optional secondary per-instance classification heads (attributes).
 * :func:`load_dinov2_backbone` initializes the ViT encoder from pretrained
@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
-from .box_loss import DetectionLoss
+from .box_loss import DetectionLoss, masks_to_norm_boxes
 from .config import (
     DEFAULT_IMAGE_SIZE,
     EOMT_CONFIGS,
@@ -64,6 +64,7 @@ class EoMTOutput:
     class_queries_logits: torch.Tensor | None = None
     masks_queries_logits: torch.Tensor | None = None
     pred_boxes: torch.Tensor | None = None
+    aux_boxes: torch.Tensor | None = None  # instance family: boxes of the auxiliary box head (normalized cxcywh)
     last_hidden_state: torch.Tensor | None = None
 
 
@@ -230,8 +231,9 @@ class ScaleBlock(nn.Module):
         super().__init__()
         self.block = nn.ModuleList([ScaleLayer(config) for _ in range(config.num_upscale_blocks)])
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        for block in self.block:
+    def forward(self, hidden_states: torch.Tensor, steps: int | None = None) -> torch.Tensor:
+        """``steps`` runs only the first ``steps`` upscale steps (``None`` = all)."""
+        for block in self.block[:steps]:
             hidden_states = block(hidden_states)
         return hidden_states
 
@@ -272,6 +274,10 @@ class BoxHead(nn.Module):
         hidden_states = self.activation(self.fc2(hidden_states))
         return self.fc3(hidden_states).sigmoid()
 
+
+#: Upscale steps of the intermediate (query-block) predictions: at most 4x the patch grid (184 x 184 at 644 px). They
+#: build 46 x 46 attention masks; making them at 368 x 368 with a 3-step head ran out of memory at batch 2.
+INTERMEDIATE_UPSCALE_STEPS = 2
 
 #: Default ViTDet-style pyramid scales relative to the native stride-14 grid:
 #: 2x (fine, the small-object win), 1x (native), 0.5x (coarse). Used when
@@ -451,6 +457,21 @@ class EoMTEncoder(nn.Module):
             }
             self.criterion = EoMTLoss(config=config, weight_dict=self.weight_dict)
         self.register_buffer("attn_mask_probs", torch.ones(config.num_blocks))
+        # Host-side mirror of ``attn_mask_probs`` (set by :meth:`set_attn_mask_probs`) so training can branch on
+        # a block's probability without a GPU sync. ``None`` -> read the buffer.
+        self._mask_host: list[float] | None = None
+        #: Supervise every query block (deep supervision). When off, a block's prediction is still supervised while
+        #: that block uses masked attention (probability > 0), because that prediction builds its attention mask;
+        #: once a block's mask is annealed away only the final output is supervised.
+        self.deep_supervision = True
+
+        # Optional auxiliary box head (instance family): per-query boxes trained with L1 + GIoU and used in the
+        # matching cost, a localisation signal that does not depend on the mask grid. Off by default.
+        self.aux_box_head = None
+        if family != "detect" and getattr(config, "aux_box_head", False):
+            self.aux_box_head = BoxHead(config)
+            self.weight_dict["loss_bbox"] = float(getattr(config, "l1_weight", 5.0))
+            self.weight_dict["loss_giou"] = float(getattr(config, "giou_weight", 2.0))
 
         # Optional multi-scale (B1): SimpleFPN bank + one query→bank cross-attention
         # per query block. Built only when enabled, so the default model adds no
@@ -466,13 +487,16 @@ class EoMTEncoder(nn.Module):
 
     # --- loss plumbing (mirrors HF get_loss_dict / get_loss) ----------------
 
-    def get_loss_dict(self, masks_queries_logits, class_queries_logits, mask_labels, class_labels):
+    def get_loss_dict(self, masks_queries_logits, class_queries_logits, mask_labels, class_labels,
+                      pred_boxes=None, box_labels=None):
+        extra = {"pred_boxes": pred_boxes, "box_labels": box_labels} if pred_boxes is not None else {}
         loss_dict = self.criterion(
             masks_queries_logits=masks_queries_logits,
             class_queries_logits=class_queries_logits,
             mask_labels=mask_labels,
             class_labels=class_labels,
             auxiliary_predictions=None,
+            **extra,
         )
         for key, weight in self.weight_dict.items():
             for loss_key, loss in loss_dict.items():
@@ -485,12 +509,14 @@ class EoMTEncoder(nn.Module):
 
     # --- prediction heads (mirrors HF predict) ------------------------------
 
-    def predict(self, logits: torch.Tensor, grid_size: tuple[int, int] | None = None):
+    def predict(self, logits: torch.Tensor, grid_size: tuple[int, int] | None = None,
+                upscale_steps: int | None = None):
         """Per-query heads. Returns ``(geometry, class_logits)``: mask logits
         ``(B, Q, h, w)`` for the instance family, box preds ``(B, Q, 4)`` for detect.
 
         ``grid_size`` is the actual patch grid of the current input; it defaults to
-        the trained ``self.grid_size`` so legacy callers keep working.
+        the trained ``self.grid_size`` so legacy callers keep working. ``upscale_steps``
+        limits the mask resolution (``None`` = the full head).
         """
         grid_size = grid_size or self.grid_size
         num_queries = self.config.num_queries
@@ -506,35 +532,46 @@ class EoMTEncoder(nn.Module):
         prefix_tokens = prefix_tokens.reshape(prefix_tokens.shape[0], -1, *grid_size)
 
         query_tokens = self.mask_head(query_tokens)
-        prefix_tokens = self.upscale_block(prefix_tokens)
+        prefix_tokens = self.upscale_block(prefix_tokens, steps=upscale_steps)
         mask_logits = torch.einsum("bqc, bchw -> bqhw", query_tokens, prefix_tokens)
         return mask_logits, class_logits
 
-    @staticmethod
-    def _disable_attention_mask(attn_mask, prob, num_query_tokens, encoder_start_tokens, device):
-        if prob < 1:
-            random_queries = torch.rand(attn_mask.shape[0], num_query_tokens, device=device) > prob
-            attn_mask[:, :num_query_tokens, encoder_start_tokens:][random_queries] = 1
-        return attn_mask
+    def predict_boxes(self, logits: torch.Tensor) -> torch.Tensor:
+        """Auxiliary box head on the per-query tokens of a (normed) hidden state: ``(B, Q, 4)`` cxcywh."""
+        return self.aux_box_head(logits[:, : self.config.num_queries, :])
+
+    def set_attn_mask_probs(self, probs) -> None:
+        """Set the per-block masked-attention probabilities (buffer + host mirror, no GPU sync on read)."""
+        probs = [float(x) for x in probs]
+        self._mask_host = probs
+        self.attn_mask_probs.copy_(torch.tensor(probs, dtype=self.attn_mask_probs.dtype))
+
+    def _block_prob(self, block_idx: int) -> float:
+        if self.training and self._mask_host is not None:
+            return self._mask_host[block_idx]
+        return float(self.attn_mask_probs[block_idx])
 
     def _build_attention_mask(self, hidden_states, masks_queries_logits, prob, grid_size=None):
+        """Masked attention as a boolean ``[B, 1, N, N]`` mask (True = may attend), broadcast over heads.
+
+        Each query may attend to the patches its current mask prediction touches; every other token pair is
+        unrestricted. A patch is touched when any of its mask-logit cells is positive (max-pool). The reference
+        EoMT downsamples bilinearly, which reads only the centre of each patch and drops most masks smaller than a
+        patch, and leaves a query whose mask touches no patch unable to see any: the queries of small objects were
+        blind through most of the masked phase. Here such a query attends to every patch instead, as in Mask2Former.
+        With probability ``1 - prob`` a query is unmasked (full attention), which is how the masking is annealed away.
+        """
         grid_size = grid_size or self.grid_size
         num_query_tokens = self.config.num_queries
         encoder_start_tokens = num_query_tokens + self.embeddings.num_prefix_tokens
-        attention_mask = torch.ones(
-            hidden_states.shape[0], hidden_states.shape[1], hidden_states.shape[1],
-            device=hidden_states.device, dtype=torch.bool,
-        )
-        interpolated_logits = F.interpolate(masks_queries_logits, size=grid_size, mode="bilinear")
-        interpolated_logits = interpolated_logits.view(
-            interpolated_logits.size(0), interpolated_logits.size(1), -1
-        )
-        attention_mask[:, :num_query_tokens, encoder_start_tokens:] = interpolated_logits > 0
-        attention_mask = self._disable_attention_mask(
-            attention_mask, prob, num_query_tokens, encoder_start_tokens, attention_mask.device
-        )
-        attention_mask = attention_mask[:, None, ...].expand(-1, self.config.num_attention_heads, -1, -1)
-        return attention_mask.float().masked_fill(~attention_mask, -1e9)
+        b, n = hidden_states.shape[:2]
+        allowed = F.adaptive_max_pool2d(masks_queries_logits, grid_size).flatten(2) > 0  # [B, Q, patches]
+        allowed |= ~allowed.any(-1, keepdim=True)
+        if prob < 1:
+            allowed |= torch.rand(b, num_query_tokens, 1, device=hidden_states.device) > prob
+        attention_mask = torch.ones(b, n, n, device=hidden_states.device, dtype=torch.bool)
+        attention_mask[:, :num_query_tokens, encoder_start_tokens:] = allowed
+        return attention_mask[:, None]
 
     def forward(
         self,
@@ -544,8 +581,7 @@ class EoMTEncoder(nn.Module):
         box_labels: list[torch.Tensor] | None = None,
     ) -> EoMTOutput:
         # Per-layer geometry (mask logits or box preds) for deep supervision.
-        geom_per_layer, class_per_layer = (), ()
-        attention_mask = None
+        geom_per_layer, class_per_layer, box_per_layer = (), (), ()
         is_detect = self.family == "detect"
         # GT geometry for this family: boxes for detect, masks for instance.
         geom_labels = box_labels if is_detect else mask_labels
@@ -563,6 +599,8 @@ class EoMTEncoder(nn.Module):
         # Multi-scale bank (B1), built once from the patch features at the injection
         # point and held fixed across the query blocks (Mask2Former-style memory).
         bank_feats = bank_pos = None
+        supervise_blocks = self.training and self.deep_supervision
+        nq = self.config.num_queries
 
         for idx, layer_module in enumerate(self.layers):
             if idx == self.num_hidden_layers - self.config.num_blocks:
@@ -580,22 +618,39 @@ class EoMTEncoder(nn.Module):
 
             block_idx = idx - self.num_hidden_layers + self.config.num_blocks
             in_query_blocks = idx >= self.num_hidden_layers - self.config.num_blocks
-            if is_detect:
+            attention_mask = None
+            if in_query_blocks and is_detect:
                 # Deep supervision: predict per query-block during training. No masked
                 # attention (no masks to focus on) — queries do full attention.
-                if in_query_blocks and self.training:
+                if supervise_blocks:
                     norm_hidden_states = self.layernorm(hidden_states)
                     geom, cls = self.predict(norm_hidden_states, grid)
                     geom_per_layer += (geom,)
                     class_per_layer += (cls,)
-            elif in_query_blocks and (self.training or self.attn_mask_probs[block_idx] > 0):
-                norm_hidden_states = self.layernorm(hidden_states)
-                masks_queries_logits, class_queries_logits = self.predict(norm_hidden_states, grid)
-                geom_per_layer += (masks_queries_logits,)
-                class_per_layer += (class_queries_logits,)
-                attention_mask = self._build_attention_mask(
-                    hidden_states, masks_queries_logits, self.attn_mask_probs[block_idx], grid
-                )
+            elif in_query_blocks:
+                prob = self._block_prob(block_idx)
+                # An unsupervised prediction makes a meaningless attention mask (in a final-only run P0 let every
+                # query see a random half of the image), so a block that masks is always supervised in training.
+                supervise = supervise_blocks or (self.training and prob > 0)
+                if supervise or prob > 0:
+                    norm_hidden_states = self.layernorm(hidden_states)
+                    if supervise:
+                        masks_queries_logits, class_queries_logits = self.predict(
+                            norm_hidden_states, grid, INTERMEDIATE_UPSCALE_STEPS
+                        )
+                        geom_per_layer += (masks_queries_logits,)
+                        class_per_layer += (class_queries_logits,)
+                        if self.aux_box_head is not None:
+                            box_per_layer += (self.predict_boxes(norm_hidden_states),)
+                    else:  # masked inference: only the attention mask needs this prediction
+                        with torch.no_grad():
+                            masks_queries_logits, _ = self.predict(
+                                norm_hidden_states, grid, INTERMEDIATE_UPSCALE_STEPS
+                            )
+                    if prob > 0:  # a block whose annealing probability reached 0 builds no mask at all
+                        attention_mask = self._build_attention_mask(
+                            hidden_states, masks_queries_logits.detach(), prob, grid
+                        )
 
             hidden_states = layer_module(hidden_states, attention_mask)
 
@@ -603,27 +658,31 @@ class EoMTEncoder(nn.Module):
             # cross-attend to the bank so it gathers fine/coarse context the native
             # grid alone can't provide. The next block's prediction reads the result.
             if self.fpn_scales and in_query_blocks:
-                num_q = self.config.num_queries
-                refined = self.cross_blocks[block_idx](
-                    hidden_states[:, :num_q], bank_feats, bank_pos
-                )
-                hidden_states = torch.cat((refined, hidden_states[:, num_q:]), dim=1)
+                refined = self.cross_blocks[block_idx](hidden_states[:, :nq], bank_feats, bank_pos)
+                hidden_states = torch.cat((refined, hidden_states[:, nq:]), dim=1)
 
         sequence_output = self.layernorm(hidden_states)
         geom_final, class_queries_logits = self.predict(sequence_output, grid)
         geom_per_layer += (geom_final,)
         class_per_layer += (class_queries_logits,)
+        aux_boxes = None
+        if self.aux_box_head is not None:
+            aux_boxes = self.predict_boxes(sequence_output)
+            box_per_layer += (aux_boxes,)
 
         loss = None
         if geom_labels is not None and class_labels is not None:
             loss = 0.0
-            for g, c in zip(geom_per_layer, class_per_layer):
-                loss = loss + self.get_loss(self.get_loss_dict(g, c, geom_labels, class_labels))
+            gt_boxes = [masks_to_norm_boxes(m) for m in geom_labels] if self.aux_box_head is not None else None
+            for i, (g, c) in enumerate(zip(geom_per_layer, class_per_layer)):
+                pb = box_per_layer[i] if box_per_layer else None
+                loss = loss + self.get_loss(self.get_loss_dict(g, c, geom_labels, class_labels, pb, gt_boxes))
 
         return EoMTOutput(
             loss=loss,
             masks_queries_logits=None if is_detect else geom_final,
             pred_boxes=geom_final if is_detect else None,
+            aux_boxes=aux_boxes,
             class_queries_logits=class_queries_logits,
             last_hidden_state=sequence_output,
         )
@@ -684,6 +743,7 @@ def build_model(
     loss_weights: dict | None = None,
     num_upscale_blocks: int | None = None,
     fpn_scales: tuple[float, ...] | list[float] | None = None,
+    aux_box_head: bool = False,
 ) -> "EoMTModel":
     """Build an :class:`EoMTModel`.
 
@@ -695,10 +755,13 @@ def build_model(
     ``normalize_loss_weights``); ``num_upscale_blocks`` overrides the mask-head
     upsampling depth (instance only; ``None`` = size preset default).
     ``fpn_scales`` enables the B1 multi-scale path (SimpleFPN + query
-    cross-attention); ``None`` = the original single-scale model.
+    cross-attention); ``None`` = the original single-scale model. ``aux_box_head`` adds an
+    auxiliary box head (L1 + GIoU loss and a box term in the matching cost) to the instance family.
     """
     if family not in FAMILIES:
         raise ValueError(f"family={family!r} is not one of {FAMILIES}.")
+    if family == "detect" and aux_box_head:
+        raise ValueError("aux_box_head applies to the instance family only.")
     return EoMTModel(
         size=size,
         nc=nc,
@@ -711,6 +774,7 @@ def build_model(
         loss_weights=loss_weights,
         num_upscale_blocks=num_upscale_blocks,
         fpn_scales=fpn_scales,
+        aux_box_head=aux_box_head,
     )
 
 
@@ -734,6 +798,7 @@ class EoMTModel(nn.Module):
         loss_weights: dict | None = None,
         num_upscale_blocks: int | None = None,
         fpn_scales: tuple[float, ...] | list[float] | None = None,
+        aux_box_head: bool = False,
     ):
         super().__init__()
         self.size = size
@@ -754,8 +819,7 @@ class EoMTModel(nn.Module):
         # through and keep mask/dice at their defaults for detect (unused there).
         cfg_weights = {
             k: v for k, v in self.loss_weights.items()
-            if k in ("no_object_weight", "class_weight", "mask_weight", "dice_weight",
-                     "train_num_points", "oversample_ratio", "importance_sample_ratio")
+            if k in ("no_object_weight", "class_weight", "mask_weight", "dice_weight")
         }
         config = build_eomt_config(
             size,
@@ -778,6 +842,13 @@ class EoMTModel(nn.Module):
         self.fpn_scales = tuple(float(s) for s in fpn_scales) if fpn_scales else None
         if self.fpn_scales:
             config.fpn_scales = self.fpn_scales
+        # Auxiliary box head: stashed on the config for the encoder, recorded in the checkpoint metadata.
+        # Left unset the encoder is the model without it.
+        self.aux_box_head = bool(aux_box_head) and family != "detect"
+        if self.aux_box_head:
+            config.aux_box_head = True
+            config.l1_weight = float(self.loss_weights["l1_weight"])
+            config.giou_weight = float(self.loss_weights["giou_weight"])
         self.config = config
         # Effective upscale depth (resolved from the preset when not overridden).
         self.num_upscale_blocks = int(config.num_upscale_blocks)
@@ -822,6 +893,8 @@ class EoMTModel(nn.Module):
                 "masks_queries_logits": out.masks_queries_logits,
                 "class_queries_logits": out.class_queries_logits,
             }
+            if out.aux_boxes is not None:  # not "pred_boxes": that key marks the detect family downstream
+                result["aux_boxes"] = out.aux_boxes
         # The per-query embedding [B, Q, hidden]: the leading queries of the final
         # hidden state, which is precisely the tensor ``class_predictor`` consumes.
         # Always exposed — aux heads read it, and so does cross-photo re-identification

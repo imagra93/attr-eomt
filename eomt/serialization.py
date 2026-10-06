@@ -64,6 +64,7 @@ def wrap_checkpoint(
     loss_weights: dict | None = None,
     num_upscale_blocks: int | None = None,
     fpn_scales: tuple[float, ...] | list[float] | None = None,
+    aux_box_head: bool = False,
     norm_mean: Any = None,
     norm_std: Any = None,
     patch_size: int | None = None,
@@ -110,6 +111,10 @@ def wrap_checkpoint(
     # SimpleFPN + cross-attn modules with matching shapes on reload.
     if fpn_scales is not None:
         checkpoint["fpn_scales"] = [float(s) for s in fpn_scales]
+    # Auxiliary box head: load-bearing for the module shapes, recorded so it is rebuilt on reload
+    # (a checkpoint without this key is the model without it).
+    if aux_box_head:
+        checkpoint["aux_box_head"] = True
     # Records the torchao recipe (if the weights are compressed) so ``load_model``
     # re-creates the quantized layout before loading the subclassed tensors.
     if compression is not None:
@@ -226,6 +231,9 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     # Multi-scale (B1) modules: rebuilt from the recorded scales (or recovered
     # best-effort from the state dict when the metadata predates the field).
     fpn_scales = ckpt.get("fpn_scales") or _infer_fpn_scales(state)
+    if ckpt.get("detail") or any(_state_keys(state, "eomt.detail.", "detail.")):
+        raise ValueError(f"{path} uses the pixel-detail pathway, which this version of eomt no longer has.")
+    aux_box_head = bool(ckpt.get("aux_box_head")) or _infer_aux_box_head(state)
 
     model = build_model(
         size,
@@ -238,6 +246,7 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
         loss_weights=loss_weights,
         num_upscale_blocks=num_upscale_blocks,
         fpn_scales=fpn_scales,
+        aux_box_head=aux_box_head,
     )
     # Compressed checkpoints carry int8 tensor subclasses (torchao). Re-create the
     # quantized layout, then load with ``assign=True`` so the saved subclassed
@@ -361,6 +370,19 @@ def _infer_fpn_scales(state: dict) -> list[float] | None:
     return list(DEFAULT_FPN_SCALES) if n == len(DEFAULT_FPN_SCALES) else None
 
 
+def _state_keys(state: dict, *prefixes: str):
+    for key in state:
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                yield key
+                break
+
+
+def _infer_aux_box_head(state: dict) -> bool:
+    """True if the state dict carries the instance family's auxiliary box head."""
+    return any(_state_keys(state, "eomt.aux_box_head.", "aux_box_head."))
+
+
 def _infer_imgsz(state: dict, patch_size: int = 14) -> int:
     import math
 
@@ -405,6 +427,8 @@ def summarize_checkpoint(path: str | Path) -> dict[str, Any]:
         "aux_heads": ckpt.get("aux_heads"),
         "loss_weights": ckpt.get("loss_weights"),
         "num_upscale_blocks": ckpt.get("num_upscale_blocks"),
+        "fpn_scales": ckpt.get("fpn_scales") or _try(lambda: _infer_fpn_scales(state)),
+        "aux_box_head": bool(ckpt.get("aux_box_head")) or bool(_try(lambda: _infer_aux_box_head(state))),
         # Training state (only present in last.pt).
         "epoch": ckpt.get("epoch"),
         "best_metric": ckpt.get("best_metric"),
@@ -452,6 +476,13 @@ def format_summary(summary: dict[str, Any]) -> str:
         f"  aux heads: {aux_str}",
         f"  classes  : {names_str or '(none)'}",
     ]
+    arch = []
+    if summary.get("fpn_scales"):
+        arch.append(f"FPN{tuple(summary['fpn_scales'])}")
+    if summary.get("aux_box_head"):
+        arch.append("box head")
+    if arch:
+        lines.insert(5, "  extras   : " + ", ".join(arch))
     if summary.get("epoch") is not None or summary.get("has_optimizer"):
         bm = summary.get("best_metric")
         bm_str = f"{bm:.4f}" if isinstance(bm, (int, float)) else str(bm)

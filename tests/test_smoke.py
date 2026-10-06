@@ -534,12 +534,12 @@ def test_letterbox_inverse_crops_content_not_padding():
 
 def test_loss_weights_thread_into_criterion():
     """Tuned loss weights / num_upscale_blocks reach the HF criterion and mask head."""
-    lw = {"no_object_weight": 0.05, "dice_weight": 8.0, "train_num_points": 24576}
+    lw = {"no_object_weight": 0.05, "dice_weight": 8.0, "mask_weight": 3.0}
     model = build_model("s", nc=NC, imgsz=IMGSZ, loss_weights=lw, num_upscale_blocks=3)
     crit = model.eomt.criterion
     assert float(crit.eos_coef) == 0.05
     assert float(crit.empty_weight[-1]) == pytest.approx(0.05)
-    assert crit.num_points == 24576
+    assert crit.matcher.cost_mask == 3.0
     assert crit.matcher.cost_dice == 8.0
     assert model.eomt.weight_dict["loss_dice"] == 8.0
     assert model.num_upscale_blocks == 3
@@ -549,6 +549,10 @@ def test_loss_weights_thread_into_criterion():
     # Unknown keys are rejected early.
     with pytest.raises(ValueError):
         build_model("s", nc=NC, imgsz=IMGSZ, loss_weights={"bogus": 1.0})
+    # The point-sampling keys older checkpoints carry are dropped (the mask terms are dense now).
+    old = build_model("s", nc=NC, imgsz=IMGSZ, loss_weights={"train_num_points": 12544, "oversample_ratio": 3.0,
+                                                             "importance_sample_ratio": 0.75, "dice_weight": 6.0})
+    assert "train_num_points" not in old.loss_weights and old.eomt.criterion.matcher.cost_dice == 6.0
 
 
 def test_loss_weights_checkpoint_roundtrip(tmp_path):
@@ -557,7 +561,7 @@ def test_loss_weights_checkpoint_roundtrip(tmp_path):
 
     from eomt.serialization import load_model, save_checkpoint, wrap_checkpoint
 
-    lw = {"no_object_weight": 0.05, "dice_weight": 8.0, "train_num_points": 24576}
+    lw = {"no_object_weight": 0.05, "dice_weight": 8.0, "mask_weight": 3.0}
     model = build_model("s", nc=NC, imgsz=IMGSZ, loss_weights=lw, num_upscale_blocks=3).eval()
     ckpt = wrap_checkpoint(
         model.state_dict(), size="s", nc=NC, imgsz=IMGSZ,
@@ -573,7 +577,7 @@ def test_loss_weights_checkpoint_roundtrip(tmp_path):
     msgs = [str(w.message) for w in caught]
     assert not any("missing" in m or "unexpected" in m for m in msgs), msgs
     crit = loaded.eomt.criterion
-    assert float(crit.eos_coef) == 0.05 and crit.num_points == 24576
+    assert float(crit.eos_coef) == 0.05 and crit.matcher.cost_mask == 3.0
     assert crit.matcher.cost_dice == 8.0 and loaded.num_upscale_blocks == 3
 
 

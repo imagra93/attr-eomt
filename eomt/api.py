@@ -483,6 +483,7 @@ class EoMT:
             letterbox=bool(getattr(m, "preprocess_letterbox", False)),
             loss_weights=m.loss_weights, num_upscale_blocks=m.num_upscale_blocks,
             fpn_scales=getattr(m, "fpn_scales", None),
+            aux_box_head=bool(getattr(m, "aux_box_head", False)),
             norm_mean=getattr(m, "pixel_mean", None), norm_std=getattr(m, "pixel_std", None),
             patch_size=getattr(m, "patch_size", None),
             compression=self._compression,

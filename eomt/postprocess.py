@@ -43,18 +43,26 @@ def _build_aux_result(aux_logits: dict, sel, classes, aux_scopes: dict | None) -
 
 
 def boxes_from_masks(masks: torch.Tensor) -> torch.Tensor:
-    """Derive ``xyxy`` boxes (pixel coords) from boolean masks ``(N, H, W)``."""
+    """Derive ``xyxy`` boxes (pixel coords) from boolean masks ``(N, H, W)``; an empty mask gives zeros.
+
+    Vectorised over the masks (the per-mask ``torch.where`` loop it replaces cost tens of ms per image
+    for 100 detections of a 1024 px image).
+    """
     n = masks.shape[0]
     boxes = masks.new_zeros((n, 4), dtype=torch.float32)
-    for i in range(n):
-        ys, xs = torch.where(masks[i])
-        if ys.numel() == 0:
-            continue
-        boxes[i, 0] = xs.min()
-        boxes[i, 1] = ys.min()
-        boxes[i, 2] = xs.max() + 1
-        boxes[i, 3] = ys.max() + 1
-    return boxes
+    if n == 0:
+        return boxes
+    h, w = masks.shape[-2:]
+    rows, cols = masks.any(2), masks.any(1)  # (N, H), (N, W)
+    ys = torch.arange(h, device=masks.device)
+    xs = torch.arange(w, device=masks.device)
+    nonempty = rows.any(1)
+    y0 = torch.where(rows, ys, h).min(1).values
+    y1 = torch.where(rows, ys, -1).max(1).values + 1
+    x0 = torch.where(cols, xs, w).min(1).values
+    x1 = torch.where(cols, xs, -1).max(1).values + 1
+    boxes = torch.stack([x0, y0, x1, y1], dim=1).to(torch.float32)
+    return boxes * nonempty[:, None]
 
 
 def _masks_to_original(mask_logits, orig_h, orig_w, preprocess_meta):
@@ -243,6 +251,8 @@ def postprocess_instance(
             "masks": torch.zeros((0, orig_h, orig_w), dtype=torch.bool),
             "query_idx": torch.zeros((0,), dtype=torch.long),
         }
+        if output.get("aux_boxes") is not None:
+            empty["head_boxes"] = torch.zeros((0, 4))
         if aux_logits is not None:
             empty["aux"] = {
                 name: {
@@ -277,6 +287,9 @@ def postprocess_instance(
         "masks": masks,
         "query_idx": sel,
     }
+    if output.get("aux_boxes") is not None:
+        # Boxes regressed by the auxiliary box head (xyxy, original pixels), next to the mask-derived ``boxes``.
+        result["head_boxes"] = boxes_to_original(output["aux_boxes"][0].float()[sel], orig_h, orig_w, preprocess_meta)
     if aux_logits is not None:
         result["aux"] = _build_aux_result(aux_logits, sel, classes, aux_scopes)
     return result
