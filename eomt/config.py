@@ -126,9 +126,13 @@ DEFAULT_LOSS_WEIGHTS: dict = {
     "class_weight": 2.0,
     "mask_weight": 5.0,
     "dice_weight": 5.0,
-    "train_num_points": 12544,
-    "oversample_ratio": 3.0,
-    "importance_sample_ratio": 0.75,
+    # Only used with the auxiliary box head (``aux_box_head=True``): L1 / GIoU loss and matching weights.
+    "l1_weight": 5.0,
+    "giou_weight": 2.0,
+    # Class target of a matched query = (1 + mask IoU) / 2 instead of 1 (scores rank masks by quality).
+    "iou_aware_cls": False,
+    # Mask-quality head: predicts each matched query's mask IoU (BCE); postprocess scores class x predicted IoU. 0 = off.
+    "quality_weight": 0.0,
 }
 
 #: Detection (box-head) criterion weights. The shared ``no_object_weight`` /
@@ -140,6 +144,15 @@ DETECT_LOSS_WEIGHTS: dict = {
     "l1_weight": 5.0,
     "giou_weight": 2.0,
 }
+
+
+#: Point-sampling knobs of the old PointRend mask loss (the mask terms are now dense on the logit grid, see
+#: :mod:`eomt.loss`), and matcher options that were tried and dropped. Checkpoints still carry them in ``loss_weights``,
+#: so they are dropped on load.
+_OBSOLETE_LOSS_KEYS = (
+    "train_num_points", "oversample_ratio", "importance_sample_ratio", "match_class_weight", "match_full_res",
+    "quality_detach", "o2m_k", "sem_weight",
+)
 
 
 def _loss_weight_defaults(family: str) -> dict:
@@ -155,6 +168,7 @@ def normalize_loss_weights(lw: dict | None, family: str = "instance") -> dict:
     the box L1/GIoU keys.
     """
     out = dict(_loss_weight_defaults(family))
+    lw = {k: v for k, v in (lw or {}).items() if k not in _OBSOLETE_LOSS_KEYS}
     if lw:
         unknown = set(lw) - set(out)
         if unknown:
@@ -163,8 +177,6 @@ def normalize_loss_weights(lw: dict | None, family: str = "instance") -> dict:
                 f"valid keys are {sorted(out)}."
             )
         out.update({k: v for k, v in lw.items() if v is not None})
-    if "train_num_points" in out:
-        out["train_num_points"] = int(out["train_num_points"])
     return out
 
 
@@ -180,9 +192,6 @@ def build_eomt_config(
     class_weight: float = 2.0,
     mask_weight: float = 5.0,
     dice_weight: float = 5.0,
-    train_num_points: int = 12544,
-    oversample_ratio: float = 3.0,
-    importance_sample_ratio: float = 0.75,
 ):
     """Build a ``transformers.EomtConfig`` for the given size code.
 
@@ -200,8 +209,6 @@ def build_eomt_config(
             ⇒ the model fires more queries (higher recall / more detections).
         class_weight / mask_weight / dice_weight: matcher + loss weights for the
             classification, per-pixel mask BCE and (scale-invariant) dice terms.
-        train_num_points / oversample_ratio / importance_sample_ratio: PointRend
-            sampling for the mask loss; more points ⇒ sharper boundaries.
     """
     from transformers import EomtConfig
 
@@ -236,7 +243,4 @@ def build_eomt_config(
         class_weight=class_weight,
         mask_weight=mask_weight,
         dice_weight=dice_weight,
-        train_num_points=int(train_num_points),
-        oversample_ratio=oversample_ratio,
-        importance_sample_ratio=importance_sample_ratio,
     )

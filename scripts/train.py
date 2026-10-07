@@ -47,7 +47,7 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch", type=int, default=4, help="Micro-batch size (per optimizer micro-step).")
     p.add_argument("--imgsz", type=int, default=644, help="Square input size (divisible by 14).")
-    p.add_argument("--device", default="auto")
+    p.add_argument("--device", default="auto", help="auto (GPU 0), cpu, cuda:N / N, or GPU indices such as 0,1 to train on several.")
     p.add_argument("--name", default=None, help="Run name (default: eomt-{size}).")
     p.add_argument("--weights", default=None, help="Init from a checkpoint/run to fine-tune (warm start).")
     p.add_argument("--resume", default=None, help="Resume a run from a checkpoint/run folder.")
@@ -56,6 +56,12 @@ def main() -> None:
         help="B1 multi-scale SimpleFPN scales relative to the native grid (default "
              "'2,1,0.5', on by default). Pass 'none'/'off' for the single-scale model.",
     )
+    p.add_argument("--box-head", action="store_true", help="Auxiliary box head: L1 + GIoU loss and a box term in the matcher.")
+    p.add_argument("--no-deep-supervision", action="store_true", help="Stop supervising a query block once its masked attention is annealed away (it stays supervised while it masks).")
+    p.add_argument("--upscale-blocks", type=int, default=None, help="Mask-head upscale blocks (2 = 184x184 logits at 644 px, 3 = 368x368).")
+    p.add_argument("--iou-aware-cls", action="store_true", help="Class target of a matched query = (1 + mask IoU) / 2 (scores rank masks by quality).")
+    p.add_argument("--quality-weight", type=float, default=0.0, help="Mask-quality head loss weight (predicted IoU scores the masks); 0 = off.")
+    p.add_argument("--val-imgsz", type=int, default=None, help="Validation input size (default: --imgsz); e.g. imgsz x the mean training scale.")
     p.add_argument(
         "--aug", action="append", default=[], metavar="KEY=VALUE",
         help="Augmentation override (repeatable), e.g. --aug rotate_prob=0.5 --aug 'blur_sigma=[0.3,1.0]'. "
@@ -83,6 +89,12 @@ def main() -> None:
         name=args.name,
         resume=bool(args.resume),
         fpn_scales=fpn_scales,
+        box_head=args.box_head,
+        deep_supervision=not args.no_deep_supervision,
+        num_upscale_blocks=args.upscale_blocks,
+        iou_aware_cls=args.iou_aware_cls,
+        quality_weight=args.quality_weight,
+        val_imgsz=args.val_imgsz,
         aug=_parse_aug(args.aug, args.aug_preset),
     )
     if result["best_metric"] >= 0:

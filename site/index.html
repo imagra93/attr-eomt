@@ -389,13 +389,13 @@ matched  = gather_matched(out, indices)                          <span class="c"
 <section>
   <div class="tag">Defaults that matter</div>
   <h2>The training recipe, and the knobs</h2>
-  <p>Defaults follow the EoMT / Mask2Former fine-tuning recipe. Each piece is a keyword argument to <code>train()</code>, so legacy behaviour is one override away.</p>
+  <p>Defaults follow the reference EoMT recipe. Each piece is a keyword argument to <code>train()</code>.</p>
   <ul class="dim">
     <li><strong>Effective batch via gradient accumulation</strong> — LR/WD/clip are tuned for an effective batch of 16; EoMT is a ViT (LayerNorm, no BatchNorm), so accumulation ≈ a true large batch at a fraction of the memory.</li>
     <li><strong>EMA weights</strong> are validated and saved as <code>best.pt</code>; <code>last.pt</code> holds live weights + optimizer + EMA state for exact resume.</li>
     <li><strong>Large-Scale Jitter</strong> for training, <strong>letterbox</strong> for eval/inference (the mode is stored per-checkpoint so <code>val</code>/<code>predict</code> match training automatically).</li>
-    <li><strong>AdamW</strong> with no weight decay on norms/biases/embeddings, and layer-wise LR decay on the backbone.</li>
-    <li><strong>Masked-attention annealing</strong> <code>1 → 0</code> so the final stretch trains mask-free and matches efficient (mask-less) inference.</li>
+    <li><strong>AdamW</strong> at <code>1e-4</code> with no weight decay on norms/biases/embeddings. Layer-wise LR decay <code>0.8</code> on the encoder with the <em>top block at the full LR</em> (the last blocks process the queries, so there is no backbone multiplier), and a polynomial decay to 0 after a two-stage warmup: the head first, with the ViT held at 0, then the ViT.</li>
+    <li><strong>Masked-attention annealing</strong> <code>1 → 0</code>, one query block after the other, so the final sixth of training is mask-free and matches efficient (mask-less) inference.</li>
   </ul>
 
   <table>
@@ -404,13 +404,16 @@ matched  = gather_matched(out, indices)                          <span class="c"
       <tr><td><code>family</code></td><td><code>"instance"</code></td><td><code>"instance"</code> (masks) or <code>"detect"</code> (boxes only)</td></tr>
       <tr><td><code>nominal_batch</code> / <code>accum</code></td><td><code>16</code> / <code>0</code></td><td>gradient accumulation to an effective batch of <code>nominal_batch</code>; <code>accum=N</code> sets the step count explicitly</td></tr>
       <tr><td><code>ema</code> / <code>ema_decay</code> / <code>ema_tau</code></td><td><code>True</code> / <code>0.9999</code> / <code>2000</code></td><td>validate &amp; export <code>best.pt</code> from an EMA of the weights</td></tr>
-      <tr><td><code>llrd</code></td><td><code>0.85</code></td><td>layer-wise LR decay on the DINOv2 backbone (<code>1.0</code> = flat <code>backbone_lr_mult</code>)</td></tr>
+      <tr><td><code>llrd</code> / <code>backbone_lr_mult</code></td><td><code>0.8</code> / <code>1.0</code></td><td>layer-wise LR decay on the DINOv2 encoder, top block at <code>lr0 &times; backbone_lr_mult</code> (<code>llrd=1.0</code> = flat)</td></tr>
+      <tr><td><code>box_head</code></td><td><code>False</code></td><td>auxiliary box head: L1 + GIoU loss and a box term in the Hungarian matching cost</td></tr>
+      <tr><td><code>deep_supervision</code></td><td><code>True</code></td><td><code>False</code> stops supervising a query block once its masked attention is annealed away (~26% faster steps in the mask-free last sixth)</td></tr>
+      <tr><td><code>poly_power</code> / <code>warmup_steps</code></td><td><code>0.9</code> / <code>(500, 1000)</code></td><td>polynomial LR decay to 0; two-stage warmup in optimizer steps (head, then ViT with its LR held at 0 during the head warmup)</td></tr>
       <tr><td><code>aug</code></td><td>strong recipe</td><td>every augmentation knob (<code>AugConfig</code>): flip, Large-Scale Jitter, rotate / shear / perspective, gamma, grayscale, blur, noise, JPEG, glare, safe erasing; mosaic / mixup / copy-paste and the instance-aware crop are off. A mapping, or a <code>train_aug</code> block in the dataset YAML; <code>{"preset": "legacy"}</code> restores the original recipe</td></tr>
       <tr><td><code>min_scale</code> / <code>max_scale</code></td><td><code>0.1</code> / <code>2.0</code></td><td>Large-Scale Jitter range (explicit values beat <code>aug</code>)</td></tr>
       <tr><td><code>letterbox</code></td><td><code>True</code></td><td>aspect-preserving letterbox eval (vs legacy square stretch); recorded in the checkpoint</td></tr>
       <tr><td><code>flip_prob</code></td><td><code>0.5</code></td><td>horizontal-flip probability (explicit values beat <code>aug</code>)</td></tr>
       <tr><td><code>train_transform</code></td><td><code>None</code></td><td>your own <code>(image, masks) &rarr; (image, masks)</code> callable, replacing the built-in pipeline</td></tr>
-      <tr><td><code>mask_anneal</code></td><td><code>True</code></td><td>anneal masked attention <code>1→0</code> over training</td></tr>
+      <tr><td><code>mask_anneal</code> / <code>mask_anneal_start</code> / <code>mask_anneal_end</code></td><td><code>True</code> / <code>(1/6, 2/6, 3/6, 4/6)</code> / <code>(2/6, 3/6, 4/6, 5/6)</code></td><td>anneal masked attention <code>1→0</code>, one window (fraction of training) per query block</td></tr>
       <tr><td><code>aux_w</code></td><td><code>1.0</code></td><td>weight on the summed secondary-head loss</td></tr>
     </tbody>
   </table>

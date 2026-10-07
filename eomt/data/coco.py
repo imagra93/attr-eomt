@@ -235,7 +235,7 @@ class _InstanceWeights:
     """Per-instance sampling weights for the instance-aware crop: ``freq(key) ** -power``.
 
     ``key`` is the instance's primary class, or its value of the attribute named by
-    ``aug.instance_crop_rarity_attr`` (e.g. ``"typology"``), so rare kinds are chosen as the crop's focus more often.
+    ``aug.instance_crop_rarity_attr`` (e.g. ``"material"``), so rare kinds are chosen as the crop's focus more often.
     Only built when the instance-aware crop is enabled (``instance_crop_prob`` / ``instance_crop_empty_prob`` > 0).
     """
 
@@ -286,6 +286,10 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
     Augmentation: ``aug`` (an :class:`~eomt.data.transforms.AugConfig` or a mapping) holds every knob;
     ``flip_prob`` / ``min_scale`` / ``max_scale`` override it when given; ``transform`` replaces the built-in
     pipeline altogether.
+
+    ``keep_empty=True`` keeps the images with no annotations as **negatives**: they yield zero targets (``masks``
+    ``(0, imgsz, imgsz)``, empty ``class_t`` / attribute tensors), so every query is trained as "no object". The default
+    (``False``) drops them, as before.
     """
 
     def __init__(
@@ -299,6 +303,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
         min_scale: float | None = None,
         max_scale: float | None = None,
         aug: AugConfig | dict | None = None,
+        keep_empty: bool = False,
         attributes: list[str] | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
     ):
@@ -306,6 +311,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
 
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
+        self.keep_empty = keep_empty
         # One source of truth for the augmentation defaults (:class:`AugConfig`); the explicit keywords
         # (``flip_prob`` / ``min_scale`` / ``max_scale``) override ``aug`` when given.
         self.aug = AugConfig.resolve(aug, flip_prob=flip_prob, min_scale=min_scale, max_scale=max_scale)
@@ -330,7 +336,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
         self.ids = [
             i
             for i in self.coco.getImgIds()
-            if len(self.coco.getAnnIds(imgIds=i, iscrowd=False)) > 0
+            if keep_empty or len(self.coco.getAnnIds(imgIds=i, iscrowd=False)) > 0
         ]
         self._init_weights()
         # ``transform`` replaces the built-in pipeline (any ``(image, masks) -> (image, masks)`` callable, e.g. a
@@ -375,6 +381,10 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
             masks_tv = tv_tensors.Mask(torch.stack(masks))  # (N, H, W) uint8
             class_t = torch.tensor(classes, dtype=torch.long)
             attr_t = {k: torch.tensor(v, dtype=torch.long) for k, v in attrs.items()}
+        elif self.keep_empty:  # a negative image: genuinely zero targets
+            masks_tv = tv_tensors.Mask(torch.zeros((0, *image_tv.shape[1:]), dtype=torch.uint8))
+            class_t = torch.zeros((0,), dtype=torch.long)
+            attr_t = {s.name: torch.zeros((0,), dtype=torch.long) for s in self.aux_specs}
         else:  # should not happen (filtered), but stay safe
             masks_tv = tv_tensors.Mask(torch.zeros((1, *image_tv.shape[1:]), dtype=torch.uint8))
             class_t = torch.zeros((1,), dtype=torch.long)
@@ -389,6 +399,17 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
 
     def __getitem__(self, idx: int):
         image_tv, masks_tv, class_t, attr_t, keys = self._load_raw(idx)
+
+        if self.keep_empty and class_t.numel() == 0:  # negative: augment once, keep the empty target
+            if getattr(self.transform, "is_train_augment", False):
+                c = self.transform.cfg
+                multi = c.mosaic_prob > 0 or c.mixup_prob > 0 or c.copy_paste_prob > 0
+                image_t, masks_t, class_t, attr_t = self.transform(
+                    image_tv, masks_tv, class_t, attr_t, sampler=self._sample_other if multi else None
+                )
+            else:
+                image_t, masks_t = self.transform(image_tv, masks_tv)
+            return image_t, masks_t.float(), class_t, attr_t
 
         # Apply augmentation; if a random crop removes every instance, retry a few
         # times, then fall back to a plain resize (no crop) that always preserves
@@ -571,10 +592,12 @@ class CocoDetection(_InstanceWeights, Dataset):
 
 
 class CocoValImages(Dataset):
-    """COCO images for evaluation -> ``(pixel_values, image_id, orig_w, orig_h)``.
+    """COCO images for evaluation -> ``(pixel_values, image_id, orig_w, orig_h, meta)``.
 
     Ground-truth annotations are read from the JSON by ``COCOeval`` directly, so
-    this dataset only needs to deliver preprocessed pixels and identity/size.
+    this dataset only needs to deliver preprocessed pixels and identity/size. With
+    ``raw=True`` it delivers the decoded RGB image ``(H, W, 3)`` uint8 instead (and
+    ``meta=None``), for test-time augmentation, which preprocesses each view itself.
     """
 
     def __init__(
@@ -588,12 +611,14 @@ class CocoValImages(Dataset):
         std=None,
         attributes: list[str] | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
+        raw: bool = False,
     ):
         from pycocotools.coco import COCO
 
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
         self.letterbox = letterbox
+        self.raw = raw
         self.mean = mean
         self.std = std
         self.coco = COCO(str(json_file))
@@ -620,6 +645,8 @@ class CocoValImages(Dataset):
         info = self.coco.loadImgs(img_id)[0]
         img = Image.open(self.img_dir / info["file_name"]).convert("RGB")
         orig_w, orig_h = img.size
+        if self.raw:
+            return np.array(img), int(img_id), orig_w, orig_h, None
         chw, meta = preprocess_numpy(
             np.array(img), self.imgsz, letterbox=self.letterbox, mean=self.mean, std=self.std,
         )
@@ -642,7 +669,8 @@ def collate_train(batch):
 
 
 def collate_val(batch):
-    pixel_values = torch.stack([b[0] for b in batch])
+    # raw images (``CocoValImages(raw=True)``) differ in size: kept as a list
+    pixel_values = torch.stack([b[0] for b in batch]) if isinstance(batch[0][0], torch.Tensor) else [b[0] for b in batch]
     image_ids = [b[1] for b in batch]
     sizes = [(b[2], b[3]) for b in batch]
     metas = [b[4] for b in batch]

@@ -24,9 +24,12 @@ def match_queries(model, out: dict, geom_labels, class_labels):
     ``"instance"`` family, normalized ``cxcywh`` boxes for ``"detect"``. The right
     matcher (mask-cost or box-cost) is selected by what the model emitted in ``out``.
     """
-    geom = out["pred_boxes"] if "pred_boxes" in out else out["masks_queries_logits"]
+    if "pred_boxes" in out:  # detect family
+        return model.eomt.criterion.matcher(out["pred_boxes"], out["class_queries_logits"], geom_labels, class_labels)
+    # Instance family; with the auxiliary box head the matcher also uses the box cost, as the loss did.
+    boxes = {"pred_boxes": out["aux_boxes"]} if out.get("aux_boxes") is not None else {}
     return model.eomt.criterion.matcher(
-        geom, out["class_queries_logits"], geom_labels, class_labels
+        out["masks_queries_logits"], out["class_queries_logits"], geom_labels, class_labels, **boxes
     )
 
 
@@ -97,12 +100,15 @@ def _localization_iou(out, b, src, tgt, geom_labels, is_detect, dev):
         pred = box_cxcywh_to_xyxy(out["pred_boxes"][b, src].to(dev))  # [n, 4]
         gt = box_cxcywh_to_xyxy(geom_labels[b][tgt].to(dev).float())  # [n, 4]
         return box_iou(pred, gt)[0].diagonal()  # per-matched-pair IoU
-    masks = out["masks_queries_logits"]  # [B, Q, h, w]
-    pm = masks[b, src].sigmoid() > 0.5  # [n, h, w]
-    gm = geom_labels[b][tgt].to(dev).float()  # [n, H, W] in {0, 1}
-    if gm.shape[-2:] != pm.shape[-2:]:
-        gm = F.interpolate(gm.unsqueeze(1), size=pm.shape[-2:], mode="nearest").squeeze(1)
-    gm = gm > 0.5
+    # Compared at the GT's resolution: shrinking the GT to the logit grid with "nearest" erases many instances of a
+    # few pixels (IoU 0, so they never trained the attribute heads). A thin or tiny soft GT can have no pixel above
+    # 0.5, so each GT is binarised at half its own peak.
+    logits = out["masks_queries_logits"][b, src].float()  # [n, h, w]
+    gm = geom_labels[b][tgt].to(dev).float()  # [n, H, W], soft or binary
+    if logits.shape[-2:] != gm.shape[-2:]:
+        logits = F.interpolate(logits.unsqueeze(1), size=gm.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
+    pm = logits > 0
+    gm = gm >= (0.5 * gm.flatten(1).amax(1)).clamp(min=1e-6)[:, None, None]
     inter = (pm & gm).flatten(1).sum(1).float()
     union = (pm | gm).flatten(1).sum(1).float().clamp(min=1.0)
     return inter / union

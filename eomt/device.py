@@ -5,7 +5,10 @@ several GPUs present — pick a specific card with an explicit ``"cuda:N"``), el
 CPU. Defaulting to a single fixed device keeps a run on one GPU: ``auto`` is
 resolved more than once per run (model load, then training), and a "least busy"
 heuristic could land those calls on different cards and split the run across both.
-An explicit ``"cpu"`` / ``"cuda:N"`` (or a ``torch.device``) is honored as-is.
+An explicit ``"cpu"`` / ``"cuda:N"`` (or a ``torch.device``) is honored as-is, and a
+GPU index ``"N"`` means ``"cuda:N"``. Several indices (``"0,1"``) are a multi-GPU
+training spec (see :func:`gpu_ids`); anything else run with it (loading, predicting)
+uses the first of them.
 The first time each device is resolved, one line is logged so it is always clear
 which device a run landed on.
 """
@@ -18,12 +21,21 @@ import torch
 _logged: set[str] = set()
 
 
+def gpu_ids(device) -> list[int]:
+    """The GPU indices of a spec written as indices (``"0,1"`` -> ``[0, 1]``, ``"1"`` -> ``[1]``), else ``[]``."""
+    if isinstance(device, str) and device.replace(",", "").replace(" ", "").isdigit():
+        return [int(i) for i in device.split(",")]
+    return []
+
+
 def resolve_device(device: str | torch.device = "auto", *, verbose: bool = True) -> torch.device:
     """Resolve a device spec to a concrete :class:`torch.device` (see module docstring)."""
     if isinstance(device, torch.device):
         dev = device
     elif device in ("", "auto"):
         dev = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    elif gpu_ids(device):
+        dev = torch.device(f"cuda:{gpu_ids(device)[0]}")
     else:
         dev = torch.device(device)
     if verbose:

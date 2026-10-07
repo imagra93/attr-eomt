@@ -97,9 +97,9 @@ def test_augconfig_resolve_precedence_and_yaml_roundtrip():
     c = AugConfig.from_dict({"preset": "legacy", "blur_prob": 0.4})
     assert c.blur_prob == 0.4 and c.rotate_prob == 0.0 and c.mask_resize == "nearest"
     # ranges survive a YAML round trip (lists <-> tuples)
-    d = AugConfig(blur_sigma=(0.2, 0.9), instance_crop_rarity_attr="typology").to_dict()
+    d = AugConfig(blur_sigma=(0.2, 0.9), instance_crop_rarity_attr="kind").to_dict()
     again = AugConfig.from_dict(yaml.safe_load(yaml.safe_dump(d)))
-    assert again == AugConfig(blur_sigma=(0.2, 0.9), instance_crop_rarity_attr="typology")
+    assert again == AugConfig(blur_sigma=(0.2, 0.9), instance_crop_rarity_attr="kind")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -429,8 +429,9 @@ def test_copy_paste_occludes_existing_masks():
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _mini_coco(tmp_path, n_images=4, bbox_only=False):
-    """n tiny images, each with a wide and a thin instance of different 'typology'; returns (img_dir, json)."""
+def _mini_coco(tmp_path, n_images=4, bbox_only=False, n_negatives=0):
+    """n tiny images, each with a wide and a thin instance of different 'kind' (plus ``n_negatives`` images with
+    no annotations at all); returns (img_dir, json)."""
     img_dir = tmp_path / "images"
     img_dir.mkdir()
     anns, imgs, aid = [], [], 1
@@ -441,10 +442,13 @@ def _mini_coco(tmp_path, n_images=4, bbox_only=False):
         for typ, (x0, y0, x1, y1) in ((0, (10, 10, 90, 60)), (1, (20, 80, 140, 86))):
             anns.append({"id": aid, "image_id": i, "category_id": 1, "iscrowd": 0, "bbox": [x0, y0, x1 - x0, y1 - y0],
                          "area": (x1 - x0) * (y1 - y0), "segmentation": [[x0, y0, x1, y0, x1, y1, x0, y1]],
-                         "attributes": {"typology": typ}})
+                         "attributes": {"kind": typ}})
             aid += 1
-    coco = {"images": imgs, "categories": [{"id": 1, "name": "damage"}], "annotations": anns,
-            "attributes": [{"name": "typology", "categories": [{"id": 0, "name": "blob"}, {"id": 1, "name": "line"}]}]}
+    for i in range(n_images + 1, n_images + n_negatives + 1):
+        Image.fromarray(rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)).save(img_dir / f"im{i}.png")
+        imgs.append({"id": i, "file_name": f"im{i}.png", "width": 160, "height": 120})
+    coco = {"images": imgs, "categories": [{"id": 1, "name": "object"}], "annotations": anns,
+            "attributes": [{"name": "kind", "categories": [{"id": 0, "name": "blob"}, {"id": 1, "name": "line"}]}]}
     jf = tmp_path / "instances_train.json"
     jf.write_text(json.dumps(coco))
     return img_dir, jf
@@ -465,6 +469,46 @@ def test_dataset_defaults_are_the_same_as_the_trainers(tmp_path):
     assert "aug" in sig and "train_transform" in sig
 
 
+def test_keep_empty_keeps_negatives_as_zero_target_samples(tmp_path):
+    img_dir, jf = _mini_coco(tmp_path, n_images=4, n_negatives=3)
+    assert len(CocoInstanceSeg(img_dir, jf, imgsz=112)) == 4  # default: images without annotations are dropped
+    aug = {"rotate_prob": 1.0, "shear_prob": 1.0, "perspective_prob": 1.0, "erasing_prob": 1.0,
+           "instance_crop_prob": 1.0, "instance_crop_empty_prob": 0.5, "instance_crop_rarity_attr": "kind"}
+    custom = lambda image, masks: build_val_transform(112)(image, masks)  # noqa: E731
+    for ds in (CocoInstanceSeg(img_dir, jf, imgsz=112, aug=aug, keep_empty=True),
+               CocoInstanceSeg(img_dir, jf, imgsz=112, transform=custom, keep_empty=True)):
+        assert len(ds) == 7
+        torch.manual_seed(0)
+        for _ in range(5):
+            for i in range(len(ds)):
+                x, m, c, a = ds[i]
+                assert x.shape == (3, 112, 112) and m.dtype == torch.float32
+                if i < 4:  # positives are untouched by the option
+                    assert m.shape[0] == c.shape[0] == a["kind"].shape[0] >= 1
+                else:      # negatives: genuinely zero targets, not a fabricated placeholder instance
+                    assert m.shape == (0, 112, 112) and c.shape == (0,) and a["kind"].shape == (0,)
+                    assert c.dtype == torch.long and a["kind"].dtype == torch.long
+
+
+def test_collate_and_train_handle_negatives(tmp_path):
+    from eomt.data import collate_train
+
+    img_dir, jf = _mini_coco(tmp_path, n_images=2, n_negatives=6)
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=112, keep_empty=True)
+    px, masks, classes, aux = collate_train([ds[2], ds[3]])  # an all-negative batch
+    assert px.shape == (2, 3, 112, 112) and [m.shape[0] for m in masks] == [0, 0] and aux["kind"][0].numel() == 0
+    # the real trainer: batch 2 over 2 positives + 6 negatives (so all-negative micro-batches occur), with the aux head
+    from eomt.engine.train import train
+
+    res = train(train_images=str(img_dir), train_json=str(jf), size="s", imgsz=112, epochs=1, batch=2, accum=1, workers=0,
+                device="cpu", amp=False, pretrained=False, ema=False, seed=0, keep_empty=True, project=str(tmp_path / "runs"), name="neg")
+    args = yaml.safe_load((tmp_path / "runs" / "neg" / "args.yaml").read_text())
+    assert args["keep_empty"] is True and res["last"].endswith("last.pt")
+    with pytest.raises(ValueError, match="keep_empty"):
+        train(train_images=str(img_dir), train_json=str(jf), size="s", family="detect", imgsz=112, epochs=1, batch=2, workers=0,
+              device="cpu", amp=False, pretrained=False, keep_empty=True, project=str(tmp_path / "runs"), name="det")
+
+
 def test_dataset_items_are_valid_with_the_default_pipeline(tmp_path):
     torch.manual_seed(0)
     img_dir, jf = _mini_coco(tmp_path)
@@ -473,7 +517,7 @@ def test_dataset_items_are_valid_with_the_default_pipeline(tmp_path):
         for _ in range(5):
             x, m, cls, attrs = ds[i]
             assert x.shape == (3, 112, 112) and m.shape[1:] == (112, 112) and m.dtype == torch.float32
-            assert m.shape[0] == cls.shape[0] == attrs["typology"].shape[0] >= 1
+            assert m.shape[0] == cls.shape[0] == attrs["kind"].shape[0] >= 1
             assert (m.flatten(1).sum(1) >= ds.aug.min_mask_mass).all()
 
 
@@ -498,14 +542,14 @@ def test_dataset_runs_each_multi_image_op_end_to_end(tmp_path, op):
     seen = set()
     for _ in range(6):
         x, m, cls, attrs = ds[0]
-        assert m.shape[0] == cls.shape[0] == attrs["typology"].shape[0]
+        assert m.shape[0] == cls.shape[0] == attrs["kind"].shape[0]
         seen.add(m.shape[0])
     assert max(seen) > 2  # instances really were added from other images
 
 
 def test_instance_crop_weights_follow_the_rarest_attribute_value(tmp_path):
     img_dir, jf = _mini_coco(tmp_path)
-    ds = CocoInstanceSeg(img_dir, jf, imgsz=112, aug={"instance_crop_prob": 1.0, "instance_crop_rarity_attr": "typology"})
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=112, aug={"instance_crop_prob": 1.0, "instance_crop_rarity_attr": "kind"})
     assert ds._rarity is not None
     w = ds._instance_weights([0, 1, 1])
     assert w.shape == (3,) and (w > 0).all()
@@ -584,9 +628,9 @@ def test_cli_aug_parsing():
     spec = importlib.util.spec_from_file_location("train_cli", Path(__file__).resolve().parents[1] / "scripts" / "train.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    out = mod._parse_aug(["rotate_prob=0.5", "blur_sigma=[0.3,1.0]", "erasing_avoid_instances=false", "instance_crop_rarity_attr=typology"], "legacy")
+    out = mod._parse_aug(["rotate_prob=0.5", "blur_sigma=[0.3,1.0]", "erasing_avoid_instances=false", "instance_crop_rarity_attr=kind"], "legacy")
     assert out == {"preset": "legacy", "rotate_prob": 0.5, "blur_sigma": [0.3, 1.0], "erasing_avoid_instances": False,
-                   "instance_crop_rarity_attr": "typology"}
+                   "instance_crop_rarity_attr": "kind"}
     assert mod._parse_aug([], None) is None
     with pytest.raises(SystemExit):
         mod._parse_aug(["oops"], None)

@@ -53,6 +53,36 @@ def generalized_box_iou(boxes1: Tensor, boxes2: Tensor) -> Tensor:
     return iou - (area - union) / area.clamp(min=1e-6)
 
 
+def masks_to_norm_boxes(masks: Tensor, thresh: float = 0.1) -> Tensor:
+    """Tight boxes of ``(N, H, W)`` instance masks as normalized ``cxcywh`` ``(N, 4)`` in ``[0, 1]``.
+
+    A pixel belongs to the instance when its (possibly soft, area-averaged) value exceeds ``thresh``;
+    a thin or tiny instance can have no pixel above 0.5 after resizing, which is why the threshold is
+    low. An instance with no pixel above it falls back to a one-pixel box at its strongest pixel, so
+    every row is a valid box. Edges are pixel edges (``x1`` is the last column + 1).
+    """
+    n, h, w = masks.shape
+    if n == 0:
+        return masks.new_zeros((0, 4), dtype=torch.float32)
+    m = masks > thresh
+    empty = ~m.flatten(1).any(1)
+    if empty.any():  # fallback: the strongest pixel
+        peak = masks.flatten(1).argmax(1)
+        fix = torch.zeros_like(m.flatten(1))
+        fix[torch.arange(n, device=m.device), peak] = True
+        m = torch.where(empty[:, None, None], fix.view(n, h, w), m)
+    ys = torch.arange(h, device=m.device)
+    xs = torch.arange(w, device=m.device)
+    rows, cols = m.any(2), m.any(1)  # (N, H), (N, W)
+    big = max(h, w) + 1
+    y0 = torch.where(rows, ys, big).min(1).values
+    y1 = torch.where(rows, ys, -1).max(1).values + 1
+    x0 = torch.where(cols, xs, big).min(1).values
+    x1 = torch.where(cols, xs, -1).max(1).values + 1
+    boxes = torch.stack([(x0 + x1) / 2 / w, (y0 + y1) / 2 / h, (x1 - x0) / w, (y1 - y0) / h], dim=1)
+    return boxes.to(torch.float32)
+
+
 class DetectionHungarianMatcher(nn.Module):
     """1-to-1 assignment between queries and GT boxes via class + L1 + GIoU cost."""
 

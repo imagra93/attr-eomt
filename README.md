@@ -376,8 +376,98 @@ EoMT("runs/train/eomt-l").val(data="coco")
 EoMT("runs/train/eomt-l").predict("images/", plot=True)   # writes annotated images
 ```
 
+**Several GPUs.** `device="0,1"` trains on both GPUs, one process each (DistributedDataParallel); `"auto"` is GPU 0.
+`batch` is per GPU and `nominal_batch` (16) stays the global effective batch, so the optimizer steps, LR schedule and
+masked-attention annealing are exactly those of one GPU, with an epoch 1.9× faster on two RTX 5090s (1.8× end to end with
+validation and checkpoints). Validation splits the val images between the
+GPUs; the main process scores them and alone logs and writes checkpoints. The processes are spawned, so every `train()`
+argument must be picklable.
+
+```python
+EoMT("l", device="0,1").train(data="coco", epochs=50, batch=2)   # 2 per GPU x accum 4 x 2 GPUs = effective 16
+```
+
+**Test-time augmentation and tiled inference** (instance family). `predict()` and `val()` take `augment=True` (the
+image at `imgsz` and zoomed to 1.5x `imgsz`) and `tiles=True` (overlapping tiles of `imgsz` px of the original image, i.e. native resolution,
+25 % overlap, plus the whole image: small objects in large images). The views' instances are merged: same class and
+mask IoU >= 0.5 measured where both views can see, so an object cut by a tile border is put back together; the mask
+logits are averaged and the score is the mean over the views that could see the object (one that missed it votes 0).
+Each takes a dict of overrides; see
+[`eomt/tta.py`](eomt/tta.py). `augment={"flip": True}` also merges mirrored views: never with left / right classes or
+attributes, which a mirrored view predicts swapped.
+
+```python
+m = EoMT("runs/train/eomt-l")
+m.predict("images/", augment=True)                                  # + the image at 1.5x imgsz
+m.val(data="data.yaml", tiles=True)                                 # native tiles + the whole image
+m.predict("images/", augment={"flip": True}, tiles=1024)            # 1x / 1.5x and mirrored; 1024 px tiles
+```
+
+`scripts/val.py` and `scripts/predict.py` take `--augment` and `--tiles [SIZE]`. Each view is a forward pass: `augment`
+costs ~3.5x one prediction (the 1.5x view has 2.25x the pixels); a 1280 x 960 photo at `imgsz` 644 makes 6 tiles + the
+whole image.
+
 For the full training recipe, every `train()` knob, and int8 compression, see the
 **[annotated explainer →](https://imagra93.github.io/attr-eomt)** — it's the deep dive.
+
+### Optimisation recipe
+
+`train()` follows the reference EoMT recipe (checked numerically against the official code: every parameter group's
+LR, every step of the LR schedule, and the masked-attention annealing agree exactly):
+
+| | default |
+|---|---|
+| optimizer | AdamW, `lr0=1e-4`, `weight_decay=0.05` (not applied to norms, biases and embeddings) |
+| head LR | `lr0` |
+| encoder LR | layer-wise decay `llrd=0.8`, `backbone_lr_mult=1.0`: the **top ViT block is at the full `lr0`** and each block below is 0.8× the one above; embeddings follow the first block, the final norm is at `lr0` |
+| schedule | polynomial decay (`poly_power=0.9`) to 0 after a two-stage warmup in optimizer steps `warmup_steps=(500, 1000)`: the head warms up while the ViT LR is held at 0, then the ViT ramps up |
+| masked attention | annealed block by block (`mask_anneal_start/end`, fractions of training: 1/6–2/6, 2/6–3/6, 3/6–4/6, 4/6–5/6, polynomial); the last sixth of training is mask-free |
+
+In EoMT the last four transformer blocks are the ones that process the queries and predict the masks, so they must learn at
+close to the head's speed: scaling the whole encoder by 0.1 (as detector-style recipes do for a backbone) starves them. The
+LR decay and the annealing span `epochs`, and validation runs mask-free, so metrics logged early in a long run understate
+the model. The official COCO recipe trains for 12 epochs (about 89k optimizer steps at batch 16).
+
+### Architecture options
+
+All are keyword arguments of `train()` (and flags of `scripts/train.py`); checkpoints record them, so `EoMT(path)` rebuilds
+the model with the same modules, and checkpoints without them load as before.
+
+| option | what it does | cost, ViT-L at 644 px, batch 2, bf16 (measured, relative to the default) |
+|---|---|---|
+| `fpn_scales=None` | drop the multi-scale FPN (default `(2, 1, 0.5)`) | +12 % throughput, −0.5 GB |
+| `box_head=True` | auxiliary box head: L1 + GIoU loss on the matched queries, and the same terms in the matching cost (a localisation signal that does not depend on the mask grid). Predicted boxes are returned as `aux_boxes` / `head_boxes` | −7 % |
+| `deep_supervision=False` | stop supervising a query block's prediction once that block's masked attention is annealed away (while it masks, the prediction builds its attention mask and stays supervised: unsupervised, it made noise masks). Blocks drop out at 2/6, 3/6, 4/6, 5/6 of training | none while blocks mask; +26 % per step once all are annealed (last sixth) |
+| `num_upscale_blocks=3` | 368² mask logits at 644 px (small masks); the block predictions stay at 184² (they only build 46² attention masks), only the output is 368²; cannot warm-start a 2-block checkpoint | −17 % (10.1 vs 12.1 img/s), 22.2 GB |
+| `iou_aware_cls=True` | train a matched query's class probability towards `(1 + mask IoU) / 2` instead of 1 (IoU-aware targets, as in VarifocalNet / Stable-DINO), so the score ranks loose masks below tight ones; above 0.5, so matched queries keep their class for the attribute gate. Hard targets reduce exactly to the weighted CE. Windscreen damage, 12 epochs at 644 px, against the same recipe: segm AP 0.0296 -> 0.0758, AP small 0.0033 -> 0.0106, AP large 0.128 -> 0.210, bbox AP 0.177 -> 0.217, attribute accuracy unchanged | one upsample of the matched masks |
+| `quality_weight=2` | mask-quality head: a small MLP on the query embedding predicts each matched query's mask IoU (BCE against the measured IoU, final prediction only; Mask Scoring R-CNN), and postprocess scores class probability x predicted IoU instead of the mean mask probability. Windscreen damage, with `iou_aware_cls`, two seeds against the same recipe without the head: segm AP +7 / +13 %, AP small +19 % / 3.6x, AP medium +21 / +22 %, AR100 +2 / +5 %, bbox AP and attribute accuracy unchanged | one MLP on the queries |
+| `val_imgsz=N` | validate (and pick `best.pt`) at another input size than `imgsz`. Scale jitter shows the objects larger, on average, than a val image resized to `imgsz`: validate at `imgsz` × the mean training scale. Windscreens (training scale 0.4-1.0 of the photo, val 0.5), same checkpoint: segm AP 0.0113 at 644, 0.0173 at 896 | val time grows with the pixels |
+| `stop_after_epochs=N` | stop after N epochs while the LR schedule and mask annealing still span `epochs` (truncated A/B runs) | |
+
+Always on (training-side; inference of existing checkpoints is unchanged):
+
+- **Masked attention keeps small objects in view.** A query may attend to every patch its predicted mask touches (max-pool of
+  the mask logits onto the patch grid), and a query whose mask touches no patch attends to all of them, as in Mask2Former. The
+  reference EoMT downsamples bilinearly (only the centre of each patch counts) and leaves an empty-mask query blind, which in
+  practice blinded the queries of most objects smaller than a patch during the masked phase. The mask is a boolean
+  `[B, 1, N, N]` and is not built in a block whose annealing probability has reached 0.
+- **Mask terms that see small objects.** Matching scores every query on every cell of the mask-logit grid against the GT
+  area-averaged onto it, instead of on 12,544 random points (one per ~33 px² at 644 px, so an object of a few dozen pixels often
+  got no point and its assigned query changed from step to step). The mask loss keeps the reference's BCE on 12,544 points
+  concentrated where the prediction is uncertain (the boundaries), and computes dice on every GT pixel against the upsampled
+  logits, so every instance is supervised however small. A fully dense loss gave coarser masks (AP75 down) on thin objects;
+  dropping the points altogether lost the boundaries. The `train_num_points` / `oversample_ratio` / `importance_sample_ratio`
+  settings are gone (fixed at the reference values; checkpoints that carry them still load).
+- **Attribute IoU gate at full resolution.** The gate that decides which matched queries train the attribute heads compares the
+  upsampled prediction with the GT, instead of shrinking the GT to the logit grid with "nearest" (which erased many objects of a
+  few pixels, so they never trained the attribute heads).
+
+Inference: `predict_image(..., amp=True)` (and `predict(..., amp=True)`) runs the network under bf16 autocast, ~2.5x faster at 644 px
+on an RTX 5090 with the same accuracy on a trained ViT-L model (AP within 0.002 in every size bucket). Off by default.
+
+**What is not established:** the accuracy effect of `box_head`, `deep_supervision=False`,
+`iou_aware_cls` and `quality_weight` (beyond the windscreen data), dropping the FPN and the always-on changes above depends on the data. Measure it with truncated runs (`stop_after_epochs`), which follow the schedule of a full run, against a reference run at equal
+epochs.
 
 ---
 
@@ -413,7 +503,7 @@ train_aug:
   min_scale: 0.6                  # thin / tiny objects: keep the effective scale r = imgsz/long_side * s in ~[0.4, 1.0]
   max_scale: 1.6
   instance_crop_prob: 0.8         # optional instance-aware crop: window placed around a (rarity-weighted) instance
-  instance_crop_rarity_attr: typology
+  instance_crop_rarity_attr: material
 ```
 
 ```bash
@@ -431,6 +521,9 @@ Things worth knowing:
   `instance_crop_rarity_attr` makes rare attribute values the crop's focus more often.
 - **Multi-image ops** (`mosaic`, `mixup`, `copy_paste`) add instances from other samples and are *off*: they splice or
   blend long thin structures, so try them deliberately and look at the result.
+- **Negatives.** Images with no annotations are dropped from the train set by default. `train(keep_empty=True)` keeps
+  them as zero-target samples (masks `(0, imgsz, imgsz)`, every query is trained as "no object"); validation already
+  includes them. Instance family only.
 - `args.yaml` of a run records the resolved `aug` dict; the log prints the active ops at start.
 - `build_train_transform(imgsz, aug=...)` returns the same pipeline for use in your own loaders
   (`tf(image_uint8, masks) -> (image, masks)`).
