@@ -592,10 +592,12 @@ class CocoDetection(_InstanceWeights, Dataset):
 
 
 class CocoValImages(Dataset):
-    """COCO images for evaluation -> ``(pixel_values, image_id, orig_w, orig_h)``.
+    """COCO images for evaluation -> ``(pixel_values, image_id, orig_w, orig_h, meta)``.
 
     Ground-truth annotations are read from the JSON by ``COCOeval`` directly, so
-    this dataset only needs to deliver preprocessed pixels and identity/size.
+    this dataset only needs to deliver preprocessed pixels and identity/size. With
+    ``raw=True`` it delivers the decoded RGB image ``(H, W, 3)`` uint8 instead (and
+    ``meta=None``), for test-time augmentation, which preprocesses each view itself.
     """
 
     def __init__(
@@ -609,12 +611,14 @@ class CocoValImages(Dataset):
         std=None,
         attributes: list[str] | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
+        raw: bool = False,
     ):
         from pycocotools.coco import COCO
 
         self.img_dir = Path(img_dir)
         self.imgsz = imgsz
         self.letterbox = letterbox
+        self.raw = raw
         self.mean = mean
         self.std = std
         self.coco = COCO(str(json_file))
@@ -641,6 +645,8 @@ class CocoValImages(Dataset):
         info = self.coco.loadImgs(img_id)[0]
         img = Image.open(self.img_dir / info["file_name"]).convert("RGB")
         orig_w, orig_h = img.size
+        if self.raw:
+            return np.array(img), int(img_id), orig_w, orig_h, None
         chw, meta = preprocess_numpy(
             np.array(img), self.imgsz, letterbox=self.letterbox, mean=self.mean, std=self.std,
         )
@@ -663,7 +669,8 @@ def collate_train(batch):
 
 
 def collate_val(batch):
-    pixel_values = torch.stack([b[0] for b in batch])
+    # raw images (``CocoValImages(raw=True)``) differ in size: kept as a list
+    pixel_values = torch.stack([b[0] for b in batch]) if isinstance(batch[0][0], torch.Tensor) else [b[0] for b in batch]
     image_ids = [b[1] for b in batch]
     sizes = [(b[2], b[3]) for b in batch]
     metas = [b[4] for b in batch]

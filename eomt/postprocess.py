@@ -16,7 +16,12 @@ import torch.nn.functional as F  # noqa: N812
 
 
 def _build_aux_result(aux_logits: dict, sel, classes, aux_scopes: dict | None) -> dict:
-    """Per-head ``{name: {"ids", "probs"}}`` for the kept queries, class-scope-gated.
+    """Per-head ``{name: {"ids", "probs"}}`` for the kept queries, class-scope-gated (see :func:`aux_result`)."""
+    return aux_result({name: lg[0].float().softmax(dim=-1)[sel] for name, lg in aux_logits.items()}, classes, aux_scopes)
+
+
+def aux_result(aux_probs: dict, classes, aux_scopes: dict | None) -> dict:
+    """Per-head ``{name: {"ids", "probs"}}`` from per-detection probabilities ``{name: (N, ns)}``, class-scope-gated.
 
     For a class-scoped head (``aux_scopes[name]`` a set of primary class ids), any kept
     detection whose class is out of scope gets ``ids = -1`` (the "not applicable"
@@ -25,8 +30,7 @@ def _build_aux_result(aux_logits: dict, sel, classes, aux_scopes: dict | None) -
     """
     aux_scopes = aux_scopes or {}
     res: dict = {}
-    for name, lg in aux_logits.items():
-        probs = lg[0].float().softmax(dim=-1)[sel]  # (N, ns)
+    for name, probs in aux_probs.items():
         ids = probs.argmax(dim=-1)
         scope = aux_scopes.get(name)
         if scope is not None and ids.numel():
@@ -189,6 +193,25 @@ def postprocess_detection(
     return result
 
 
+def query_scores(class_logits, mask_logits, quality_logits, mask_thresh: float = 0.5):
+    """Per-query ``(scores, classes)`` ``(Q,)`` of one image: the best non-background class probability times the mask
+    score, from ``class_logits`` ``(Q, C+1)``, ``mask_logits`` ``(Q, h, w)`` and ``quality_logits`` ``(Q,)`` or None."""
+    # Last column is the "no-object" class — drop it.
+    cls_scores, classes = class_logits.float().softmax(dim=-1)[:, :-1].max(dim=-1)  # (Q,)
+
+    # Mask2Former-style score: weight the class confidence by mask "objectness"
+    # (mean sigmoid over the binarized region), computed on the low-res logits.
+    # This ranks crisp, confident masks above diffuse ones and lifts mAP. A model with a
+    # mask-quality head weights it by the predicted mask IoU instead (Mask Scoring R-CNN).
+    if quality_logits is not None:
+        mask_scores = quality_logits.float().sigmoid()
+    else:
+        mask_prob = mask_logits.float().sigmoid()  # (Q, h, w)
+        binar = mask_prob > mask_thresh
+        mask_scores = (mask_prob * binar).flatten(1).sum(1) / (binar.flatten(1).sum(1) + 1e-6)
+    return cls_scores * mask_scores, classes
+
+
 def postprocess_instance(
     output: dict,
     conf_thres: float,
@@ -225,24 +248,11 @@ def postprocess_instance(
         ``"aux": {name: {"ids": (N,), "probs": (N, ns)}}`` for the same kept queries.
     """
     mask_logits = output["masks_queries_logits"][0].float()  # (Q, h, w)
-    class_logits = output["class_queries_logits"][0].float()  # (Q, C+1)
     aux_logits = output.get("aux_queries_logits")  # {name: (1, Q, ns)} or None
-
-    # Last column is the "no-object" class — drop it.
-    scores_all = class_logits.softmax(dim=-1)[:, :-1]  # (Q, C)
-    cls_scores, classes = scores_all.max(dim=-1)  # (Q,)
-
-    # Mask2Former-style score: weight the class confidence by mask "objectness"
-    # (mean sigmoid over the binarized region), computed on the low-res logits.
-    # This ranks crisp, confident masks above diffuse ones and lifts mAP. A model with a
-    # mask-quality head weights it by the predicted mask IoU instead (Mask Scoring R-CNN).
-    if output.get("quality_logits") is not None:
-        mask_scores = output["quality_logits"][0].float().sigmoid()
-    else:
-        mask_prob = mask_logits.sigmoid()  # (Q, h, w)
-        binar = mask_prob > mask_thresh
-        mask_scores = (mask_prob * binar).flatten(1).sum(1) / (binar.flatten(1).sum(1) + 1e-6)
-    scores = cls_scores * mask_scores  # (Q,)
+    quality = output.get("quality_logits")
+    scores, classes = query_scores(
+        output["class_queries_logits"][0], mask_logits, None if quality is None else quality[0], mask_thresh
+    )
 
     orig_w, orig_h = original_size
     sel = (scores >= conf_thres).nonzero(as_tuple=True)[0]  # indices into Q

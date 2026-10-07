@@ -387,6 +387,26 @@ argument must be picklable.
 EoMT("l", device="0,1").train(data="coco", epochs=50, batch=2)   # 2 per GPU x accum 4 x 2 GPUs = effective 16
 ```
 
+**Test-time augmentation and tiled inference** (instance family). `predict()` and `val()` take `augment=True` (the
+image at `imgsz` and zoomed to 1.5x `imgsz`) and `tiles=True` (overlapping tiles of `imgsz` px of the original image, i.e. native resolution,
+25 % overlap, plus the whole image: small objects in large images). The views' instances are merged: same class and
+mask IoU >= 0.5 measured where both views can see, so an object cut by a tile border is put back together; the mask
+logits are averaged and the score is the mean over the views that could see the object (one that missed it votes 0).
+Each takes a dict of overrides; see
+[`eomt/tta.py`](eomt/tta.py). `augment={"flip": True}` also merges mirrored views: never with left / right classes or
+attributes, which a mirrored view predicts swapped.
+
+```python
+m = EoMT("runs/train/eomt-l")
+m.predict("images/", augment=True)                                  # + the image at 1.5x imgsz
+m.val(data="data.yaml", tiles=True)                                 # native tiles + the whole image
+m.predict("images/", augment={"flip": True}, tiles=1024)            # 1x / 1.5x and mirrored; 1024 px tiles
+```
+
+`scripts/val.py` and `scripts/predict.py` take `--augment` and `--tiles [SIZE]`. Each view is a forward pass: `augment`
+costs ~3.5x one prediction (the 1.5x view has 2.25x the pixels); a 1280 x 960 photo at `imgsz` 644 makes 6 tiles + the
+whole image.
+
 For the full training recipe, every `train()` knob, and int8 compression, see the
 **[annotated explainer →](https://imagra93.github.io/attr-eomt)** — it's the deep dive.
 

@@ -12,6 +12,7 @@ images and the main process scores (or counts) them all; the others get ``{}``.
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 
 import numpy as np
@@ -21,6 +22,7 @@ from tqdm import tqdm
 
 from ..data import collate_val
 from ..postprocess import postprocess_detection, postprocess_instance
+from ..tta import TTAConfig, predict_views
 from .distributed import gather, shard, sum_over_processes
 
 #: COCOeval.stats index -> metric name.
@@ -82,12 +84,22 @@ def evaluate(
     amp: bool = False,
     also_bbox: bool = True,
     verbose: bool = True,
+    augment: bool | dict = False,
+    tiles: bool | int | dict = False,
 ) -> dict[str, float]:
-    """Evaluate ``model`` on ``val_ds`` and return a COCO metrics dict."""
+    """Evaluate ``model`` on ``val_ds`` and return a COCO metrics dict.
+
+    ``augment`` / ``tiles`` (see :mod:`eomt.tta`) evaluate with test-time augmentation / tiled inference: each image is
+    predicted alone from its views, at ``val_ds.imgsz`` with its letterbox and normalisation.
+    """
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
     use_amp = amp and device.type == "cuda"
     contig2cat = val_ds.contig2cat
+    cfg = TTAConfig.resolve(augment, tiles)
+    if cfg is not None and not getattr(val_ds, "raw", False):  # the views are cut from the original image
+        val_ds = copy.copy(val_ds)
+        val_ds.raw = True
 
     loader = DataLoader(
         shard(val_ds),
@@ -104,26 +116,39 @@ def evaluate(
     for pixel_values, image_ids, sizes, metas in tqdm(
         loader, desc="val", unit="batch", leave=False, disable=not verbose
     ):
-        pixel_values = pixel_values.to(device)
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            out = model(pixel_values)
-        mql = out["masks_queries_logits"]
-        cql = out["class_queries_logits"]
+        if cfg is not None:
+            batch_results = [
+                predict_views(
+                    model, image, cfg, imgsz=val_ds.imgsz, conf_thres=conf_thres, max_det=max_det,
+                    mask_thresh=mask_thresh, min_mask_area=min_mask_area, letterbox=val_ds.letterbox,
+                    mean=val_ds.mean, std=val_ds.std, amp_dtype=torch.float16 if use_amp else None,
+                )
+                for image in pixel_values
+            ]
+        else:
+            pixel_values = pixel_values.to(device)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = model(pixel_values)
+            mql = out["masks_queries_logits"]
+            cql = out["class_queries_logits"]
+            batch_results = [
+                postprocess_instance(
+                    {
+                        "masks_queries_logits": mql[b : b + 1],
+                        "class_queries_logits": cql[b : b + 1],
+                        **({"quality_logits": out["quality_logits"][b : b + 1]} if "quality_logits" in out else {}),
+                    },
+                    conf_thres,
+                    (orig_w, orig_h),
+                    max_det=max_det,
+                    mask_thresh=mask_thresh,
+                    min_mask_area=min_mask_area,
+                    preprocess_meta=meta,
+                )
+                for b, ((orig_w, orig_h), meta) in enumerate(zip(sizes, metas))
+            ]
 
-        for b, (img_id, (orig_w, orig_h), meta) in enumerate(zip(image_ids, sizes, metas)):
-            res = postprocess_instance(
-                {
-                    "masks_queries_logits": mql[b : b + 1],
-                    "class_queries_logits": cql[b : b + 1],
-                    **({"quality_logits": out["quality_logits"][b : b + 1]} if "quality_logits" in out else {}),
-                },
-                conf_thres,
-                (orig_w, orig_h),
-                max_det=max_det,
-                mask_thresh=mask_thresh,
-                min_mask_area=min_mask_area,
-                preprocess_meta=meta,
-            )
+        for img_id, res in zip(image_ids, batch_results):
             n = res["num_detections"]
             for i in range(n):
                 cat_id = int(contig2cat[int(res["classes"][i])])
@@ -171,6 +196,8 @@ def evaluate_detection(
     max_det: int = 100,
     amp: bool = False,
     verbose: bool = True,
+    augment: bool | dict = False,
+    tiles: bool | int | dict = False,
 ) -> dict[str, float]:
     """Evaluate a ``family="detect"`` model on ``val_ds`` -> COCO **bbox** metrics.
 
@@ -178,6 +205,8 @@ def evaluate_detection(
     :func:`~eomt.postprocess.postprocess_detection` and scores only ``bbox`` mAP
     (there are no masks). Returns a metrics dict keyed ``bbox/<metric>``.
     """
+    if TTAConfig.resolve(augment, tiles) is not None:
+        raise NotImplementedError("augment / tiles support the instance family only.")
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
     use_amp = amp and device.type == "cuda"

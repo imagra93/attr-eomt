@@ -3,6 +3,7 @@
 
     python scripts/predict.py runs/train/eomt-l                       # uses scripts/sample_images
     python scripts/predict.py runs/train/eomt-l/weights/best.pt path/to/images --conf 0.3
+    python scripts/predict.py runs/train/eomt-l big_images/ --tiles --augment   # tiles + the image at 1x and 1.5x
 
 Annotated images are written to runs/predict/; each detection is labelled with its
 class and, for models with auxiliary heads, each attribute and its confidence.
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 
 from eomt import EoMT
+from val import add_tta_args
 
 
 def main() -> None:
@@ -22,10 +24,12 @@ def main() -> None:
     p.add_argument("--out", default="runs/predict", help="Output directory for annotated images.")
     p.add_argument("--conf", type=float, default=0.3, help="Confidence threshold.")
     p.add_argument("--device", default="auto")
+    add_tta_args(p)
     args = p.parse_args()
 
     model = EoMT(args.weights, device=args.device)
-    results = model.predict(args.source, plot=True, save=args.out, conf_thres=args.conf)
+    results = model.predict(args.source, plot=True, save=args.out, conf_thres=args.conf,
+                            augment=args.augment, tiles=args.tiles)
     print(f"[done] wrote {len(results)} annotated image(s) to {args.out}")
 
 

@@ -12,6 +12,7 @@ from PIL import Image
 from ..postprocess import postprocess_detection, postprocess_instance
 from ..preprocess import preprocess_numpy
 from ..serialization import load_model
+from ..tta import TTAConfig, predict_views
 from ..visualize import draw_instances
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -60,6 +61,8 @@ def predict_image(
     letterbox: bool = True,
     embed: bool = False,
     amp: bool | str = False,
+    augment: bool | dict = False,
+    tiles: bool | int | dict = False,
 ) -> dict:
     """Run the model on one PIL image and return a postprocess dict.
 
@@ -77,7 +80,29 @@ def predict_image(
     (:mod:`eomt.reid`). The vectors are **raw**, not normalized — normalizing (and
     optionally mean-centering) is :func:`eomt.reid.similarity_matrix`'s job, and it
     needs the raw vectors to do it.
+
+    ``augment=True`` adds the image zoomed to 1.5x ``imgsz`` (test-time augmentation) and ``tiles=True`` runs overlapping
+    native-resolution tiles plus the whole image (tiled inference); the views' instances are merged. Each also takes a
+    dict of options (``tiles`` an int tile size); see :mod:`eomt.tta`. Instance family only. The result then has no
+    ``query_idx`` (a merged instance comes from several queries); ``embed`` is the score-weighted mean of the merged
+    queries' embeddings.
     """
+    # Class-scoped aux heads: pass their primary-class scope so postprocess emits
+    # ``ids = -1`` for detections the head does not apply to (the inference side of
+    # the hard class-routing). Unscoped heads (``applies_to=None``) are omitted here.
+    aux_scopes = {
+        s.name: s.applies_to
+        for s in getattr(model, "aux_specs", [])
+        if s.applies_to is not None
+    }
+    cfg = TTAConfig.resolve(augment, tiles)
+    if cfg is not None:
+        return predict_views(
+            model, np.array(image.convert("RGB")), cfg, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det,
+            mask_thresh=mask_thresh, letterbox=letterbox, mean=getattr(model, "pixel_mean", None),
+            std=getattr(model, "pixel_std", None), amp_dtype=_amp_dtype(device, amp), aux_scopes=aux_scopes,
+            embed=embed,
+        )
     orig_w, orig_h = image.size
     chw, meta = preprocess_numpy(
         np.array(image.convert("RGB")), imgsz, letterbox=letterbox,
@@ -90,14 +115,6 @@ def predict_image(
     else:  # only the network runs in reduced precision; postprocess casts the logits back to fp32
         with torch.autocast("cuda", dtype=dtype):
             out = model(tensor)
-    # Class-scoped aux heads: pass their primary-class scope so postprocess emits
-    # ``ids = -1`` for detections the head does not apply to (the inference side of
-    # the hard class-routing). Unscoped heads (``applies_to=None``) are omitted here.
-    aux_scopes = {
-        s.name: s.applies_to
-        for s in getattr(model, "aux_specs", [])
-        if s.applies_to is not None
-    }
     if getattr(model, "family", "instance") == "detect":
         result = postprocess_detection(
             out, conf_thres, (orig_w, orig_h), max_det=max_det, preprocess_meta=meta,
@@ -140,6 +157,8 @@ def predict(
     imgsz: int | None = None,
     embed: bool = False,
     amp: bool | str = False,
+    augment: bool | dict = False,
+    tiles: bool | int | dict = False,
 ) -> list[dict]:
     """Run inference on an image or a directory of images.
 
@@ -153,7 +172,8 @@ def predict(
 
     With ``embed``, each result also carries ``"embed"`` ``(N, hidden)`` — the
     per-instance appearance fingerprint (see :func:`predict_image`). ``amp`` runs the
-    network under autocast (see :func:`predict_image`).
+    network under autocast; ``augment`` / ``tiles`` run test-time augmentation / tiled
+    inference (see :func:`predict_image`).
     """
     if isinstance(model, (str, Path)):
         model = load_model(model, device=device)
@@ -183,6 +203,7 @@ def predict(
             model, image, device=dev, imgsz=imgsz,
             conf_thres=conf_thres, max_det=max_det,
             mask_thresh=mask_thresh, letterbox=letterbox, embed=embed, amp=amp,
+            augment=augment, tiles=tiles,
         )
         if dev.type == "cuda":
             torch.cuda.synchronize(dev)
