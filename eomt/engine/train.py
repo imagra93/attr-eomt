@@ -7,10 +7,12 @@ annealed 1->0 over training (EoMT recipe) so the model converges to efficient
 mask-free inference. Validates every ``val_interval`` epochs with COCO segm mAP
 (in the mask-free regime) and keeps both ``last.pt`` and the ``best.pt`` (highest
 ``segm/mAP``). The EoMT segmentation loss is computed inside the HF model.
+``device="0,1"`` trains on several GPUs, one process each (DistributedDataParallel).
 """
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import math
 import warnings
@@ -18,7 +20,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 from ..aux_cls import (
@@ -34,8 +38,9 @@ from ..data.transforms import AugConfig, build_val_transform
 from ..ema import ModelEMA, _unwrap
 from ..model import DEFAULT_FPN_SCALES, build_model, load_dinov2_backbone
 from ..plotting import plot_aux_per_class, plot_metrics_csv
-from ..device import resolve_device
+from ..device import gpu_ids, resolve_device
 from ..serialization import load_raw, resolve_checkpoint, save_checkpoint, wrap_checkpoint
+from .distributed import is_main, launch, rank, sum_over_processes, world_size
 from .validate import _SEGM_KEYS, aux_evaluate, evaluate, evaluate_detection
 
 _ENCODER_PREFIXES = ("eomt.embeddings", "eomt.layers", "eomt.layernorm")
@@ -263,10 +268,12 @@ def _write_run_config(path: Path, cfg: dict) -> None:
     """Persist the resolved run hyper-parameters (incl. model ``size``) to YAML.
 
     Written once at startup so the run directory records how it was trained even
-    if training is interrupted before the first checkpoint.
+    if training is interrupted before the first checkpoint (by the main process on several GPUs).
     """
     import yaml
 
+    if not is_main():
+        return
     with path.open("w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
@@ -297,6 +304,19 @@ class _CsvLogger:
     def append(self, row: dict):
         with self.path.open("a", newline="") as f:
             csv.writer(f).writerow([row.get(k, float("nan")) for k in self.fields])
+
+
+class _Forward(torch.nn.Module):
+    """``fn(model, *args)`` as a module's forward, so that DistributedDataParallel sees every parameter a training
+    step uses: the attribute heads run on the model's outputs, outside ``model.forward``, and get no gradient when no
+    query matches, which DDP tolerates only for parameters used inside its forward (``find_unused_parameters``)."""
+
+    def __init__(self, model, fn):
+        super().__init__()
+        self.model, self.fn = model, fn
+
+    def forward(self, *args):
+        return self.fn(self.model, *args)
 
 
 class _Logger:
@@ -435,6 +455,14 @@ def train(
     ``imgsz`` (``min_scale``..``max_scale`` of ``imgsz``); validating at ``imgsz`` times the mean training scale measures
     the model at the scale it learned.
 
+    **Several GPUs.** ``device="0,1"`` (GPU indices) runs one process per GPU with DistributedDataParallel;
+    ``"auto"`` is GPU 0 alone. ``batch`` is per GPU and ``nominal_batch`` stays the global effective batch, so the
+    accumulation shrinks (``nominal_batch / (batch x GPUs)``) and the optimizer steps, LR schedule and mask annealing
+    are those of one GPU (an epoch 1.9x faster on two RTX 5090s). Gradients are averaged over the GPUs on the last micro-step of
+    each accumulation window. Each GPU draws its own share of the images and augmentations (seed + rank); validation
+    splits the val images between the GPUs and the main process scores them all; it alone logs and writes
+    checkpoints and plots. ``workers`` is per GPU. Every argument must be picklable (the processes are spawned).
+
     ``stop_after_epochs`` ends the run once that many epochs have completed (counted from the start of the run,
     so it composes with ``resume``) while the LR schedule and mask annealing still span ``epochs``: it is for
     truncated A/B comparisons that must follow exactly the schedule of a full run.
@@ -466,8 +494,15 @@ def train(
     if imgsz % 14 or (val_imgsz is not None and val_imgsz % 14):
         raise ValueError(f"imgsz={imgsz} and val_imgsz={val_imgsz} must be divisible by 14 (DINOv2 grid).")
 
+    gpus = gpu_ids(device)
+    if len(gpus) > 1 and not dist.is_initialized():  # one process per GPU, each running this function on its own
+        return launch(train, gpus, {k: v for k, v in locals().items() if k != "gpus"})
+    world, main = world_size(), is_main()
+
     if seed is not None:
-        _seed_everything(seed)
+        _seed_everything(seed + rank())  # DDP copies process 0's initial weights to the others
+    elif world > 1:
+        torch.seed()  # torch's default seed is the same constant in every process: draw distinct augmentations
 
     dev = resolve_device(device)
 
@@ -482,15 +517,17 @@ def train(
     # Gradient accumulation: reach an effective (nominal) batch of ``nominal_batch``
     # without the memory of a true large batch. EoMT is a ViT (LayerNorm, no
     # BatchNorm) so accumulating ``accum`` micro-batches is ~equivalent to one large
-    # batch. ``accum`` overrides ``nominal_batch`` when > 0.
+    # batch. ``accum`` overrides ``nominal_batch`` when > 0. On several GPUs each
+    # accumulates its own micro-batches and the gradients are averaged over the GPUs.
     if accum > 0:
         accum_steps = accum
     elif nominal_batch > 0:
-        accum_steps = max(1, round(nominal_batch / batch))
+        accum_steps = max(1, round(nominal_batch / (batch * world)))
     else:
         accum_steps = 1
-    eff_batch = batch * accum_steps
-    print(f"[batch] micro={batch} x accum={accum_steps} -> effective {eff_batch}")
+    eff_batch = batch * accum_steps * world
+    gpus_str = f" x {world} GPUs" if world > 1 else ""
+    print(f"[batch] micro={batch} x accum={accum_steps}{gpus_str} -> effective {eff_batch}")
 
     # Resume may point at a checkpoint file OR a run/weights folder. Resolve it
     # and recover the model size/imgsz from its metadata BEFORE building the model
@@ -631,10 +668,13 @@ def train(
                 for s in aux_specs
             )
         )
+    # Several GPUs: each process draws a disjoint share of every epoch's shuffle (same seed and epoch everywhere).
+    sampler = DistributedSampler(train_ds, shuffle=True, seed=seed or 0, drop_last=True) if world > 1 else None
     train_loader = DataLoader(
         train_ds,
         batch_size=batch,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=workers,
         collate_fn=collate_train,
         pin_memory=True,
@@ -677,6 +717,7 @@ def train(
             "val_images": val_images,
             "val_json": val_json,
             "epochs": epochs,
+            "gpus": world,
             "batch": batch,
             "accum": accum_steps,
             "effective_batch": eff_batch,
@@ -785,7 +826,40 @@ def train(
         load_dinov2_backbone(model)
         model.to(dev)
 
-    # EMA of the weights, built after init/resume so it starts from real weights.
+    # ``geom_labels`` carries instance masks (instance family) or normalized
+    # cxcywh boxes (detect family); route it to the matching forward kwarg.
+    geom_key = "box_labels" if is_detect else "mask_labels"
+
+    def micro_step(m, pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff):
+        """One micro-batch's loss: the segmentation loss computed in the model plus the attribute heads' loss."""
+        out = m(pixel_values, class_labels=class_labels, **{geom_key: geom_labels})
+        loss, aux_indices, aux_gated = out["loss"], None, None
+        if aux_specs:
+            # Match once per step, then gate to well-localized (IoU) and
+            # correctly-classified queries so the attribute trains only on
+            # instances the detector actually got right. Reuse for accuracy.
+            aux_indices = match_queries(m, out, geom_labels, class_labels)
+            aux_gated = gate_indices(
+                out, aux_indices, geom_labels, class_labels,
+                iou_thr=aux_iou_gate, require_class=aux_class_gate,
+            )
+            a_loss, _ = aux_loss(
+                m, out, geom_labels, class_labels, aux_labels,
+                weights=aux_w_per_head, indices=aux_gated,
+                class_weights=aux_class_weight,
+            )
+            loss = loss + aux_w_eff * a_loss
+        return loss, out, aux_indices, aux_gated
+
+    # Several GPUs: DDP copies process 0's weights to the others here and averages the gradients in backward. The
+    # buffers (the annealed masked-attention probabilities) are set identically on every process, not broadcast.
+    step_model = _Forward(model, micro_step)
+    if world > 1:
+        step_model = DistributedDataParallel(
+            step_model, device_ids=[dev.index], broadcast_buffers=False, find_unused_parameters=True
+        )
+
+    # EMA of the weights, built after init/resume (and DDP's copy) so it starts from real weights.
     # Restored from the checkpoint when resuming so the average isn't lost.
     ema_model = ModelEMA(model, decay=ema_decay, tau=ema_tau, device=dev) if ema else None
     if ema_model is not None and resume_ckpt is not None and resume_ckpt.get("ema"):
@@ -832,7 +906,7 @@ def train(
         """(head, backbone) multiplier of each group's ``initial_lr`` at micro-iteration ``it``."""
         return _poly_two_stage_factors(it // accum_steps, total_opt_steps, warmup_steps, poly_power)
 
-    tb = _Logger(logger, run_dir, name) if logger != "none" else None
+    tb = _Logger(logger, run_dir, name) if logger != "none" and main else None
 
     def _save(path: Path, *, state_dict, with_trainer_state: bool):
         extra = {}
@@ -873,7 +947,7 @@ def train(
             csv_fields += [f"val/segm/{k}" for k in _SEGM_KEYS]
         csv_fields += [f"val/bbox/{k}" for k in _SEGM_KEYS]
         csv_fields += [f"val/aux_acc/{s.name}" for s in aux_specs]
-    csv_log = _CsvLogger(run_dir / "metrics.csv", csv_fields)
+    csv_log = _CsvLogger(run_dir / "metrics.csv", csv_fields) if main else None
 
     # Per-primary aux accuracy is computed held-out in aux_evaluate when a val split
     # exists; otherwise fall back to accumulating it over the train epoch.
@@ -881,14 +955,16 @@ def train(
 
     # --- epochs ---
     for epoch in range(start_epoch, epochs):
-        model.train()
+        step_model.train()
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         running = 0.0
         # matched-query accuracy per aux head, accumulated over the epoch
         aux_hits = {s.name: 0 for s in aux_specs}
         aux_tot = {s.name: 0 for s in aux_specs}
         # per-primary-class aux accuracy (only accumulated as the no-val fallback)
         aux_pc: dict[str, dict[int, list[int]]] = {s.name: {} for s in aux_specs}
-        pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs - 1}", unit="batch")
+        pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs - 1}", unit="batch", disable=not main)
         for step, (pixel_values, geom_labels, class_labels, aux_labels) in enumerate(pbar):
             it = epoch * iters_per_epoch + step
             head_factor, vit_factor = lr_factors(it)
@@ -907,34 +983,20 @@ def train(
             # Gradient accumulation: zero grads at the start of each window, divide
             # the loss by ``accum_steps`` (so summed micro-batch grads average), and
             # only step/clip/update on the window boundary (or the epoch's last batch).
+            # On several GPUs the gradients are averaged over them on that boundary only.
             if step % accum_steps == 0:
                 optimizer.zero_grad(set_to_none=True)
-            aux_gated = None
-            # ``geom_labels`` carries instance masks (instance family) or normalized
-            # cxcywh boxes (detect family); route it to the matching forward kwarg.
-            geom_kw = {"box_labels": geom_labels} if is_detect else {"mask_labels": geom_labels}
-            with torch.amp.autocast("cuda", enabled=amp_on, dtype=autocast_dtype):
-                out = model(pixel_values, class_labels=class_labels, **geom_kw)
-                loss = out["loss"]
-                if aux_specs:
-                    # Match once per step, then gate to well-localized (IoU) and
-                    # correctly-classified queries so the attribute trains only on
-                    # instances the detector actually got right. Reuse for accuracy.
-                    aux_indices = match_queries(model, out, geom_labels, class_labels)
-                    aux_gated = gate_indices(
-                        out, aux_indices, geom_labels, class_labels,
-                        iou_thr=aux_iou_gate, require_class=aux_class_gate,
+            boundary = (step + 1) % accum_steps == 0 or (step + 1) == iters_per_epoch
+            aux_w_eff = aux_w * _aux_w_factor(it, total_iters, aux_w_warmup)
+            no_sync = step_model.no_sync() if world > 1 and not boundary else contextlib.nullcontext()
+            with no_sync:
+                with torch.amp.autocast("cuda", enabled=amp_on, dtype=autocast_dtype):
+                    loss, out, aux_indices, aux_gated = step_model(
+                        pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff
                     )
-                    a_loss, _ = aux_loss(
-                        model, out, geom_labels, class_labels, aux_labels,
-                        weights=aux_w_per_head, indices=aux_gated,
-                        class_weights=aux_class_weight,
-                    )
-                    aux_w_eff = aux_w * _aux_w_factor(it, total_iters, aux_w_warmup)
-                    loss = loss + aux_w_eff * a_loss
-            loss_item = float(loss.detach())  # unscaled, for logging
-            scaler.scale(loss / accum_steps).backward()
-            if (step + 1) % accum_steps == 0 or (step + 1) == iters_per_epoch:
+                loss_item = float(loss.detach())  # unscaled, for logging
+                scaler.scale(loss / accum_steps).backward()
+            if boundary:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(core.parameters(), clip_norm)
                 scaler.step(optimizer)
@@ -979,14 +1041,18 @@ def train(
                     scalars["train/attn_mask_prob"] = float(core.eomt.attn_mask_probs[0])
                 tb.log(scalars, it)
 
-        epoch_loss = running / iters_per_epoch
-        print(f"[epoch {epoch}] mean loss {epoch_loss:.4f}")
-        aux_acc = {n: _safe_acc(aux_hits[n], aux_tot[n]) for n in aux_hits}
-        if aux_specs:
-            acc_str = "  ".join(f"{n}={aux_acc[n]:.3f}" for n in aux_acc)
-            print(f"[epoch {epoch}] aux train acc: {acc_str}")
-            if tb is not None:
-                tb.log({f"train/aux_acc/{n}": aux_acc[n] for n in aux_acc}, epoch)
+        # Several GPUs: the epoch's loss and accuracy counts summed over all of them, on the main process.
+        totals = sum_over_processes((running, aux_hits, aux_tot, aux_pc))
+        if main:
+            running, aux_hits, aux_tot, aux_pc = totals
+            epoch_loss = running / (iters_per_epoch * world)
+            print(f"[epoch {epoch}] mean loss {epoch_loss:.4f}")
+            aux_acc = {n: _safe_acc(aux_hits[n], aux_tot[n]) for n in aux_hits}
+            if aux_specs:
+                acc_str = "  ".join(f"{n}={aux_acc[n]:.3f}" for n in aux_acc)
+                print(f"[epoch {epoch}] aux train acc: {acc_str}")
+                if tb is not None:
+                    tb.log({f"train/aux_acc/{n}": aux_acc[n] for n in aux_acc}, epoch)
 
         # Evaluate and checkpoint in the deployment regime: masked attention off
         # (deterministic, mask-free) so val mAP and the saved buffer match how the
@@ -1000,7 +1066,7 @@ def train(
             if ema_model is not None:
                 eval_model.eomt.attn_mask_probs.zero_()
 
-        # --- validation ---
+        # --- validation (several GPUs: each runs its share, the main process gets the metrics) ---
         metrics = {}
         epoch_aux_pc: dict[str, dict[int, tuple[int, int]]] | None = None
         if val_ds is not None and (epoch + 1) % val_interval == 0:
@@ -1008,7 +1074,7 @@ def train(
                 metrics = evaluate_detection(
                     eval_model, val_ds, device=dev, batch_size=batch,
                     num_workers=workers, conf_thres=conf_thres, max_det=max_det,
-                    amp=amp, verbose=True,
+                    amp=amp, verbose=main,
                 )
                 print(
                     f"[epoch {epoch}] bbox mAP {metrics.get('bbox/mAP', 0):.4f} "
@@ -1018,7 +1084,7 @@ def train(
                 metrics = evaluate(
                     eval_model, val_ds, device=dev, batch_size=batch,
                     num_workers=workers, conf_thres=conf_thres, max_det=max_det,
-                    amp=amp, verbose=True,
+                    amp=amp, verbose=main,
                 )
                 print(
                     f"[epoch {epoch}] segm mAP {metrics.get('segm/mAP', 0):.4f} "
@@ -1028,7 +1094,7 @@ def train(
             if val_seg_ds is not None:  # held-out matched-query accuracy per head
                 val_aux, epoch_aux_pc = aux_evaluate(
                     eval_model, val_seg_ds, device=dev, batch_size=batch,
-                    num_workers=workers, amp=amp,
+                    num_workers=workers, amp=amp, verbose=main,
                     iou_gate=aux_iou_gate, class_gate=aux_class_gate,
                 )
                 metrics.update({f"aux_acc/{n}": v for n, v in val_aux.items()})
@@ -1039,43 +1105,44 @@ def train(
             if tb is not None:
                 tb.log({f"val/{k}": v for k, v in metrics.items()}, epoch)
 
-        # --- checkpoints ---
-        # last.pt holds the live weights + trainer state (optimizer/EMA) for resume;
-        # best.pt holds the eval weights (EMA when enabled) for inference.
-        # The best metric is updated BEFORE last.pt is written, so a resumed run starts from the right value
-        # (it used to lag one epoch and could overwrite a better best.pt).
-        best_key = "bbox/mAP" if is_detect else "segm/mAP"
-        cur = metrics.get(best_key, None)
-        improved = cur is not None and cur > best_metric
-        if improved:
-            best_metric = cur
-        _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True)
-        if improved:
-            _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False)
-            print(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
+        if main:  # the main process alone writes the checkpoints, the metrics row and the plots
+            # --- checkpoints ---
+            # last.pt holds the live weights + trainer state (optimizer/EMA) for resume;
+            # best.pt holds the eval weights (EMA when enabled) for inference.
+            # The best metric is updated BEFORE last.pt is written, so a resumed run starts from the right value
+            # (it used to lag one epoch and could overwrite a better best.pt).
+            best_key = "bbox/mAP" if is_detect else "segm/mAP"
+            cur = metrics.get(best_key, None)
+            improved = cur is not None and cur > best_metric
+            if improved:
+                best_metric = cur
+            _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True)
+            if improved:
+                _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False)
+                print(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
 
-        # --- per-epoch metrics row (missing values -> nan) ---
-        row = {"epoch": epoch, "train/loss": epoch_loss}
-        row.update({f"train/aux_acc/{n}": aux_acc[n] for n in aux_acc})
-        row.update({f"val/{k}": v for k, v in metrics.items()})
-        csv_log.append(row)
+            # --- per-epoch metrics row (missing values -> nan) ---
+            row = {"epoch": epoch, "train/loss": epoch_loss}
+            row.update({f"train/aux_acc/{n}": aux_acc[n] for n in aux_acc})
+            row.update({f"val/{k}": v for k, v in metrics.items()})
+            csv_log.append(row)
 
-        # --- per-epoch plots (overwrite each round; never fatal) ---
-        try:
-            plot_metrics_csv(run_dir / "metrics.csv", run_dir / "metrics.png")
-        except Exception as e:  # noqa: BLE001 - plotting must never crash training
-            print(f"[plot] metrics.png failed: {e}")
-        if aux_specs:
-            if epoch_aux_pc is None and track_pc_train:
-                epoch_aux_pc = {
-                    n: {c: (v[0], v[1]) for c, v in buckets.items()}
-                    for n, buckets in aux_pc.items()
-                }
-            if epoch_aux_pc is not None:
-                try:
-                    plot_aux_per_class(epoch_aux_pc, names, run_dir / "aux_per_class.png")
-                except Exception as e:  # noqa: BLE001
-                    print(f"[plot] aux_per_class.png failed: {e}")
+            # --- per-epoch plots (overwrite each round; never fatal) ---
+            try:
+                plot_metrics_csv(run_dir / "metrics.csv", run_dir / "metrics.png")
+            except Exception as e:  # noqa: BLE001 - plotting must never crash training
+                print(f"[plot] metrics.png failed: {e}")
+            if aux_specs:
+                if epoch_aux_pc is None and track_pc_train:
+                    epoch_aux_pc = {
+                        n: {c: (v[0], v[1]) for c, v in buckets.items()}
+                        for n, buckets in aux_pc.items()
+                    }
+                if epoch_aux_pc is not None:
+                    try:
+                        plot_aux_per_class(epoch_aux_pc, names, run_dir / "aux_per_class.png")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[plot] aux_per_class.png failed: {e}")
 
         if stop_after_epochs is not None and epoch + 1 >= stop_after_epochs:
             print(f"[stop] stopping after {epoch + 1} epoch(s) as requested; the schedule spans {epochs}")

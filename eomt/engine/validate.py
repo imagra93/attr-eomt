@@ -4,6 +4,9 @@ Runs the model over a :class:`~eomt.data.coco.CocoValImages` set, converts each
 prediction to a COCO result (RLE mask + score + original category id) and scores
 it with ``COCOeval(iouType='segm')``. Optionally also reports bbox mAP using the
 mask-extent boxes.
+
+On several GPUs (:mod:`eomt.engine.distributed`) each process runs its share of the
+images and the main process scores (or counts) them all; the others get ``{}``.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from tqdm import tqdm
 
 from ..data import collate_val
 from ..postprocess import postprocess_detection, postprocess_instance
+from .distributed import gather, shard, sum_over_processes
 
 #: COCOeval.stats index -> metric name.
 _SEGM_KEYS = [
@@ -86,7 +90,7 @@ def evaluate(
     contig2cat = val_ds.contig2cat
 
     loader = DataLoader(
-        val_ds,
+        shard(val_ds),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -144,6 +148,11 @@ def evaluate(
                         }
                     )
 
+    parts = gather((segm_results, bbox_results))
+    if parts is None:  # several GPUs: the main process scores the results of all
+        return {}
+    segm_results = [r for segm, _ in parts for r in segm]
+    bbox_results = [r for _, bbox in parts for r in bbox]
     metrics = _cocoeval(val_ds.coco, segm_results, val_ds.ids, "segm", verbose)
     if also_bbox:
         metrics.update(_cocoeval(val_ds.coco, bbox_results, val_ds.ids, "bbox", verbose))
@@ -175,7 +184,7 @@ def evaluate_detection(
     contig2cat = val_ds.contig2cat
 
     loader = DataLoader(
-        val_ds,
+        shard(val_ds),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -213,7 +222,10 @@ def evaluate_detection(
                     }
                 )
 
-    return _cocoeval(val_ds.coco, bbox_results, val_ds.ids, "bbox", verbose)
+    parts = gather(bbox_results)
+    if parts is None:  # several GPUs: the main process scores the results of all
+        return {}
+    return _cocoeval(val_ds.coco, [r for part in parts for r in part], val_ds.ids, "bbox", verbose)
 
 
 @torch.no_grad()
@@ -344,7 +356,7 @@ def aux_evaluate(
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
     loader = DataLoader(
-        val_seg_ds,
+        shard(val_seg_ds),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -388,6 +400,10 @@ def aux_evaluate(
                 acc[0] += c
                 acc[1] += t
 
+    counts = sum_over_processes((hits, tot, per_class))
+    if counts is None:  # several GPUs: the main process reports the counts of all
+        return {}, {}
+    hits, tot, per_class = counts
     scalar = {n: (hits[n] / tot[n] if tot[n] else float("nan")) for n in hits}
     pc = {n: {c: (v[0], v[1]) for c, v in buckets.items()} for n, buckets in per_class.items()}
     return scalar, pc

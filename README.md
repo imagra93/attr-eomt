@@ -376,6 +376,17 @@ EoMT("runs/train/eomt-l").val(data="coco")
 EoMT("runs/train/eomt-l").predict("images/", plot=True)   # writes annotated images
 ```
 
+**Several GPUs.** `device="0,1"` trains on both GPUs, one process each (DistributedDataParallel); `"auto"` is GPU 0.
+`batch` is per GPU and `nominal_batch` (16) stays the global effective batch, so the optimizer steps, LR schedule and
+masked-attention annealing are exactly those of one GPU, with an epoch 1.9× faster on two RTX 5090s (1.8× end to end with
+validation and checkpoints). Validation splits the val images between the
+GPUs; the main process scores them and alone logs and writes checkpoints. The processes are spawned, so every `train()`
+argument must be picklable.
+
+```python
+EoMT("l", device="0,1").train(data="coco", epochs=50, batch=2)   # 2 per GPU x accum 4 x 2 GPUs = effective 16
+```
+
 For the full training recipe, every `train()` knob, and int8 compression, see the
 **[annotated explainer →](https://imagra93.github.io/attr-eomt)** — it's the deep dive.
 
