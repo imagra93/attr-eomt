@@ -189,8 +189,14 @@ class EoMTLoss(nn.Module):
             cost_bbox=self.l1_weight,
             cost_giou=self.giou_weight,
         )
+        # IoU-aware class targets: a matched query's class target is (1 + IoU) / 2 of its mask instead of 1, so the score
+        # ranks masks by quality; above 0.5, so a matched query stays classified as its GT class (the attribute gate).
+        self.iou_aware_cls = bool(getattr(config, "iou_aware_cls", False))
 
-    def loss_labels(self, class_queries_logits, class_labels, indices) -> dict[str, Tensor]:
+    def loss_labels(self, class_queries_logits, class_labels, indices, quality: Tensor | None = None) -> dict[str, Tensor]:
+        """Class CE. ``quality`` (IoU of each matched query, in permutation order) softens the matched targets to
+        ``(1 + IoU) / 2`` for the GT class and the rest for "no object"; every query keeps its weight (1 matched,
+        ``no_object_weight`` unmatched), so hard targets give exactly the weighted CE."""
         pred_logits = class_queries_logits
         batch_size, num_queries, _ = pred_logits.shape
         criterion = nn.CrossEntropyLoss(weight=self.empty_weight)
@@ -200,8 +206,29 @@ class EoMTLoss(nn.Module):
             (batch_size, num_queries), fill_value=self.num_labels, dtype=torch.int64, device=pred_logits.device
         )
         target_classes[idx] = target_classes_o
-        loss_ce = criterion(pred_logits.transpose(1, 2), target_classes)
-        return {"loss_cross_entropy": loss_ce}
+        if quality is None:
+            return {"loss_cross_entropy": criterion(pred_logits.transpose(1, 2), target_classes)}
+        q = 0.5 + 0.5 * quality.to(device=pred_logits.device, dtype=torch.float32)
+        target = F.one_hot(target_classes, self.num_labels + 1).float()
+        target[idx] = target[idx] * q[:, None]
+        target[idx[0], idx[1], -1] = 1 - q
+        weight = self.empty_weight[target_classes]
+        loss = -(target * F.log_softmax(pred_logits.float(), -1)).sum(-1)
+        return {"loss_cross_entropy": (weight * loss).sum() / weight.sum()}
+
+    @torch.no_grad()
+    def matched_iou(self, masks_queries_logits, mask_labels, indices) -> Tensor:
+        """Mask IoU of each matched query with its GT at the GT resolution, in permutation order (prediction > 0 after
+        :func:`upsample_logits`; a soft GT binarised at half its peak, as the attribute gate does)."""
+        targets = [t[j.to(t.device)] for t, (_, j) in zip(mask_labels, indices) if len(j)]
+        if not targets:
+            return masks_queries_logits.new_zeros(0, dtype=torch.float32)
+        gt = torch.cat(targets).float()
+        gt = gt >= (0.5 * gt.flatten(1).amax(1)).clamp(min=1e-6)[:, None, None]
+        logits = masks_queries_logits[self._get_predictions_permutation_indices(indices)].float()
+        pred = upsample_logits(logits, gt.shape[-2:]) > 0
+        inter = (pred & gt).flatten(1).sum(1).float()
+        return inter / (pred | gt).flatten(1).sum(1).float().clamp(min=1)
 
     def loss_masks(self, masks_queries_logits, mask_labels, indices, num_masks) -> dict[str, Tensor]:
         """Mask loss of the matched queries: dice on every GT pixel (see :func:`upsample_logits`), so every instance is
@@ -251,8 +278,12 @@ class EoMTLoss(nn.Module):
         auxiliary_predictions: dict[str, Tensor] | None = None,
         pred_boxes: Tensor | None = None,
         box_labels: list[Tensor] | None = None,
+        pred_quality: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        """``pred_boxes`` (with the model built with ``aux_box_head``) adds the box terms to the matching and the loss."""
+        """``pred_boxes`` (with the model built with ``aux_box_head``) adds the box terms to the matching and the loss.
+        ``pred_quality`` ``(B, Q)`` (mask-quality logits) adds ``loss_quality``: BCE of the matched queries' predicted
+        against their measured mask IoU (Mask Scoring R-CNN); it does not enter the matching.
+        """
         use_boxes = self.use_boxes and pred_boxes is not None
         if use_boxes and box_labels is None:
             box_labels = [masks_to_norm_boxes(m) for m in mask_labels]
@@ -261,12 +292,20 @@ class EoMTLoss(nn.Module):
             pred_boxes=pred_boxes if use_boxes else None, box_labels=box_labels if use_boxes else None,
         )
         num_masks = self.get_num_masks(class_labels, device=class_labels[0].device)
+        quality = self.matched_iou(masks_queries_logits, mask_labels, indices) if self.iou_aware_cls else None
         losses: dict[str, Tensor] = {
             **self.loss_masks(masks_queries_logits, mask_labels, indices, num_masks),
-            **self.loss_labels(class_queries_logits, class_labels, indices),
+            **self.loss_labels(class_queries_logits, class_labels, indices, quality),
         }
         if use_boxes:
             losses.update(self.loss_boxes(pred_boxes, box_labels, indices, num_masks))
+        if pred_quality is not None:
+            iou = quality if quality is not None else self.matched_iou(masks_queries_logits, mask_labels, indices)
+            pred = pred_quality[self._get_predictions_permutation_indices(indices)].float()
+            losses["loss_quality"] = (
+                F.binary_cross_entropy_with_logits(pred, iou.to(pred), reduction="sum") / num_masks
+                if pred.numel() else pred_quality.sum() * 0.0
+            )
         if auxiliary_predictions is not None:
             for idx, aux_outputs in enumerate(auxiliary_predictions):
                 loss_dict = self.forward(

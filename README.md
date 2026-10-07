@@ -408,6 +408,9 @@ the model with the same modules, and checkpoints without them load as before.
 | `box_head=True` | auxiliary box head: L1 + GIoU loss on the matched queries, and the same terms in the matching cost (a localisation signal that does not depend on the mask grid). Predicted boxes are returned as `aux_boxes` / `head_boxes` | −7 % |
 | `deep_supervision=False` | stop supervising a query block's prediction once that block's masked attention is annealed away (while it masks, the prediction builds its attention mask and stays supervised: unsupervised, it made noise masks). Blocks drop out at 2/6, 3/6, 4/6, 5/6 of training | none while blocks mask; +26 % per step once all are annealed (last sixth) |
 | `num_upscale_blocks=3` | 368² mask logits at 644 px (small masks); the block predictions stay at 184² (they only build 46² attention masks), only the output is 368²; cannot warm-start a 2-block checkpoint | −17 % (10.1 vs 12.1 img/s), 22.2 GB |
+| `iou_aware_cls=True` | train a matched query's class probability towards `(1 + mask IoU) / 2` instead of 1 (IoU-aware targets, as in VarifocalNet / Stable-DINO), so the score ranks loose masks below tight ones; above 0.5, so matched queries keep their class for the attribute gate. Hard targets reduce exactly to the weighted CE. Windscreen damage, 12 epochs at 644 px, against the same recipe: segm AP 0.0296 -> 0.0758, AP small 0.0033 -> 0.0106, AP large 0.128 -> 0.210, bbox AP 0.177 -> 0.217, attribute accuracy unchanged | one upsample of the matched masks |
+| `quality_weight=2` | mask-quality head: a small MLP on the query embedding predicts each matched query's mask IoU (BCE against the measured IoU, final prediction only; Mask Scoring R-CNN), and postprocess scores class probability x predicted IoU instead of the mean mask probability. Windscreen damage, with `iou_aware_cls`, two seeds against the same recipe without the head: segm AP +7 / +13 %, AP small +19 % / 3.6x, AP medium +21 / +22 %, AR100 +2 / +5 %, bbox AP and attribute accuracy unchanged | one MLP on the queries |
+| `val_imgsz=N` | validate (and pick `best.pt`) at another input size than `imgsz`. Scale jitter shows the objects larger, on average, than a val image resized to `imgsz`: validate at `imgsz` × the mean training scale. Windscreens (training scale 0.4-1.0 of the photo, val 0.5), same checkpoint: segm AP 0.0113 at 644, 0.0173 at 896 | val time grows with the pixels |
 | `stop_after_epochs=N` | stop after N epochs while the LR schedule and mask annealing still span `epochs` (truncated A/B runs) | |
 
 Always on (training-side; inference of existing checkpoints is unchanged):
@@ -431,8 +434,8 @@ Always on (training-side; inference of existing checkpoints is unchanged):
 Inference: `predict_image(..., amp=True)` (and `predict(..., amp=True)`) runs the network under bf16 autocast, ~2.5x faster at 644 px
 on an RTX 5090 with the same accuracy on a trained ViT-L model (AP within 0.002 in every size bucket). Off by default.
 
-**What is not established:** the accuracy effect of `box_head`, `deep_supervision=False`, dropping the
-FPN and the always-on changes above depends on the data. Measure it with truncated runs (`stop_after_epochs`), which follow the schedule of a full run, against a reference run at equal
+**What is not established:** the accuracy effect of `box_head`, `deep_supervision=False`,
+`iou_aware_cls` and `quality_weight` (beyond the windscreen data), dropping the FPN and the always-on changes above depends on the data. Measure it with truncated runs (`stop_after_epochs`), which follow the schedule of a full run, against a reference run at equal
 epochs.
 
 ---

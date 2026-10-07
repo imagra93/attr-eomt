@@ -390,11 +390,14 @@ def train(
     dice_weight: float = 5.0,
     l1_weight: float = 5.0,
     giou_weight: float = 2.0,
+    iou_aware_cls: bool = False,
+    quality_weight: float = 0.0,
     num_upscale_blocks: int | None = None,
     fpn_scales: tuple[float, ...] | list[float] | None = DEFAULT_FPN_SCALES,
     box_head: bool = False,
     deep_supervision: bool = True,
     stop_after_epochs: int | None = None,
+    val_imgsz: int | None = None,
     logger: str = "none",
     resume: str | None = None,
     init_weights: str | None = None,
@@ -421,6 +424,16 @@ def train(
     With the default windows the blocks drop out at 2/6, 3/6, 4/6 and 5/6 of training (~40 % fewer intermediate
     predictions overall) and only the last sixth runs final-only (~25 % faster steps); the reference recipe
     supervises every block throughout. Resuming keeps the checkpoint's ``box_head``; warm starts honor the argument.
+
+    **Class targets** (instance family; persisted with the loss weights). ``iou_aware_cls=True`` trains a matched query's
+    class probability towards ``(1 + IoU) / 2`` of its mask rather than 1, so the score ranks masks by their quality.
+    ``quality_weight > 0`` adds a mask-quality head that predicts each matched query's mask IoU (Mask Scoring R-CNN);
+    the score at inference becomes class probability x predicted IoU.
+
+    ``val_imgsz`` validates (and picks ``best.pt``) at another input size than ``imgsz``; ``None`` = ``imgsz``. Scale
+    augmentation makes the objects the model trains on larger, on average, than they are in a val image resized to
+    ``imgsz`` (``min_scale``..``max_scale`` of ``imgsz``); validating at ``imgsz`` times the mean training scale measures
+    the model at the scale it learned.
 
     ``stop_after_epochs`` ends the run once that many epochs have completed (counted from the start of the run,
     so it composes with ``resume``) while the LR schedule and mask annealing still span ``epochs``: it is for
@@ -450,8 +463,8 @@ def train(
     """
     if len(warmup_steps) != 2:
         raise ValueError("warmup_steps must be (head_steps, vit_steps)")
-    if imgsz % 14:
-        raise ValueError(f"imgsz={imgsz} must be divisible by 14 (DINOv2 grid).")
+    if imgsz % 14 or (val_imgsz is not None and val_imgsz % 14):
+        raise ValueError(f"imgsz={imgsz} and val_imgsz={val_imgsz} must be divisible by 14 (DINOv2 grid).")
 
     if seed is not None:
         _seed_everything(seed)
@@ -561,6 +574,8 @@ def train(
             "dice_weight": dice_weight,
             "l1_weight": l1_weight,
             "giou_weight": giou_weight,
+            "iou_aware_cls": iou_aware_cls,
+            "quality_weight": quality_weight,
         }
     loss_weights = normalize_loss_weights(cli_loss_weights, family=family)
     if resume_ckpt is not None:
@@ -630,17 +645,18 @@ def train(
 
     val_ds = None
     val_seg_ds = None
+    val_size = val_imgsz or imgsz
     if val_images and val_json:
-        val_ds = CocoValImages(val_images, val_json, imgsz=imgsz, letterbox=letterbox)
-        print(f"[data] val:   {len(val_ds)} images")
+        val_ds = CocoValImages(val_images, val_json, imgsz=val_size, letterbox=letterbox)
+        print(f"[data] val:   {len(val_ds)} images" + (f" at {val_size} px" if val_size != imgsz else ""))
         # Held-out aux accuracy needs GT geometry/attrs in the train id space: a
         # deterministic (no-crop) view of the val split, sharing train's maps.
         if aux_specs:
             val_seg_ds = Dataset(
                 val_images,
                 val_json,
-                imgsz=imgsz,
-                transform=build_val_transform(imgsz, letterbox=letterbox),
+                imgsz=val_size,
+                transform=build_val_transform(val_size, letterbox=letterbox),
                 shared_aux=(aux_specs, train_ds._attr_id_maps),
             )
 
@@ -654,6 +670,7 @@ def train(
             "size": size,
             "family": family,
             "imgsz": imgsz,
+            "val_imgsz": val_size,
             "nc": nc,
             "train_images": train_images,
             "train_json": train_json,
@@ -726,6 +743,10 @@ def train(
         print(f"[model] multi-scale FPN enabled: scales={model.fpn_scales}")
     if model.aux_box_head:
         print(f"[model] auxiliary box head: L1 {loss_weights['l1_weight']} / GIoU {loss_weights['giou_weight']} (also in the matching cost)")
+    if loss_weights.get("quality_weight"):
+        print(f"[model] mask-quality head (predicted IoU scores the masks): weight {loss_weights['quality_weight']}")
+    if loss_weights.get("iou_aware_cls"):
+        print("[model] IoU-aware class targets: a matched query's target is (1 + mask IoU) / 2")
     if not deep_supervision:
         print("[model] deep supervision off: a query block is supervised only while it uses masked attention")
     if aux_specs:

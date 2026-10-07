@@ -218,6 +218,75 @@ def test_an_instance_smaller_than_a_logit_cell_is_cheaper_to_predict_than_to_mis
     assert hit["loss_dice"] < miss["loss_dice"]
 
 
+def test_checkpoints_of_dropped_matcher_options_still_load(tmp_path):
+    m = _model().eval()
+    lw = {**m.loss_weights, "match_class_weight": 0.0, "match_full_res": True}   # written by runs of the dropped options
+    save_checkpoint(wrap_checkpoint(m.state_dict(), size="s", nc=NC, imgsz=IMGSZ, loss_weights=lw), tmp_path / "m.pt")
+    assert load_model(tmp_path / "m.pt", device="cpu").eomt.criterion.matcher.cost_class == 2.0
+
+
+def test_iou_aware_class_targets_reduce_to_the_weighted_ce_and_follow_mask_quality():
+    crit = _model(loss_weights={"iou_aware_cls": True}).eomt.criterion
+    assert crit.iou_aware_cls and not _model().eomt.criterion.iou_aware_cls
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(2, 5, NC + 1, generator=g)
+    labels = [torch.tensor([1, 2]), torch.tensor([0])]
+    idx = [(torch.tensor([3, 0]), torch.tensor([0, 1])), (torch.tensor([4]), torch.tensor([0]))]
+    hard = crit.loss_labels(logits, labels, idx)["loss_cross_entropy"]
+    soft = crit.loss_labels(logits, labels, idx, quality=torch.ones(3))["loss_cross_entropy"]
+    assert torch.allclose(hard, soft, atol=1e-6)                       # IoU 1: exactly the weighted CE
+    # a matched query is pushed towards (1 + IoU) / 2: the class logit that minimises its loss tracks its mask IoU
+    best = []
+    for iou in (0.2, 0.8):
+        x = torch.zeros(1, 1, NC + 1, requires_grad=True)
+        opt = torch.optim.SGD([x], lr=1.0)
+        for _ in range(300):
+            opt.zero_grad()
+            crit.loss_labels(x, [torch.tensor([0])], [(torch.tensor([0]), torch.tensor([0]))],
+                             quality=torch.tensor([iou]))["loss_cross_entropy"].backward()
+            opt.step()
+        best.append(float(x.softmax(-1)[0, 0, 0]))
+    assert abs(best[0] - 0.6) < 0.02 and abs(best[1] - 0.9) < 0.02
+    # matched IoU is measured per pair, in permutation order
+    gt = torch.zeros(2, 64, 64)
+    gt[0, :32] = 1.0
+    gt[1, 32:] = 1.0
+    mql = torch.full((1, 3, 16, 16), -10.0)
+    mql[0, 2, :8] = 10.0                                               # query 2 predicts GT 0 exactly
+    mql[0, 1, :, :8] = 10.0                                            # query 1 predicts the left half: IoU 1/3 with GT 1
+    iou = crit.matched_iou(mql, [gt], [(torch.tensor([2, 1]), torch.tensor([0, 1]))])
+    assert torch.allclose(iou, torch.tensor([1.0, 1 / 3]), atol=1e-3)
+
+
+def test_mask_quality_head_learns_the_matched_iou_and_scores_the_masks(tmp_path):
+    assert _model().eomt.quality_head is None
+    m = _model(loss_weights={"quality_weight": 2.0})
+    enc = m.eomt
+    assert enc.quality_head is not None and enc.weight_dict["loss_quality"] == 2.0
+    x, masks, cls = _batch()
+    m.train()(x, mask_labels=masks, class_labels=cls)["loss"].backward()
+    assert enc.quality_head[-1].weight.grad.abs().sum() > 0           # trained through the final prediction
+    # the loss pulls each matched query's predicted IoU towards its measured one
+    crit = enc.criterion
+    gt = torch.zeros(1, 64, 64)
+    gt[0, :32] = 1.0
+    mql = torch.full((1, 2, 16, 16), -10.0)
+    mql[0, 0, :, :8] = 10.0                                            # IoU 1/3 with the GT
+    cql = torch.zeros(1, 2, NC + 1)
+    lo = crit(mql, cql, [gt], [torch.tensor([0])], pred_quality=torch.tensor([[torch.logit(torch.tensor(1 / 3)), 0.0]]))
+    hi = crit(mql, cql, [gt], [torch.tensor([0])], pred_quality=torch.tensor([[4.0, 0.0]]))
+    assert lo["loss_quality"] < hi["loss_quality"]
+    # postprocess scores class prob x predicted IoU when the head is there
+    out = {"masks_queries_logits": mql, "class_queries_logits": cql, "quality_logits": torch.tensor([[2.0, -2.0]])}
+    res = postprocess_instance(out, 0.0, (64, 64), max_det=2)
+    p = cql[0].softmax(-1)[:, :-1].max(-1).values
+    assert torch.allclose(res["scores"].sort().values, (p * torch.tensor([2.0, -2.0]).sigmoid()).sort().values)
+    save_checkpoint(wrap_checkpoint(m.state_dict(), size="s", nc=NC, imgsz=IMGSZ, loss_weights=m.loss_weights),
+                    tmp_path / "m.pt")
+    back = load_model(tmp_path / "m.pt", device="cpu")
+    assert back.eomt.quality_head is not None and "quality_logits" in back.eval()(x)
+
+
 def test_attribute_gate_keeps_a_tiny_instance():
     """The IoU gate compares at the GT's resolution: a predicted 4 px chip passes (nearest-shrinking the GT erased it)."""
     from eomt.aux_cls import gate_indices

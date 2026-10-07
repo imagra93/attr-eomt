@@ -111,6 +111,7 @@ def evaluate(
                 {
                     "masks_queries_logits": mql[b : b + 1],
                     "class_queries_logits": cql[b : b + 1],
+                    **({"quality_logits": out["quality_logits"][b : b + 1]} if "quality_logits" in out else {}),
                 },
                 conf_thres,
                 (orig_w, orig_h),
@@ -268,6 +269,7 @@ def sweep(
             single = {
                 "masks_queries_logits": mql[b : b + 1],
                 "class_queries_logits": cql[b : b + 1],
+                **({"quality_logits": out["quality_logits"][b : b + 1]} if "quality_logits" in out else {}),
             }
             for gi, knobs in enumerate(grid):
                 res = postprocess_instance(

@@ -234,10 +234,14 @@ def postprocess_instance(
 
     # Mask2Former-style score: weight the class confidence by mask "objectness"
     # (mean sigmoid over the binarized region), computed on the low-res logits.
-    # This ranks crisp, confident masks above diffuse ones and lifts mAP.
-    mask_prob = mask_logits.sigmoid()  # (Q, h, w)
-    binar = mask_prob > mask_thresh
-    mask_scores = (mask_prob * binar).flatten(1).sum(1) / (binar.flatten(1).sum(1) + 1e-6)
+    # This ranks crisp, confident masks above diffuse ones and lifts mAP. A model with a
+    # mask-quality head weights it by the predicted mask IoU instead (Mask Scoring R-CNN).
+    if output.get("quality_logits") is not None:
+        mask_scores = output["quality_logits"][0].float().sigmoid()
+    else:
+        mask_prob = mask_logits.sigmoid()  # (Q, h, w)
+        binar = mask_prob > mask_thresh
+        mask_scores = (mask_prob * binar).flatten(1).sum(1) / (binar.flatten(1).sum(1) + 1e-6)
     scores = cls_scores * mask_scores  # (Q,)
 
     orig_w, orig_h = original_size

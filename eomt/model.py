@@ -65,6 +65,7 @@ class EoMTOutput:
     masks_queries_logits: torch.Tensor | None = None
     pred_boxes: torch.Tensor | None = None
     aux_boxes: torch.Tensor | None = None  # instance family: boxes of the auxiliary box head (normalized cxcywh)
+    quality_logits: torch.Tensor | None = None  # instance family: predicted mask IoU (logits) of the quality head
     last_hidden_state: torch.Tensor | None = None
 
 
@@ -473,6 +474,15 @@ class EoMTEncoder(nn.Module):
             self.weight_dict["loss_bbox"] = float(getattr(config, "l1_weight", 5.0))
             self.weight_dict["loss_giou"] = float(getattr(config, "giou_weight", 2.0))
 
+        # Optional mask-quality head (instance family): per query, the IoU of its mask with its matched GT (Mask Scoring
+        # R-CNN), trained on the final prediction; postprocess then scores class prob x predicted IoU. Off unless
+        # ``config.quality_weight``.
+        self.quality_head = None
+        if family != "detect" and float(getattr(config, "quality_weight", 0.0)) > 0:
+            h = config.hidden_size
+            self.quality_head = nn.Sequential(nn.Linear(h, h), _act(config.hidden_act), nn.Linear(h, 1))
+            self.weight_dict["loss_quality"] = float(config.quality_weight)
+
         # Optional multi-scale (B1): SimpleFPN bank + one query→bank cross-attention
         # per query block. Built only when enabled, so the default model adds no
         # params and keeps state-dict parity with the HF EoMT.
@@ -488,8 +498,10 @@ class EoMTEncoder(nn.Module):
     # --- loss plumbing (mirrors HF get_loss_dict / get_loss) ----------------
 
     def get_loss_dict(self, masks_queries_logits, class_queries_logits, mask_labels, class_labels,
-                      pred_boxes=None, box_labels=None):
+                      pred_boxes=None, box_labels=None, pred_quality=None):
         extra = {"pred_boxes": pred_boxes, "box_labels": box_labels} if pred_boxes is not None else {}
+        if pred_quality is not None:
+            extra["pred_quality"] = pred_quality
         loss_dict = self.criterion(
             masks_queries_logits=masks_queries_logits,
             class_queries_logits=class_queries_logits,
@@ -669,20 +681,26 @@ class EoMTEncoder(nn.Module):
         if self.aux_box_head is not None:
             aux_boxes = self.predict_boxes(sequence_output)
             box_per_layer += (aux_boxes,)
+        quality_logits = None
+        if self.quality_head is not None:
+            quality_logits = self.quality_head(sequence_output[:, : self.config.num_queries])[..., 0]
 
         loss = None
         if geom_labels is not None and class_labels is not None:
             loss = 0.0
             gt_boxes = [masks_to_norm_boxes(m) for m in geom_labels] if self.aux_box_head is not None else None
+            last = len(geom_per_layer) - 1
             for i, (g, c) in enumerate(zip(geom_per_layer, class_per_layer)):
                 pb = box_per_layer[i] if box_per_layer else None
-                loss = loss + self.get_loss(self.get_loss_dict(g, c, geom_labels, class_labels, pb, gt_boxes))
+                pq = quality_logits if i == last else None
+                loss = loss + self.get_loss(self.get_loss_dict(g, c, geom_labels, class_labels, pb, gt_boxes, pq))
 
         return EoMTOutput(
             loss=loss,
             masks_queries_logits=None if is_detect else geom_final,
             pred_boxes=geom_final if is_detect else None,
             aux_boxes=aux_boxes,
+            quality_logits=quality_logits,
             class_queries_logits=class_queries_logits,
             last_hidden_state=sequence_output,
         )
@@ -835,6 +853,9 @@ class EoMTModel(nn.Module):
         if family == "detect":
             config.l1_weight = float(self.loss_weights["l1_weight"])
             config.giou_weight = float(self.loss_weights["giou_weight"])
+        else:  # loss-only settings, stashed the same way
+            config.iou_aware_cls = bool(self.loss_weights["iou_aware_cls"])
+            config.quality_weight = float(self.loss_weights["quality_weight"])
         # Multi-scale (B1): stash the FPN scales on the config so ``EoMTEncoder``
         # (which only receives the config) builds the SimpleFPN + cross-attn modules.
         # ``EomtConfig`` has no such field, so this is an added attribute; left unset
@@ -895,6 +916,8 @@ class EoMTModel(nn.Module):
             }
             if out.aux_boxes is not None:  # not "pred_boxes": that key marks the detect family downstream
                 result["aux_boxes"] = out.aux_boxes
+            if out.quality_logits is not None:
+                result["quality_logits"] = out.quality_logits
         # The per-query embedding [B, Q, hidden]: the leading queries of the final
         # hidden state, which is precisely the tensor ``class_predictor`` consumes.
         # Always exposed — aux heads read it, and so does cross-photo re-identification
