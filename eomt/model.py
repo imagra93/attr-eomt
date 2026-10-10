@@ -929,11 +929,20 @@ class EoMTModel(nn.Module):
             # inference; in training the aux loss applies each head to the matched
             # subset only, so skip the full-query application here.
             if not training:
-                result["aux_queries_logits"] = {
-                    name: head(q) for name, head in self.aux_heads.items()
-                }
+                specs = {s.name: s for s in self.aux_specs}
+                outs = {name: head(q) for name, head in self.aux_heads.items()}
+                logits = {n: o for n, o in outs.items() if not specs[n].regression}
+                if logits:
+                    result["aux_queries_logits"] = logits
+                # Regression heads: their values in real units, ``{name: (B, Q)}``.
+                values = {n: specs[n].decode(o[..., 0].float()) for n, o in outs.items() if specs[n].regression}
+                if values:
+                    result["aux_queries_values"] = values
         if training:
             result["loss"] = out.loss
+            # The tensor the final predictions are read from (``query_embed`` is a view of it), for the per-task
+            # gradient diagnostic of the attribute heads.
+            result["last_hidden_state"] = out.last_hidden_state
         return result
 
 

@@ -44,7 +44,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 
-from .postprocess import _masks_to_original, aux_result, boxes_from_masks, query_scores
+from .postprocess import _masks_to_original, aux_result, aux_value_result, boxes_from_masks, query_scores
 from .preprocess import preprocess_numpy
 
 _AUGMENT_KEYS = {"flip", "scales"}
@@ -197,6 +197,7 @@ def _view_instances(out, b, view, meta, cells, conf_thres, max_det, mask_thresh,
         "scores": scores[sel],
         "classes": classes[sel],
         "aux": {n: lg[b].float().softmax(-1)[sel] for n, lg in (out.get("aux_queries_logits") or {}).items()},
+        "aux_values": {n: v[b].float()[sel] for n, v in (out.get("aux_queries_values") or {}).items()},
         "embed": out["query_embed"][b, sel].float() if embed else None,
     }
 
@@ -322,10 +323,11 @@ def predict_views(
                     found.append(inst)
 
     if not found:
-        aux_sizes = {s.name: s.num_classes for s in getattr(model, "aux_specs", [])}
+        specs = getattr(model, "aux_specs", [])
         return _result(torch.zeros((0, h, w), dtype=torch.bool), torch.zeros(0), torch.zeros(0, dtype=torch.long),
-                       {n: torch.zeros(0, k) for n, k in aux_sizes.items()},
-                       torch.zeros(0, model.config.hidden_size) if embed else None, aux_scopes)
+                       {s.name: torch.zeros(0, s.num_classes) for s in specs if not s.regression},
+                       torch.zeros(0, model.config.hidden_size) if embed else None, aux_scopes,
+                       {s.name: torch.zeros(0) for s in specs if s.regression})
 
     scores = torch.cat([f["scores"] for f in found]).float()
     classes = torch.cat([f["classes"] for f in found])
@@ -377,8 +379,9 @@ def predict_views(
             logit = F.interpolate(logit[:, None], size=(h, w), mode="bilinear", align_corners=False)[:, 0]
         masks[start : start + 16] = logit > _logit(mask_thresh)
 
-    # Score-weighted means of the members' attribute probabilities and embeddings.
+    # Score-weighted means of the members' attribute probabilities, regression values and embeddings.
     aux_probs = {n: weight_t @ torch.cat([f["aux"][n] for f in found]) for n in found[0]["aux"]}
+    aux_values = {n: weight_t @ torch.cat([f["aux_values"][n] for f in found]) for n in found[0]["aux_values"]}
     embeds = weight_t @ torch.cat([f["embed"] for f in found]) if embed else None
     out_scores = torch.as_tensor(fused[keep], device=scores.device)
     out_classes = classes[[clusters[k][0] for k in keep]] if keep else classes[:0]
@@ -386,11 +389,12 @@ def predict_views(
         ok = masks.flatten(1).sum(1) >= min_mask_area
         masks, out_scores, out_classes = masks[ok], out_scores[ok], out_classes[ok]
         aux_probs = {n: p[ok] for n, p in aux_probs.items()}
+        aux_values = {n: v[ok] for n, v in aux_values.items()}
         embeds = embeds[ok] if embeds is not None else None
-    return _result(masks, out_scores, out_classes, aux_probs, embeds, aux_scopes)
+    return _result(masks, out_scores, out_classes, aux_probs, embeds, aux_scopes, aux_values)
 
 
-def _result(masks, scores, classes, aux_probs: dict, embeds, aux_scopes) -> dict:
+def _result(masks, scores, classes, aux_probs: dict, embeds, aux_scopes, aux_values: dict) -> dict:
     res = {
         "num_detections": int(scores.numel()),
         "boxes": boxes_from_masks(masks),
@@ -400,6 +404,8 @@ def _result(masks, scores, classes, aux_probs: dict, embeds, aux_scopes) -> dict
     }
     if aux_probs:
         res["aux"] = aux_result(aux_probs, classes, aux_scopes)
+    if aux_values:
+        res["aux_values"] = aux_value_result(aux_values, classes, aux_scopes)
     if embeds is not None:
         res["embed"] = embeds.cpu()
     return res

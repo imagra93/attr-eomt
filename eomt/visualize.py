@@ -44,9 +44,7 @@ def _aux_label(
     With ``show_scores=False`` the parenthesised probabilities are omitted.
     Otherwise the legacy compact form is used (all heads on one space-joined row).
     """
-    aux = result.get("aux")
-    if not aux:
-        return ""
+    aux = result.get("aux") or {}
     rows = []
     for head, pred in aux.items():
         idx = int(pred["ids"][i])
@@ -58,6 +56,10 @@ def _aux_label(
             label = aux_names[head].get(idx, label)
         prob_txt = f" ({prob:.2f})" if show_scores else ""
         rows.append(f"  • {head}: {label}{prob_txt}" if multiline else f"{label}{prob_txt}")
+    for head, values in (result.get("aux_values") or {}).items():
+        v = float(values[i])
+        if v == v:  # NaN: class-scoped head does not apply to this instance
+            rows.append(f"  • {head}: {v:.3g}" if multiline else f"{head}={v:.3g}")
     return "\n".join(rows) if multiline else "  ".join(rows)
 
 

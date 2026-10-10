@@ -7,7 +7,10 @@ size, … — read from the matched query's embedding.
 The supervision reuses EoMT's own Hungarian matcher
 (``model.eomt.criterion.matcher``) so each attribute is trained on the **same**
 query→GT assignment the detection loss used. Several specs ⇒ several independent
-heads, summed (optionally weighted) into one scalar.
+heads, summed (optionally weighted) into one scalar. A regression head
+(``AuxHeadSpec.regression``) regresses one real number per instance instead: a
+Huber loss on its standardized value (O(1), like the cross-entropy of the
+categorical heads), evaluated as the mean absolute error in real units.
 """
 
 from __future__ import annotations
@@ -114,6 +117,12 @@ def _localization_iou(out, b, src, tgt, geom_labels, is_detect, dev):
     return inter / union
 
 
+def _density_weights(bins, z: torch.Tensor) -> torch.Tensor:
+    """Per-sample weight of standardized regression targets ``z`` from ``bins = (edges, weights)``."""
+    edges, w = (t.to(z.device, z.dtype) for t in bins)
+    return w[torch.bucketize(z, edges[1:-1])]
+
+
 def aux_loss(
     model,
     out: dict,
@@ -123,18 +132,22 @@ def aux_loss(
     weights: dict[str, float] | None = None,
     *,
     indices=None,
-    class_weights: dict[str, torch.Tensor] | None = None,
+    class_weights: dict | None = None,
+    log_vars=None,
     ignore_index: int = -100,
 ):
-    """Weighted sum of per-attribute CE over matched queries.
+    """Weighted sum of per-attribute losses over matched queries: CE, or Huber for a regression head.
 
     ``aux_labels`` maps head name → per-image label tensors (line-aligned with
     ``class_labels``). Labels equal to ``ignore_index`` (missing / out-of-vocab
-    attributes) are skipped — they contribute no loss instead of being trained as
+    attributes; NaN for a regression head) are skipped — they contribute no loss instead of being trained as
     class 0. ``weights`` scales each head; ``class_weights`` optionally re-weights
-    classes within a head (imbalance). Pass ``indices`` to reuse a matching already
+    classes within a head (imbalance), or, for a regression head, its values by density (``(edges, weights)``
+    over the standardized values). ``log_vars`` (``{name: scalar parameter s}``) turns on uncertainty weighting
+    (Kendall et al., 2018): each head contributes ``exp(-s) * loss + s``, so ``exp(-s)`` is a learned weight.
+    Pass ``indices`` to reuse a matching already
     computed this step (avoids re-running the Hungarian matcher). Returns
-    ``(total_loss, {name: per_head_loss})``.
+    ``(total_loss, {name: per_head_loss})``, the per-head losses unweighted.
     """
     if indices is None:
         indices = match_queries(model, out, mask_labels, class_labels)
@@ -145,20 +158,32 @@ def aux_loss(
 
     weights = weights or {}
     class_weights = class_weights or {}
+    specs = {s.name: s for s in model.aux_specs}
     total: torch.Tensor | None = None
     per_head: dict[str, torch.Tensor] = {}
     for name, head in model.aux_heads.items():
         logits = head(matched)  # [N, ns]
         gt = torch.cat([aux_labels[name][b][tgt] for (b, tgt) in batch_tgt]).to(logits.device)
         cw = class_weights.get(name)
-        if cw is not None:
-            cw = cw.to(logits.device, logits.dtype)
-        if (gt != ignore_index).any():
+        if specs[name].regression:
+            valid = ~gt.isnan()
+            if valid.any():
+                z = specs[name].encode(gt[valid].float())
+                err = F.huber_loss(logits[valid, 0].float(), z, delta=1.0, reduction="none")
+                sw = _density_weights(cw, z) if cw is not None else None
+                loss = (err * sw).sum() / sw.sum() if sw is not None else err.mean()
+            else:  # every matched value ignored — keep the graph alive with a zero
+                loss = logits.sum() * 0.0
+        elif (gt != ignore_index).any():
+            if cw is not None:
+                cw = cw.to(logits.device, logits.dtype)
             loss = F.cross_entropy(logits, gt, weight=cw, ignore_index=ignore_index)
         else:  # every matched label ignored — keep the graph alive with a zero
             loss = logits.sum() * 0.0
         per_head[name] = loss
         w = float(weights.get(name, 1.0))
+        if log_vars is not None:
+            loss = torch.exp(-log_vars[name]) * loss + log_vars[name]
         total = w * loss if total is None else total + w * loss
     return total, per_head
 
@@ -176,7 +201,8 @@ def aux_accuracy(
 ) -> dict[str, tuple[int, int]]:
     """Top-1 ``{name: (correct, total)}`` on matched queries (the ``typ_acc`` analogue).
 
-    Ignored labels (``ignore_index``) are excluded from both correct and total.
+    For a regression head the pair is ``(sum of absolute errors in real units, total)``, so its ratio is the MAE.
+    Ignored labels (``ignore_index``, NaN) are excluded from both correct and total.
     Pass ``indices`` to reuse a matching already computed this step.
     """
     if indices is None:
@@ -184,13 +210,22 @@ def aux_accuracy(
     matched, batch_tgt = _gather_matched(out, indices)
     if matched is None:
         return {name: (0, 0) for name in model.aux_heads}
-    res: dict[str, tuple[int, int]] = {}
+    specs = {s.name: s for s in model.aux_specs}
+    res: dict[str, tuple] = {}
     for name, head in model.aux_heads.items():
-        pred = head(matched).argmax(-1)
-        gt = torch.cat([aux_labels[name][b][tgt] for (b, tgt) in batch_tgt]).to(pred.device)
-        valid = gt != ignore_index
-        res[name] = (int(((pred == gt) & valid).sum()), int(valid.sum()))
+        hit, valid = _hits(specs[name], head(matched), aux_labels[name], batch_tgt, ignore_index)
+        res[name] = (hit.sum().item() if specs[name].regression else int(hit.sum()), int(valid.sum()))
     return res
+
+
+def _hits(spec, logits, labels, batch_tgt, ignore_index):
+    """Per matched query: correct (bool), or for a regression head the absolute error in real units; and validity."""
+    gt = torch.cat([labels[b][tgt] for (b, tgt) in batch_tgt]).to(logits.device)
+    if spec.regression:
+        valid = ~gt.isnan()
+        return (spec.decode(logits[:, 0].float()) - gt).abs().nan_to_num(0.0), valid
+    valid = gt != ignore_index
+    return (logits.argmax(-1) == gt) & valid, valid
 
 
 @torch.no_grad()
@@ -207,7 +242,8 @@ def aux_accuracy_by_primary(
     """Per-head accuracy bucketed by GT **primary** class.
 
     Returns ``{head: {primary_class_id: (correct, total)}}`` over matched queries —
-    a diagnostic for *which primary classes* the attribute is (in)accurate on. Pass
+    a diagnostic for *which primary classes* the attribute is (in)accurate on (a regression head: the summed absolute
+    error instead of ``correct``, as in :func:`aux_accuracy`). Pass
     ``indices`` (e.g. IoU-gated, but not class-gated, so weak primary classes still
     appear) to control the population. Ignored labels are excluded.
     """
@@ -218,14 +254,12 @@ def aux_accuracy_by_primary(
     if matched is None:
         return res
     prim = torch.cat([class_labels[b][tgt] for (b, tgt) in batch_tgt]).to(matched.device)
+    specs = {s.name: s for s in model.aux_specs}
     for name, head in model.aux_heads.items():
-        pred = head(matched).argmax(-1)
-        gt = torch.cat([aux_labels[name][b][tgt] for (b, tgt) in batch_tgt]).to(pred.device)
-        valid = gt != ignore_index
-        correct = (pred == gt) & valid
-        d: dict[int, tuple[int, int]] = {}
+        hit, valid = _hits(specs[name], head(matched), aux_labels[name], batch_tgt, ignore_index)
+        d: dict[int, tuple] = {}
         for c in prim[valid].unique().tolist():
             sel = (prim == c) & valid
-            d[int(c)] = (int(correct[sel].sum()), int(sel.sum()))
+            d[int(c)] = (hit[sel].sum().item() if specs[name].regression else int(hit[sel].sum()), int(sel.sum()))
         res[name] = d
     return res

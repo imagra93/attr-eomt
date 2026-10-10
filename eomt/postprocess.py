@@ -46,6 +46,20 @@ def aux_result(aux_probs: dict, classes, aux_scopes: dict | None) -> dict:
     return res
 
 
+def aux_value_result(aux_values: dict, classes, aux_scopes: dict | None) -> dict:
+    """Per regression head ``{name: (N,)}`` real values of the kept detections, class-scope-gated: NaN where a
+    class-scoped head does not apply (the regression counterpart of ``ids = -1``)."""
+    aux_scopes = aux_scopes or {}
+    res: dict = {}
+    for name, v in aux_values.items():
+        scope = aux_scopes.get(name)
+        if scope is not None and v.numel():
+            out_of_scope = torch.tensor([int(c) not in scope for c in classes.tolist()], dtype=torch.bool, device=v.device)
+            v = v.masked_fill(out_of_scope, float("nan"))
+        res[name] = v
+    return res
+
+
 def boxes_from_masks(masks: torch.Tensor) -> torch.Tensor:
     """Derive ``xyxy`` boxes (pixel coords) from boolean masks ``(N, H, W)``; an empty mask gives zeros.
 
@@ -147,11 +161,13 @@ def postprocess_detection(
         "classes": (N,), "query_idx": (N,)}``, where ``query_idx`` holds the kept
         query indices into ``[0, Q)`` — the mapping back to per-query embeddings. If the model has secondary heads, ``output`` also carries
         ``"aux_queries_logits": {name: (1, Q, ns)}`` and the result gains
-        ``"aux": {name: {"ids": (N,), "probs": (N, ns)}}`` for the same kept queries.
+        ``"aux": {name: {"ids": (N,), "probs": (N, ns)}}`` for the same kept queries; regression heads
+        (``"aux_queries_values"``) give ``"aux_values": {name: (N,)}`` in real units.
     """
     pred_boxes = output["pred_boxes"][0].float()  # (Q, 4) cxcywh in [0,1]
     class_logits = output["class_queries_logits"][0].float()  # (Q, C+1)
     aux_logits = output.get("aux_queries_logits")
+    aux_values = output.get("aux_queries_values")
 
     scores_all = class_logits.softmax(dim=-1)[:, :-1]  # drop null class -> (Q, C)
     scores, classes = scores_all.max(dim=-1)  # (Q,)
@@ -174,6 +190,8 @@ def postprocess_detection(
                 }
                 for name, lg in aux_logits.items()
             }
+        if aux_values is not None:
+            empty["aux_values"] = {name: torch.zeros((0,)) for name in aux_values}
         return empty
 
     if sel.numel() > max_det:
@@ -190,6 +208,8 @@ def postprocess_detection(
     }
     if aux_logits is not None:
         result["aux"] = _build_aux_result(aux_logits, sel, classes, aux_scopes)
+    if aux_values is not None:
+        result["aux_values"] = aux_value_result({n: v[0].float()[sel] for n, v in aux_values.items()}, classes, aux_scopes)
     return result
 
 
@@ -245,10 +265,12 @@ def postprocess_instance(
         "masks": (N,H,W), "query_idx": (N,)}``, where ``query_idx`` holds the kept
         query indices into ``[0, Q)`` — the mapping back to per-query embeddings. If the model has secondary heads, ``output`` also
         carries ``"aux_queries_logits": {name: (1, Q, ns)}`` and the result gains
-        ``"aux": {name: {"ids": (N,), "probs": (N, ns)}}`` for the same kept queries.
+        ``"aux": {name: {"ids": (N,), "probs": (N, ns)}}`` for the same kept queries; regression heads
+        (``"aux_queries_values"``) give ``"aux_values": {name: (N,)}`` in real units.
     """
     mask_logits = output["masks_queries_logits"][0].float()  # (Q, h, w)
     aux_logits = output.get("aux_queries_logits")  # {name: (1, Q, ns)} or None
+    aux_values = output.get("aux_queries_values")  # {name: (1, Q)} real values of the regression heads, or None
     quality = output.get("quality_logits")
     scores, classes = query_scores(
         output["class_queries_logits"][0], mask_logits, None if quality is None else quality[0], mask_thresh
@@ -275,6 +297,8 @@ def postprocess_instance(
                 }
                 for name, lg in aux_logits.items()
             }
+        if aux_values is not None:
+            empty["aux_values"] = {name: torch.zeros((0,)) for name in aux_values}
         return empty
 
     if sel.numel() > max_det:
@@ -306,4 +330,6 @@ def postprocess_instance(
         result["head_boxes"] = boxes_to_original(output["aux_boxes"][0].float()[sel], orig_h, orig_w, preprocess_meta)
     if aux_logits is not None:
         result["aux"] = _build_aux_result(aux_logits, sel, classes, aux_scopes)
+    if aux_values is not None:
+        result["aux_values"] = aux_value_result({n: v[0].float()[sel] for n, v in aux_values.items()}, classes, aux_scopes)
     return result

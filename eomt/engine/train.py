@@ -35,6 +35,7 @@ from ..aux_cls import (
 )
 from ..config import normalize_loss_weights
 from ..data import CocoDetection, CocoInstanceSeg, CocoValImages, collate_train
+from ..data.coco import _attr_label
 from ..data.transforms import AugConfig, build_val_transform
 from ..ema import ModelEMA, _unwrap
 from ..model import DEFAULT_FPN_SCALES, build_model, load_dinov2_backbone
@@ -200,29 +201,56 @@ def _aux_w_factor(it, total_iters, warmup_frac):
     return min(1.0, it / max(1.0, warmup_frac * total_iters))
 
 
+def _in_scope_labels(train_ds, spec) -> list:
+    """Labels (:func:`eomt.data.coco._attr_label`, ignored ones included) of the train annotations a head applies to."""
+    anns = getattr(train_ds.coco, "dataset", {}).get("annotations", []) or []
+    out = []
+    for a in anns:
+        cls = train_ds.cat2contig.get(a.get("category_id"))
+        # Out-of-scope instances never reach a class-scoped head's loss, so they count for neither its coverage nor
+        # its weights.
+        if cls is None or (spec.applies_to is not None and cls not in spec.applies_to):
+            continue
+        out.append(_attr_label(spec, train_ds._attr_id_maps, a.get("attributes", {}), cls))
+    return out
+
+
+def _valid_labels(spec, labels: list) -> list:
+    return [v for v in labels if (v == v if spec.regression else v >= 0)]  # NaN != NaN
+
+
+def _density_bins(spec, values: list, n_bins: int = 50):
+    """Inverse-sqrt smoothed-density weights of a regression head (LDS, Yang et al. 2021) as ``(edges, weights)`` over
+    its standardized values, mean-normalized over the training values; ``None`` when the values do not spread."""
+    z = spec.encode(torch.tensor(values, dtype=torch.float64)).float()
+    if z.numel() < 2 or float(z.max() - z.min()) < 1e-6:
+        return None
+    edges = torch.linspace(float(z.min()), float(z.max()), n_bins + 1)
+    counts = torch.histc(z, bins=n_bins, min=float(edges[0]), max=float(edges[-1]))
+    kernel = torch.exp(-0.5 * (torch.arange(-2.0, 3.0) / 2.0) ** 2)  # the paper's Gaussian, 5 bins, sigma 2
+    density = torch.nn.functional.conv1d(counts[None, None], (kernel / kernel.sum())[None, None], padding=2)[0, 0]
+    w = density.clamp(min=1e-6).rsqrt()
+    return edges, w / w[torch.bucketize(z, edges[1:-1])].mean()
+
+
 def _compute_aux_class_weights(train_ds) -> dict:
-    """Inverse-sqrt-frequency CE weights per aux head (mean-normalized to ~1).
+    """Inverse-sqrt-frequency CE weights per aux head (mean-normalized to ~1); for a regression head, inverse-sqrt
+    smoothed-density weights of its values (see :func:`_density_bins`).
 
     Counts each head's contiguous-class frequency from the in-memory train
     annotations (no image decode); missing / out-of-vocab values are ignored.
     """
-    anns = getattr(train_ds.coco, "dataset", {}).get("annotations", []) or []
-    cat2contig = train_ds.cat2contig
-    out: dict[str, torch.Tensor] = {}
+    out: dict = {}
     for spec in train_ds.aux_specs:
-        id_map = train_ds._attr_id_maps[spec.name]
+        labels = _valid_labels(spec, _in_scope_labels(train_ds, spec))
+        if spec.regression:
+            bins = _density_bins(spec, labels)
+            if bins is not None:
+                out[spec.name] = bins
+            continue
         counts = torch.zeros(spec.num_classes)
-        for a in anns:
-            # Skip out-of-scope instances for class-scoped heads: they are routed to
-            # -100 and never contribute to the head's loss, so they must not skew its
-            # class-frequency weights either.
-            if spec.applies_to is not None:
-                cls = cat2contig.get(a.get("category_id"))
-                if cls is None or cls not in spec.applies_to:
-                    continue
-            cid = id_map.get(a.get("attributes", {}).get(spec.name), -100)
-            if 0 <= cid < spec.num_classes:
-                counts[cid] += 1
+        for cid in labels:
+            counts[cid] += 1
         w = 1.0 / counts.clamp(min=1).sqrt()
         out[spec.name] = w * (spec.num_classes / w.sum())  # mean weight ~ 1.0
     return out
@@ -233,26 +261,25 @@ def _aux_coverage(train_ds) -> dict[str, tuple[int, int]]:
 
     ``in_scope`` counts instances whose primary class the head applies to (every
     instance for an unscoped head); ``supervised`` counts those of them carrying a
-    tagged, in-vocab value (not ignored as ``-100``). Diagnostic only — mirrors the
-    routing / ignore logic in :func:`eomt.data.coco._attr_label` without decoding images.
+    tagged, valid value (not ignored). Diagnostic only — no image is decoded.
     """
-    anns = getattr(train_ds.coco, "dataset", {}).get("annotations", []) or []
-    cat2contig = train_ds.cat2contig
     out: dict[str, tuple[int, int]] = {}
     for spec in train_ds.aux_specs:
-        id_map = train_ds._attr_id_maps[spec.name]
-        supervised = in_scope = 0
-        for a in anns:
-            cls = cat2contig.get(a.get("category_id"))
-            if cls is None:
-                continue
-            if spec.applies_to is not None and cls not in spec.applies_to:
-                continue
-            in_scope += 1
-            if id_map.get(a.get("attributes", {}).get(spec.name), -100) >= 0:
-                supervised += 1
-        out[spec.name] = (supervised, in_scope)
+        labels = _in_scope_labels(train_ds, spec)
+        out[spec.name] = (len(_valid_labels(spec, labels)), len(labels))
     return out
+
+
+def _aux_kind_str(spec) -> str:
+    """``num_classes`` of a categorical head, the target space of a regression head (banner)."""
+    if not spec.regression:
+        return str(spec.num_classes)
+    return f"regression{', log' if spec.log else ''}, mean {spec.mean:.4g} std {spec.std:.4g}"
+
+
+def _aux_metric(spec) -> str:
+    """The matched-query metric of a head: ``aux_acc`` (accuracy), or ``aux_mae`` (mean absolute error, real units)."""
+    return "aux_mae" if spec.regression else "aux_acc"
 
 
 def _aux_scope_str(spec, names: dict) -> str:
@@ -277,6 +304,29 @@ def _write_run_config(path: Path, cfg: dict) -> None:
         return
     with path.open("w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
+
+
+#: Iterations between two measurements of the attribute heads' pull on the shared queries (``train/aux_grad``).
+AUX_GRAD_EVERY = 50
+
+
+def _aux_grad_ratios(out: dict, per_head: dict, aux_w_eff: float, weights: dict | None, log_vars) -> dict[str, float]:
+    """Each attribute head's pull on the shared queries: the norm of the gradient of its weighted loss on the query rows
+    of the final hidden state, over that of the segmentation loss. Well above 1 the head steers the encoder more than
+    the segmentation does; far below it only reads the encoder's features."""
+    h = out["last_hidden_state"]
+    nq = out["query_embed"].shape[1]
+    seg = float(torch.autograd.grad(out["loss"], h, retain_graph=True)[0][:, :nq].float().norm())
+    ratios = {}
+    for name, loss in per_head.items():
+        if not loss.requires_grad:  # no query matched in this micro-batch
+            continue
+        w = aux_w_eff * float((weights or {}).get(name, 1.0))
+        if log_vars is not None:
+            w *= float(torch.exp(-log_vars[name]))
+        g = torch.autograd.grad(loss, h, retain_graph=True)[0][:, :nq]
+        ratios[name] = w * float(g.float().norm()) / max(seg, 1e-12)
+    return ratios
 
 
 def _safe_acc(hit: int, tot: int) -> float:
@@ -312,9 +362,10 @@ class _Forward(torch.nn.Module):
     step uses: the attribute heads run on the model's outputs, outside ``model.forward``, and get no gradient when no
     query matches, which DDP tolerates only for parameters used inside its forward (``find_unused_parameters``)."""
 
-    def __init__(self, model, fn):
+    def __init__(self, model, fn, extra=None):
         super().__init__()
         self.model, self.fn = model, fn
+        self.extra = extra  # parameters used by ``fn`` outside the model (the attribute heads' learned log-variances)
 
     def forward(self, *args):
         return self.fn(self.model, *args)
@@ -402,6 +453,7 @@ def train(
     aux_class_weights: bool = False,
     aux_iou_gate: float = 0.5,
     aux_class_gate: bool = True,
+    aux_balance: str = "static",
     aux_head_layers: int = 2,
     aux_head_hidden: int | None = None,
     aux_head_dropout: float = 0.0,
@@ -445,6 +497,16 @@ def train(
     With the default windows the blocks drop out at 2/6, 3/6, 4/6 and 5/6 of training (~40 % fewer intermediate
     predictions overall) and only the last sixth runs final-only (~25 % faster steps); the reference recipe
     supervises every block throughout. Resuming keeps the checkpoint's ``box_head``; warm starts honor the argument.
+
+    **Attribute heads.** A dataset attribute is categorical (cross-entropy) or ``"type": "regression"`` (a real
+    number: Huber loss on its standardized value, ``log1p`` first with ``"log": true``; validated as the MAE in real
+    units, ``val/aux_mae/<name>``). Both losses are O(1), so equal weights are a sane start: ``aux_w`` scales them all,
+    ``aux_w_per_head`` each one, and ``aux_class_weights=True`` re-weights by inverse-sqrt class frequency (by
+    inverse-sqrt smoothed density for a regression head). ``aux_balance="uncertainty"`` learns one weight per head
+    instead (``exp(-s) * loss + s``, Kendall et al. 2018; the segmentation loss stays the fixed anchor). Every
+    epoch prints each head's pull on the shared queries, the norm of its weighted loss's gradient on them over the
+    segmentation loss's (``train/aux_grad/<name>`` in the CSV): well above 1 the head steers the encoder, far below it
+    only reads its features.
 
     **Class targets** (instance family; persisted with the loss weights). ``iou_aware_cls=True`` trains a matched query's
     class probability towards ``(1 + IoU) / 2`` of its mask rather than 1, so the score ranks masks by their quality.
@@ -500,6 +562,8 @@ def train(
     """
     if len(warmup_steps) != 2:
         raise ValueError("warmup_steps must be (head_steps, vit_steps)")
+    if aux_balance not in ("static", "uncertainty"):
+        raise ValueError(f"aux_balance={aux_balance!r}: 'static' or 'uncertainty'")
     if imgsz % 14 or (val_imgsz is not None and val_imgsz % 14):
         raise ValueError(f"imgsz={imgsz} and val_imgsz={val_imgsz} must be divisible by 14 (DINOv2 grid).")
 
@@ -672,7 +736,7 @@ def train(
         print(
             "[data] aux heads: "
             + "; ".join(
-                f"{s.name}({s.num_classes}){_aux_scope_str(s, train_ds.names)}: "
+                f"{s.name}({_aux_kind_str(s)}){_aux_scope_str(s, train_ds.names)}: "
                 f"{cov[s.name][0]}/{cov[s.name][1]} tagged"
                 for s in aux_specs
             )
@@ -763,8 +827,9 @@ def train(
             "aux_class_weights": aux_class_weights,
             "aux_iou_gate": aux_iou_gate,
             "aux_class_gate": aux_class_gate,
+            "aux_balance": aux_balance,
             "aux_head_arch": aux_head_arch,
-            "aux_heads": {s.name: s.num_classes for s in aux_specs},
+            "aux_heads": {s.name: ("regression" if s.regression else s.num_classes) for s in aux_specs},
             "loss_weights": loss_weights,
             "num_upscale_blocks": num_upscale_blocks,
             "fpn_scales": list(fpn_scales) if fpn_scales else None,
@@ -803,9 +868,19 @@ def train(
         print(f"[model] aux head arch: {model.aux_head_arch}")
     start_epoch, best_metric = 0, -1.0
     optimizer = build_optimizer(model, lr0, weight_decay, backbone_lr_mult, llrd)
+    # Uncertainty weighting: one learned log-variance per attribute head, outside the model so that inference
+    # checkpoints stay as they are (saved with the trainer state in last.pt). Its own group: head LR, no decay.
+    aux_log_vars = None
+    if aux_balance == "uncertainty" and aux_specs:
+        aux_log_vars = torch.nn.ParameterDict({s.name: torch.nn.Parameter(torch.zeros((), device=dev)) for s in aux_specs})
+        optimizer.add_param_group(
+            {"params": list(aux_log_vars.values()), "lr": lr0, "initial_lr": lr0, "weight_decay": 0.0, "is_backbone": False}
+        )
 
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model"], strict=False)
+        if aux_log_vars is not None and resume_ckpt.get("aux_log_vars"):
+            aux_log_vars.load_state_dict(resume_ckpt["aux_log_vars"])
         if "optimizer" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer"])
         start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
@@ -839,10 +914,11 @@ def train(
     # cxcywh boxes (detect family); route it to the matching forward kwarg.
     geom_key = "box_labels" if is_detect else "mask_labels"
 
-    def micro_step(m, pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff):
-        """One micro-batch's loss: the segmentation loss computed in the model plus the attribute heads' loss."""
+    def micro_step(m, pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe=False):
+        """One micro-batch's loss: the segmentation loss computed in the model plus the attribute heads' loss. With
+        ``probe``, also each head's pull on the shared queries (see :func:`_aux_grad_ratios`)."""
         out = m(pixel_values, class_labels=class_labels, **{geom_key: geom_labels})
-        loss, aux_indices, aux_gated = out["loss"], None, None
+        loss, aux_indices, aux_gated, grads = out["loss"], None, None, None
         if aux_specs:
             # Match once per step, then gate to well-localized (IoU) and
             # correctly-classified queries so the attribute trains only on
@@ -852,17 +928,19 @@ def train(
                 out, aux_indices, geom_labels, class_labels,
                 iou_thr=aux_iou_gate, require_class=aux_class_gate,
             )
-            a_loss, _ = aux_loss(
+            a_loss, per_head = aux_loss(
                 m, out, geom_labels, class_labels, aux_labels,
                 weights=aux_w_per_head, indices=aux_gated,
-                class_weights=aux_class_weight,
+                class_weights=aux_class_weight, log_vars=aux_log_vars,
             )
+            if probe:
+                grads = _aux_grad_ratios(out, per_head, aux_w_eff, aux_w_per_head, aux_log_vars)
             loss = loss + aux_w_eff * a_loss
-        return loss, out, aux_indices, aux_gated
+        return loss, out, aux_indices, aux_gated, grads
 
     # Several GPUs: DDP copies process 0's weights to the others here and averages the gradients in backward. The
     # buffers (the annealed masked-attention probabilities) are set identically on every process, not broadcast.
-    step_model = _Forward(model, micro_step)
+    step_model = _Forward(model, micro_step, aux_log_vars)
     if world > 1:
         step_model = DistributedDataParallel(
             step_model, device_ids=[dev.index], broadcast_buffers=False, find_unused_parameters=True
@@ -942,6 +1020,8 @@ def train(
             }
             if ema_model is not None:
                 extra["ema"] = ema_model.state_dict()
+            if aux_log_vars is not None:
+                extra["aux_log_vars"] = aux_log_vars.state_dict()
         ckpt = wrap_checkpoint(
             state_dict,
             size=size,
@@ -963,14 +1043,17 @@ def train(
         )
         save_checkpoint(ckpt, path)
 
-    # Per-epoch metrics CSV (segmentation always; one column per aux head if present).
+    # Per-epoch metrics CSV (segmentation always; per aux head if present: its matched-query accuracy or MAE, and its
+    # pull on the shared queries).
+    metric_of = {s.name: _aux_metric(s) for s in aux_specs}
     csv_fields = ["epoch", "train/loss"]
-    csv_fields += [f"train/aux_acc/{s.name}" for s in aux_specs]
+    csv_fields += [f"train/{metric_of[s.name]}/{s.name}" for s in aux_specs]
+    csv_fields += [f"train/aux_grad/{s.name}" for s in aux_specs]
     if val_ds is not None:
         if not is_detect:
             csv_fields += [f"val/segm/{k}" for k in _SEGM_KEYS]
         csv_fields += [f"val/bbox/{k}" for k in _SEGM_KEYS]
-        csv_fields += [f"val/aux_acc/{s.name}" for s in aux_specs]
+        csv_fields += [f"val/{metric_of[s.name]}/{s.name}" for s in aux_specs]
     csv_log = _CsvLogger(run_dir / "metrics.csv", csv_fields) if main else None
 
     # Per-primary aux accuracy is computed held-out in aux_evaluate when a val split
@@ -988,6 +1071,7 @@ def train(
         aux_tot = {s.name: 0 for s in aux_specs}
         # per-primary-class aux accuracy (only accumulated as the no-val fallback)
         aux_pc: dict[str, dict[int, list[int]]] = {s.name: {} for s in aux_specs}
+        aux_grad: dict[str, list[float]] = {s.name: [] for s in aux_specs}  # the heads' pull, measured on the main process
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs - 1}", unit="batch", disable=not main)
         for step, (pixel_values, geom_labels, class_labels, aux_labels) in enumerate(pbar):
             it = epoch * iters_per_epoch + step
@@ -1015,9 +1099,12 @@ def train(
             no_sync = step_model.no_sync() if world > 1 and not boundary else contextlib.nullcontext()
             with no_sync:
                 with torch.amp.autocast("cuda", enabled=amp_on, dtype=autocast_dtype):
-                    loss, out, aux_indices, aux_gated = step_model(
-                        pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff
+                    probe = bool(aux_specs) and main and it % AUX_GRAD_EVERY == 0
+                    loss, out, aux_indices, aux_gated, grads = step_model(
+                        pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe
                     )
+                for n, r in (grads or {}).items():
+                    aux_grad[n].append(r)
                 loss_item = float(loss.detach())  # unscaled, for logging
                 scaler.scale(loss / accum_steps).backward()
             if boundary:
@@ -1054,8 +1141,8 @@ def train(
                 "avg": f"{avg:.3f}",
                 "lr": f"{head_group['lr']:.2e}",
             }
-            if aux_specs:  # running matched-query accuracy per head
-                postfix["aux_acc"] = " ".join(
+            if aux_specs:  # running matched-query accuracy (MAE for a regression head) per head
+                postfix["aux"] = " ".join(
                     f"{n}={_safe_acc(aux_hits[n], aux_tot[n]):.2f}" for n in aux_hits
                 )
             pbar.set_postfix(postfix)
@@ -1072,11 +1159,22 @@ def train(
             epoch_loss = running / (iters_per_epoch * world)
             print(f"[epoch {epoch}] mean loss {epoch_loss:.4f}")
             aux_acc = {n: _safe_acc(aux_hits[n], aux_tot[n]) for n in aux_hits}
+            aux_pull = {n: sum(v) / len(v) if v else float("nan") for n, v in aux_grad.items()}
             if aux_specs:
-                acc_str = "  ".join(f"{n}={aux_acc[n]:.3f}" for n in aux_acc)
-                print(f"[epoch {epoch}] aux train acc: {acc_str}")
+                acc_str = "  ".join(f"{n} {metric_of[n][4:]}={aux_acc[n]:.3f}" for n in aux_acc)
+                print(f"[epoch {epoch}] aux train: {acc_str}")
+                print(
+                    f"[epoch {epoch}] aux pull on the queries (gradient norm / segmentation's): "
+                    + "  ".join(f"{n}={g:.3g}" for n, g in aux_pull.items())
+                )
+                if aux_log_vars is not None:
+                    print(
+                        f"[epoch {epoch}] aux learned weights: "
+                        + "  ".join(f"{n}={math.exp(-float(v)):.3g}" for n, v in aux_log_vars.items())
+                    )
                 if tb is not None:
-                    tb.log({f"train/aux_acc/{n}": aux_acc[n] for n in aux_acc}, epoch)
+                    tb.log({f"train/{metric_of[n]}/{n}": aux_acc[n] for n in aux_acc}, epoch)
+                    tb.log({f"train/aux_grad/{n}": g for n, g in aux_pull.items()}, epoch)
 
         # Validate in the regime the model is trained in (official EoMT): masked attention at the annealing
         # probabilities of the epoch's end. The EMA copy is what gets validated and exported as best.pt.
@@ -1124,10 +1222,10 @@ def train(
                         num_workers=workers, amp=amp, verbose=main,
                         iou_gate=aux_iou_gate, class_gate=aux_class_gate,
                     )
-                    metrics.update({f"aux_acc/{n}": v for n, v in val_aux.items()})
+                    metrics.update({f"{metric_of[n]}/{n}": v for n, v in val_aux.items()})
                     print(
-                        f"[epoch {epoch}] val aux acc: "
-                        + "  ".join(f"{n}={v:.3f}" for n, v in val_aux.items())
+                        f"[epoch {epoch}] val aux: "
+                        + "  ".join(f"{n} {metric_of[n][4:]}={v:.3f}" for n, v in val_aux.items())
                     )
                 if tb is not None:
                     tb.log({f"val/{k}": v for k, v in metrics.items()}, epoch)
@@ -1155,7 +1253,8 @@ def train(
 
             # --- per-epoch metrics row (missing values -> nan) ---
             row = {"epoch": epoch, "train/loss": epoch_loss}
-            row.update({f"train/aux_acc/{n}": aux_acc[n] for n in aux_acc})
+            row.update({f"train/{metric_of[n]}/{n}": aux_acc[n] for n in aux_acc})
+            row.update({f"train/aux_grad/{n}": g for n, g in aux_pull.items()})
             row.update({f"val/{k}": v for k, v in metrics.items()})
             csv_log.append(row)
 
@@ -1171,8 +1270,11 @@ def train(
                         for n, buckets in aux_pc.items()
                     }
                 if epoch_aux_pc is not None:
-                    try:
-                        plot_aux_per_class(epoch_aux_pc, names, run_dir / "aux_per_class.png")
+                    try:  # accuracy bars: the categorical heads
+                        plot_aux_per_class(
+                            {n: b for n, b in epoch_aux_pc.items() if metric_of[n] == "aux_acc"}, names,
+                            run_dir / "aux_per_class.png",
+                        )
                     except Exception as e:  # noqa: BLE001
                         print(f"[plot] aux_per_class.png failed: {e}")
 

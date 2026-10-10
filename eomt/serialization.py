@@ -461,7 +461,8 @@ def format_summary(summary: dict[str, Any]) -> str:
     std = ", ".join(f"{x:.3f}" for x in summary.get("norm_std") or [])
     aux = summary.get("aux_heads") or []
     aux_str = ", ".join(
-        f"{a.get('name')}({a.get('num_classes')})" for a in aux
+        f"{a.get('name')}({'regression' + (', log' if a.get('log') else '') if a.get('regression') else a.get('num_classes')})"
+        for a in aux
     ) if aux else "none"
 
     lines = [

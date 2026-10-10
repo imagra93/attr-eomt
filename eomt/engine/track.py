@@ -96,7 +96,8 @@ def track(
     imgsz = int(imgsz if imgsz is not None else model.image_size)
     letterbox = bool(getattr(model, "preprocess_letterbox", False))
     names = getattr(model, "names", None)
-    aux_specs = list(getattr(model, "aux_specs", []))
+    # Tracks vote on the categorical heads; regression values (``aux_values``) are not tracked.
+    aux_specs = [s for s in getattr(model, "aux_specs", []) if not s.regression]
     aux_head_names = [s.name for s in aux_specs]
     aux_label_names = {s.name: s.names for s in aux_specs}
     aux_ns = {s.name: int(s.num_classes) for s in aux_specs}

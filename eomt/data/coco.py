@@ -12,6 +12,7 @@ to convert predictions back to original ids for ``COCOeval``.
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections import Counter
 from pathlib import Path
@@ -85,7 +86,8 @@ def _load_attr_schema(root: Path):
     """Read ``<root>/attributes.yaml`` into a normalized top-level ``attributes`` list.
 
     Each head is ``{name, categories:[{id,name}], applies_to?}``. ``categories`` may be
-    written as bare labels (auto-id 0..n-1) or explicit ``{id,name}`` dicts. Returns
+    written as bare labels (auto-id 0..n-1) or explicit ``{id,name}`` dicts. A regression head is
+    ``{name, type: regression, log?, range?, applies_to?}`` (no categories). Returns
     ``None`` when the schema file is absent.
     """
     import yaml
@@ -103,8 +105,9 @@ def _load_attr_schema(root: Path):
             else:  # bare label -> auto id by position
                 cats.append({"id": i, "name": str(c)})
         entry = {"name": d["name"], "categories": cats}
-        if d.get("applies_to") is not None:
-            entry["applies_to"] = list(d["applies_to"])
+        for key in ("applies_to", "type", "log", "range"):
+            if d.get(key) is not None:
+                entry[key] = d[key]
         norm.append(entry)
     return norm
 
@@ -143,6 +146,7 @@ def _merge_attribute_sidecar(coco, json_file) -> None:
     dataset["attributes"] = schema
     name2id = {d["name"]: {c["name"]: c["id"] for c in d["categories"]} for d in schema}
     valid_ids = {d["name"]: {c["id"] for c in d["categories"]} for d in schema}
+    regression = {d["name"] for d in schema if d.get("type") == "regression"}
     values = _load_attr_values(_find_dataset_root(Path(json_file)), Path(json_file)) or {}
     for ann in dataset.get("annotations", []) or []:
         vals = values.get(ann["id"])
@@ -152,6 +156,9 @@ def _merge_attribute_sidecar(coco, json_file) -> None:
         for head, v in vals.items():
             if head not in name2id:
                 continue
+            if head in regression:  # a number, validated by _attr_label
+                merged[head] = v
+                continue
             rid = name2id[head].get(v, v)  # value may be a label or a raw id
             if isinstance(rid, int) and rid in valid_ids[head]:
                 merged[head] = rid
@@ -159,17 +166,63 @@ def _merge_attribute_sidecar(coco, json_file) -> None:
             ann["attributes"] = {**ann.get("attributes", {}), **merged}
 
 
-def _attr_label(spec: AuxHeadSpec, id_maps: dict, ann_attrs: dict, primary_cls: int) -> int:
-    """Contiguous attribute id for one instance, or ``-100`` (ignored by the aux CE).
+def _attr_label(spec: AuxHeadSpec, id_maps: dict, ann_attrs: dict, primary_cls: int) -> int | float:
+    """Contiguous attribute id for one instance, or ``-100`` (ignored by the aux CE); for a regression head its
+    value, or NaN (ignored).
 
-    ``-100`` when the attribute is missing / out-of-vocab (never silently trained as
-    class 0), **or** when the head is class-scoped (``applies_to``) and this instance's
+    Ignored when the attribute is missing / out-of-vocab / not a valid number (never silently
+    trained as class 0), **or** when the head is class-scoped (``applies_to``) and this instance's
     primary class is out of scope — the hard-routing choke point, so the loss /
-    accuracy paths need no change (they already skip ``-100``).
+    accuracy paths need no change (they already skip ignored labels).
     """
+    ignored = math.nan if spec.regression else -100
     if spec.applies_to is not None and primary_cls not in spec.applies_to:
-        return -100
+        return ignored
+    if spec.regression:
+        return _reg_value(spec, ann_attrs.get(spec.name))
     return id_maps[spec.name].get(ann_attrs.get(spec.name), -100)
+
+
+def _reg_value(spec: AuxHeadSpec, v) -> float:
+    """A regression value as a float, or NaN when it is missing, not a finite number, outside ``value_range`` or (with
+    ``log``) not above -1."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return math.nan
+    lo, hi = spec.value_range or (-math.inf, math.inf)
+    if not lo <= v <= hi or (spec.log and v <= -1):
+        return math.nan
+    return float(v)
+
+
+def _attr_tensor(spec: AuxHeadSpec, values) -> torch.Tensor:
+    """One head's per-instance labels: ids (long, -100 = ignored) or regression values (float, NaN = ignored)."""
+    return torch.tensor(values, dtype=torch.float32 if spec.regression else torch.long)
+
+
+def _attr_ignored(spec: AuxHeadSpec, n: int) -> torch.Tensor:
+    """``n`` ignored labels of one head."""
+    return _attr_tensor(spec, [math.nan if spec.regression else -100] * n)
+
+
+def _regression_spec(d: dict, anns: list, cat2contig: dict, applies_to) -> AuxHeadSpec:
+    """A regression head from its definition, standardized by the statistics of this split's valid, in-scope values."""
+    rng = d.get("range")
+    spec = AuxHeadSpec(
+        name=d["name"], num_classes=1, applies_to=applies_to, regression=True, log=bool(d.get("log", False)),
+        value_range=(float(rng[0]), float(rng[1])) if rng is not None else None,
+    )
+    vals = [
+        _attr_label(spec, {}, a.get("attributes", {}), cat2contig.get(a.get("category_id")))
+        for a in anns
+    ]
+    t = torch.tensor([v for v in vals if not math.isnan(v)], dtype=torch.float64)
+    if t.numel() == 0:
+        warnings.warn(f"regression attribute {spec.name!r} has no valid value in this split", stacklevel=3)
+    t = t.log1p() if spec.log else t
+    spec.mean = float(t.mean()) if t.numel() else 0.0
+    std = float(t.std()) if t.numel() > 1 else 1.0
+    spec.std = std if std > 0 else 1.0
+    return spec
 
 
 def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=None, contig_names=None):
@@ -183,6 +236,8 @@ def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=Non
         ]
 
     and the per-annotation ``"attributes": {"color": 0, "posture": 2}`` field.
+    ``{"name": "cost", "type": "regression", "log": true, "range": [0, 20000]}`` defines a head that
+    regresses a real number instead (``"attributes": {"cost": 812.5}``; ``log`` and ``range`` optional).
     Falls back to inferring each attribute's id set from the annotations when a
     definition omits ``categories``. The optional ``applies_to`` scopes a head to a
     subset of primary classes (category names or raw ids); it is resolved against
@@ -204,6 +259,14 @@ def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=Non
     id_maps: dict[str, dict] = {}
     for d in defs:
         name = d["name"]
+        kind = d.get("type", "categorical")
+        if kind not in ("categorical", "regression"):
+            raise ValueError(f"attribute {name!r}: unknown type {kind!r} (categorical or regression)")
+        if kind == "regression":
+            applies_to = _resolve_applies_to(d.get("applies_to"), cat2contig, contig_names, name)
+            specs.append(_regression_spec(d, anns, cat2contig, applies_to))
+            id_maps[name] = {}
+            continue
         cats = d.get("categories")
         if cats:
             raw_ids = sorted({c["id"] for c in cats})
@@ -246,10 +309,10 @@ class _InstanceWeights:
             return
         spec = None
         if c.instance_crop_rarity_attr:
-            spec = next((s for s in self.aux_specs if s.name == c.instance_crop_rarity_attr), None)
+            spec = next((s for s in self.aux_specs if s.name == c.instance_crop_rarity_attr and not s.regression), None)
             if spec is None:
                 warnings.warn(
-                    f"instance_crop_rarity_attr={c.instance_crop_rarity_attr!r} is not an attribute of this dataset "
+                    f"instance_crop_rarity_attr={c.instance_crop_rarity_attr!r} is not an attribute of this dataset, or not a categorical one "
                     f"({[s.name for s in self.aux_specs]}); weighting by primary class instead.",
                     stacklevel=3,
                 )
@@ -359,7 +422,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
 
         anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id, iscrowd=False))
         masks, classes, keys = [], [], []
-        attrs: dict[str, list[int]] = {s.name: [] for s in self.aux_specs}
+        attrs: dict[str, list] = {s.name: [] for s in self.aux_specs}
         rarity_spec = self._rarity[0] if self._rarity is not None else None
         for ann in anns:
             m = self.coco.annToMask(ann)  # (H, W) uint8 at original resolution
@@ -380,15 +443,15 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
         if masks:
             masks_tv = tv_tensors.Mask(torch.stack(masks))  # (N, H, W) uint8
             class_t = torch.tensor(classes, dtype=torch.long)
-            attr_t = {k: torch.tensor(v, dtype=torch.long) for k, v in attrs.items()}
+            attr_t = {s.name: _attr_tensor(s, attrs[s.name]) for s in self.aux_specs}
         elif self.keep_empty:  # a negative image: genuinely zero targets
             masks_tv = tv_tensors.Mask(torch.zeros((0, *image_tv.shape[1:]), dtype=torch.uint8))
             class_t = torch.zeros((0,), dtype=torch.long)
-            attr_t = {s.name: torch.zeros((0,), dtype=torch.long) for s in self.aux_specs}
+            attr_t = {s.name: _attr_ignored(s, 0) for s in self.aux_specs}
         else:  # should not happen (filtered), but stay safe
             masks_tv = tv_tensors.Mask(torch.zeros((1, *image_tv.shape[1:]), dtype=torch.uint8))
             class_t = torch.zeros((1,), dtype=torch.long)
-            attr_t = {s.name: torch.full((1,), -100, dtype=torch.long) for s in self.aux_specs}
+            attr_t = {s.name: _attr_ignored(s, 1) for s in self.aux_specs}
         return image_tv, masks_tv, class_t, attr_t, keys
 
     def _sample_other(self) -> dict:
@@ -448,7 +511,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
         if masks_t.shape[0] == 0:  # pathological (e.g. sub-pixel masks) -> empty
             masks_t = torch.zeros((1, self.imgsz, self.imgsz))
             class_t = torch.zeros((1,), dtype=torch.long)
-            attr_t = {s.name: torch.full((1,), -100, dtype=torch.long) for s in self.aux_specs}
+            attr_t = {s.name: _attr_ignored(s, 1) for s in self.aux_specs}
 
         return image_t, masks_t.float(), class_t, attr_t
 
@@ -526,7 +589,7 @@ class CocoDetection(_InstanceWeights, Dataset):
 
         anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id, iscrowd=False))
         boxes, classes, keys = [], [], []
-        attrs: dict[str, list[int]] = {s.name: [] for s in self.aux_specs}
+        attrs: dict[str, list] = {s.name: [] for s in self.aux_specs}
         rarity_spec = self._rarity[0] if self._rarity is not None else None
         for ann in anns:
             x, y, w, h = ann["bbox"]  # COCO xywh, absolute pixels
@@ -552,7 +615,7 @@ class CocoDetection(_InstanceWeights, Dataset):
                 canvas_size=(H, W),
             )
             class_t = torch.tensor(classes, dtype=torch.long)
-            attr_t = {k: torch.tensor(v, dtype=torch.long) for k, v in attrs.items()}
+            attr_t = {s.name: _attr_tensor(s, attrs[s.name]) for s in self.aux_specs}
         else:  # should not happen (filtered), but stay safe
             boxes_tv = tv_tensors.BoundingBoxes(
                 torch.zeros((1, 4), dtype=torch.float32),
@@ -560,7 +623,7 @@ class CocoDetection(_InstanceWeights, Dataset):
                 canvas_size=(H, W),
             )
             class_t = torch.zeros((1,), dtype=torch.long)
-            attr_t = {s.name: torch.full((1,), -100, dtype=torch.long) for s in self.aux_specs}
+            attr_t = {s.name: _attr_ignored(s, 1) for s in self.aux_specs}
 
         # Apply augmentation; if a crop removes every box, retry, then fall back to a
         # plain resize that preserves them (mirrors CocoInstanceSeg).
@@ -586,7 +649,7 @@ class CocoDetection(_InstanceWeights, Dataset):
         if boxes_t.shape[0] == 0:  # pathological -> single empty placeholder
             boxes_t = torch.tensor([[0.0, 0.0, float(self.imgsz), float(self.imgsz)]])
             class_t = torch.zeros((1,), dtype=torch.long)
-            attr_t = {s.name: torch.full((1,), -100, dtype=torch.long) for s in self.aux_specs}
+            attr_t = {s.name: _attr_ignored(s, 1) for s in self.aux_specs}
 
         return image_t, self._norm_cxcywh(boxes_t), class_t, attr_t
 
@@ -657,7 +720,7 @@ def collate_train(batch):
     """Stack pixel values; keep masks/classes/attrs as per-image lists (variable N).
 
     Returns ``(pixel_values, mask_labels, class_labels, aux_labels)`` where
-    ``aux_labels`` is ``{attr_name: [per-image LongTensor]}`` (empty dict when the
+    ``aux_labels`` is ``{attr_name: [per-image LongTensor]}`` (FloatTensor for a regression head; empty dict when the
     dataset has no attributes).
     """
     pixel_values = torch.stack([b[0] for b in batch])

@@ -41,12 +41,33 @@ class AuxHeadSpec:
     instances whose primary class is in the set. ``None`` (the default) ⇒ the head
     applies to every class (the original behaviour). This is the hard class-routing
     that lets different attributes attach to different primary classes.
+
+    ``regression=True`` makes the head regress one real number instead (``num_classes`` is then 1, its output
+    size). It is trained on ``(t(y) - mean) / std`` with ``t = log1p`` when ``log`` else the identity, the
+    statistics of the train split; :meth:`encode` / :meth:`decode` map between real values and that space.
+    ``value_range`` (optional) bounds the valid values and clips the predictions.
     """
 
     name: str
     num_classes: int
     names: dict[int, str] = field(default_factory=dict)
     applies_to: frozenset[int] | None = None
+    regression: bool = False
+    log: bool = False
+    mean: float = 0.0
+    std: float = 1.0
+    value_range: tuple[float, float] | None = None
+
+    def encode(self, y):
+        """Real values -> the standardized space the head is trained in (tensor in, tensor out)."""
+        t = y.log1p() if self.log else y
+        return (t - self.mean) / self.std
+
+    def decode(self, z):
+        """Head outputs -> real values, clipped to ``value_range`` when set."""
+        t = z * self.std + self.mean
+        y = t.expm1() if self.log else t
+        return y.clamp(*self.value_range) if self.value_range is not None else y
 
 
 def aux_specs_to_meta(specs: list[AuxHeadSpec] | None) -> list[dict]:
@@ -56,6 +77,10 @@ def aux_specs_to_meta(specs: list[AuxHeadSpec] | None) -> list[dict]:
         d = {"name": s.name, "num_classes": int(s.num_classes), "names": dict(s.names)}
         if s.applies_to is not None:
             d["applies_to"] = sorted(int(c) for c in s.applies_to)
+        if s.regression:
+            d.update(regression=True, log=s.log, mean=float(s.mean), std=float(s.std))
+            if s.value_range is not None:
+                d["value_range"] = [float(v) for v in s.value_range]
         out.append(d)
     return out
 
@@ -67,7 +92,12 @@ def aux_specs_from_meta(meta: list[dict] | None) -> list[AuxHeadSpec]:
         names = {int(k): str(v) for k, v in (d.get("names") or {}).items()}
         raw = d.get("applies_to")
         applies_to = frozenset(int(c) for c in raw) if raw is not None else None
-        out.append(AuxHeadSpec(str(d["name"]), int(d["num_classes"]), names, applies_to))
+        vr = d.get("value_range")
+        out.append(AuxHeadSpec(
+            str(d["name"]), int(d["num_classes"]), names, applies_to, regression=bool(d.get("regression", False)),
+            log=bool(d.get("log", False)), mean=float(d.get("mean", 0.0)), std=float(d.get("std", 1.0)),
+            value_range=tuple(float(v) for v in vr) if vr is not None else None,
+        ))
     return out
 
 

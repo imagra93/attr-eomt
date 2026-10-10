@@ -166,14 +166,22 @@ simply reuse that same query→GT assignment and read the answer off the matched
   query→GT assignment the detection loss used; the attribute is read *after* matching.
 - **Gate.** An optional IoU gate drops barely-overlapping matched pairs (common early in
   training) so attributes only learn from queries that actually localize the object.
-- **Loss.** Cross-entropy per head over matched queries, summed across heads and scaled
+- **Loss.** Cross-entropy per head over matched queries (a regression head: Huber on its
+  standardized value, see below), summed across heads and scaled
   by `aux_w` (default `1.0`), added to the detector loss. Empty-match batches contribute
   a graph-preserving zero, and missing labels use `ignore_index` and contribute nothing.
+- **Balancing.** Both losses are O(1), so equal weights are a sane start. `aux_w_per_head`
+  weights each head, `aux_class_weights=True` re-weights rare classes (rare values of a
+  regression head, by smoothed density), and `aux_balance="uncertainty"` learns one weight
+  per head (Kendall et al. 2018) with the detector loss as the fixed anchor. Each epoch
+  prints every head's pull on the shared queries (its gradient norm over the detector's,
+  `train/aux_grad/<head>`): well above 1 a head steers the encoder, far below it only reads it.
 - **Checkpoint selection is unchanged.** The attribute "rides along": its per-head
   matched-query accuracy is shown live and written to `metrics.csv`, but never drives
   `best.pt` (still `segm/mAP` or `bbox/mAP`).
 - **Inference.** Each result attaches `aux = {head: {"ids", "probs"}}` for the kept
-  detections, and `predict(plot=True)` renders each attribute next to the class label
+  detections (and `aux_values = {head: values}` in real units for the regression heads), and
+  `predict(plot=True)` renders each attribute next to the class label
   using names stored in the checkpoint.
 
 ---
@@ -242,8 +250,29 @@ label set, in one model:
 At inference a scoped head reports `ids = -1` ("not applicable") for detections whose class it
 does not cover. The scope is stored in the checkpoint, so it survives reload.
 
+**Regression attributes.** `"type": "regression"` makes a head regress one real number per
+instance instead of choosing a category; categorical and regression heads mix freely in one
+dataset. `log` (regress `log1p` of the value, for heavy-tailed positives such as costs) and
+`range` (valid values; predictions are clipped to it) are optional, and `applies_to` works as above:
+
+```jsonc
+"attributes": [
+  {"name": "severity", "categories": [...]},
+  {"name": "repair_cost", "type": "regression", "log": true, "range": [0, 20000], "applies_to": ["bumper"]}
+]
+// per annotation:
+"attributes": {"severity": 3, "repair_cost": 812.5}
+```
+
+A missing, non-numeric or out-of-range value is ignored. The head is trained on the value
+standardized by the train split's mean and std (stored in the checkpoint), validated as the
+mean absolute error in real units (`val/aux_mae/<head>`), and predicted in real units
+(`aux_values`). The value must not change under the augmentations (scale, crop, flip,
+rotation): a cost or a score is fine, a pixel area or an angle is not. Tracking votes on the
+categorical heads only, and re-identification cannot gate on a regression head.
+
 **Sidecar format (optional).** You can keep the COCO JSON as plain, standard COCO and put the
-attributes beside it instead of inside it: an `attributes.yaml` schema in the dataset root plus
+attributes beside it instead of inside it: an `attributes.yaml` schema (same keys, regression heads included) in the dataset root plus
 `attributes/<split>.json` values keyed by annotation id (`{ann_id: {head: value}}`). If present
 (and the JSON has no embedded `attributes`), it is merged in memory at load — so a plain COCO
 dataset always works and the sidecar is picked up automatically when you add it. Embedded

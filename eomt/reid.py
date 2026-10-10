@@ -73,6 +73,9 @@ def validate_group_by(group_by, aux_specs) -> tuple[str, ...]:
         )
     if len(set(keys)) != len(keys):
         raise ValueError(f"Duplicate group_by key(s) in {keys}.")
+    regression = [k for k in keys if k != CLASS_KEY and getattr(by_name[k], "regression", False)]
+    if regression:
+        raise ValueError(f"group_by cannot gate on regression attribute(s) {regression}: they have no categories.")
 
     # A class-scoped head reports ``-1`` ("not applicable") for out-of-scope
     # detections. Gating on it *without* "class" would make every out-of-scope
