@@ -75,7 +75,8 @@ class AugConfig:
 
     * ``flip_prob`` / ``vflip_prob`` / ``rot90_prob`` — horizontal flip, vertical flip, random 90° turns.
       Vertical flips and 90° turns are *off*: sky/ground orientation usually carries information, and any
-      flip/rotation silently corrupts attributes that encode orientation.
+      flip/rotation silently corrupts attributes that encode orientation (except the horizontal flip of an attribute
+      marked ``flip_aware``, whose left / right categories are swapped).
     * ``min_scale`` / ``max_scale`` — Large-Scale Jitter: the image is resized aspect-preservingly so its long side
       is ``imgsz × s`` with ``s ~ U(min_scale, max_scale)``. The effective scale relative to the original photo is
       ``r = (imgsz / long_side) × s``. For datasets of thin or tiny objects keep ``r`` within ~[0.4, 1.0]
@@ -344,6 +345,14 @@ def _box_area(b: torch.Tensor) -> torch.Tensor:
     return (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
 
 
+#: What the augmentation measures per output instance (``TrainAugment.last_info``), carried through the multi-image ops.
+_SIGNALS = ("visible", "flipped")
+
+
+def _cat_signals(parts: list[Mapping[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    return {k: torch.cat([p[k] for p in parts], 0) for k in _SIGNALS}
+
+
 def _translate(tx: float, ty: float) -> np.ndarray:
     return np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
 
@@ -446,7 +455,9 @@ class TrainAugment:
 
     After each call, ``last_info["visible"]`` holds, per output instance, the fraction of it still in view: its mask
     mass (box area) inside the crop window, measured before the warp, times the share copy-paste did not occlude. The
-    datasets scale or drop the crop-aware attribute values with it (``AuxHeadSpec.crop``).
+    datasets scale or drop the crop-aware attribute values with it (``AuxHeadSpec.crop``). ``last_info["flipped"]``
+    (bool, per output instance) tells which instances were flipped horizontally; the datasets swap the categories of
+    the flip-aware attributes there (``AuxHeadSpec.flip_aware``).
     """
 
     #: the dataset checks this to decide whether to use the full call form
@@ -493,16 +504,16 @@ class TrainAugment:
 
         S = self.imgsz
         if multi == "mosaic":
-            img_f, tgt, labels_o, attrs_o, visible = self._mosaic(img, tgt, labels, attrs, w, sampler)
+            img_f, tgt, labels_o, attrs_o, signals = self._mosaic(img, tgt, labels, attrs, w, sampler)
         else:
             img_f, tgt, info = self._geometry(img, tgt, (S, S), w, is_boxes)
             self.last_info.update(info)
-            visible = info["visible"]
+            signals = {k: info[k] for k in _SIGNALS}
             if multi == "copy_paste":
-                img_f, tgt, labels_o, attrs_o, visible = self._copy_paste(img_f, tgt, labels, attrs, visible, sampler)
+                img_f, tgt, labels_o, attrs_o, signals = self._copy_paste(img_f, tgt, labels, attrs, signals, sampler)
             elif multi == "mixup":
-                img_f, tgt, labels_o, attrs_o, visible = self._mixup(img_f, tgt, labels, attrs, visible, sampler)
-        self.last_info["visible"] = visible
+                img_f, tgt, labels_o, attrs_o, signals = self._mixup(img_f, tgt, labels, attrs, signals, sampler)
+        self.last_info.update(signals)
 
         occupied = None
         if c.erasing_prob > 0 and c.erasing_avoid_instances:
@@ -515,10 +526,12 @@ class TrainAugment:
     # ------------------------------------------------------------------------------------------------ geometry core
 
     def _orient(self, img, tgt, is_boxes):
-        """Flips and 90° turns at source resolution. Boxes follow the same maps."""
+        """Flips and 90° turns at source resolution. Boxes follow the same maps. Also returns whether it flipped
+        horizontally."""
         c = self.cfg
         H, W = img.shape[-2:]
-        if _coin(c.flip_prob):
+        hflip = _coin(c.flip_prob)
+        if hflip:
             img = img.flip(-1)
             if is_boxes:
                 tgt = torch.stack([W - tgt[:, 2], tgt[:, 1], W - tgt[:, 0], tgt[:, 3]], 1)
@@ -540,7 +553,7 @@ class TrainAugment:
                     H, W = W, H
             else:
                 tgt = torch.rot90(tgt, k, dims=(-2, -1))
-        return img, tgt
+        return img, tgt, hflip
 
     def _resize_target(self, tgt, is_boxes, hw_src, hw_new):
         (H, W), (Hs, Ws) = hw_src, hw_new
@@ -581,7 +594,7 @@ class TrainAugment:
         c = self.cfg
         S = self.imgsz
         Ho, Wo = out_hw
-        img, tgt = self._orient(img, tgt, is_boxes)
+        img, tgt, hflip = self._orient(img, tgt, is_boxes)
         H, W = img.shape[-2:]
         n = tgt.shape[0]
 
@@ -641,7 +654,7 @@ class TrainAugment:
                 break
         out_img, out_tgt, visible = self._crop(img, tgt, is_boxes, (Hs, Ws), (Ho, Wo), (y0, x0), fwd)
         info = {"scale": s, "eff_scale": r, "mode": mode, "focus": focus, "warp": fwd is not None, "origin": (y0, x0),
-                "visible": visible}
+                "visible": visible, "flipped": torch.full((visible.shape[0],), hflip, dtype=torch.bool)}
         return out_img, out_tgt, info
 
     def _pick_focus(self, n, weights) -> int:
@@ -795,7 +808,7 @@ class TrainAugment:
         samples = [(img, tgt, labels, attrs, weights)] + [self._raw(sampler) for _ in range(3)]
         order = torch.randperm(4).tolist()
         canvas = self._mean.expand(3, S, S).clone()
-        masks, labs, atts, vis = [], [], [], []
+        masks, labs, atts, sigs = [], [], [], []
         for k, cell in enumerate(order):
             ri, ci = divmod(cell, 2)
             im_k, t_k, l_k, a_k, w_k = samples[k]
@@ -808,19 +821,19 @@ class TrainAugment:
             masks.append(full)
             labs.append(l_k)
             atts.append(a_k)
-            vis.append(info["visible"])
+            sigs.append(info)
         attrs_o = {k: torch.cat([a[k] for a in atts], 0) for k in atts[0]}
-        return canvas, torch.cat(masks, 0), torch.cat(labs, 0), attrs_o, torch.cat(vis, 0)
+        return canvas, torch.cat(masks, 0), torch.cat(labs, 0), attrs_o, _cat_signals(sigs)
 
-    def _mixup(self, img_f, tgt, labels, attrs, visible, sampler):
+    def _mixup(self, img_f, tgt, labels, attrs, signals, sampler):
         """Blend with a second augmented sample (lambda ~ Beta(a, a)); the instances of both are kept."""
         im2, t2, l2, a2, w2 = self._raw(sampler)
         o2, m2, info = self._geometry(im2, t2, (self.imgsz, self.imgsz), w2, False)
         lam = float(torch.distributions.Beta(self.cfg.mixup_alpha, self.cfg.mixup_alpha).sample())
         attrs_o = {k: torch.cat([attrs[k], a2[k]], 0) for k in attrs}
-        return lam * img_f + (1.0 - lam) * o2, torch.cat([tgt, m2], 0), torch.cat([labels, l2], 0), attrs_o, torch.cat([visible, info["visible"]], 0)
+        return lam * img_f + (1.0 - lam) * o2, torch.cat([tgt, m2], 0), torch.cat([labels, l2], 0), attrs_o, _cat_signals([signals, info])
 
-    def _copy_paste(self, img_f, tgt, labels, attrs, visible, sampler):
+    def _copy_paste(self, img_f, tgt, labels, attrs, signals, sampler):
         """Paste up to ``copy_paste_max`` instances (their pixels, feathered) from another sample; they occlude existing masks."""
         c = self.cfg
         im2, t2, l2, a2, w2 = self._raw(sampler)
@@ -828,7 +841,7 @@ class TrainAugment:
         mass = m2.flatten(1).sum(1)
         cand = [i for i in range(m2.shape[0]) if float(mass[i]) >= max(c.min_mask_mass, 1.0)]
         if not cand:
-            return img_f, tgt, labels, attrs, visible
+            return img_f, tgt, labels, attrs, signals
         perm = torch.randperm(len(cand)).tolist()
         pick = [cand[i] for i in perm[: _randint(1, min(c.copy_paste_max, len(cand)))]]
         sel = m2[pick]
@@ -841,13 +854,13 @@ class TrainAugment:
             alpha = torch.maximum(alpha, union)
         img_f = img_f * (1.0 - alpha) + o2 * alpha
         occluded = tgt * (1.0 - union)  # occlusion: pasted pixels replace the old instances there
-        visible = visible * _fraction(_mass(occluded), _mass(tgt))
+        signals = {**signals, "visible": signals["visible"] * _fraction(_mass(occluded), _mass(tgt))}
         return (
             img_f,
             torch.cat([occluded, sel], 0),
             torch.cat([labels, l2[pick]], 0),
             {k: torch.cat([attrs[k], a2[k][pick]], 0) for k in attrs},
-            torch.cat([visible, info["visible"][pick]], 0),
+            _cat_signals([signals, {k: info[k][pick] for k in _SIGNALS}]),
         )
 
 

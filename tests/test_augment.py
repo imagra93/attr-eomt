@@ -454,6 +454,32 @@ def _mini_coco(tmp_path, n_images=4, bbox_only=False, n_negatives=0):
     return img_dir, jf
 
 
+def test_flip_aware_attribute_swaps_sides_where_the_augmentation_flips(tmp_path):
+    img_dir, jf = _mini_coco(tmp_path)
+    coco = json.loads(jf.read_text())
+    coco["attributes"].append({"name": "side", "flip_aware": {"left": "right"},
+                               "categories": [{"id": 0, "name": "left"}, {"id": 1, "name": "center"}, {"id": 2, "name": "right"}]})
+    for a in coco["annotations"]:
+        a["attributes"]["side"] = 0 if a["attributes"]["kind"] == 0 else 1  # the blobs are left, the lines center
+    jf.write_text(json.dumps(coco))
+    # min_mask_mass 0 drops nothing, so the instances line up with last_info; mosaic flips each cell on its own
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=112, aug={"flip_prob": 0.5, "mosaic_prob": 0.5, "min_mask_mass": 0.0})
+    assert ds.aux_specs[1].flip_aware == {0: 2, 2: 0}
+    torch.manual_seed(0)
+    mixed_mosaic = False
+    for _ in range(20):
+        a = ds[0][3]
+        flipped = ds.transform.last_info["flipped"]
+        assert torch.equal(a["side"], torch.where(a["kind"] == 0, torch.where(flipped, 2, 0), 1))
+        mixed_mosaic |= ds.transform.last_info["multi"] == "mosaic" and len(set(flipped.tolist())) == 2
+    assert mixed_mosaic  # flipped and unflipped cells in one sample
+    for flip_aware, msg in (({"left": "up"}, "does not have"), ({"left": "right", "right": "center"}, "two others")):
+        coco["attributes"][1]["flip_aware"] = flip_aware
+        jf.write_text(json.dumps(coco))
+        with pytest.raises(ValueError, match=msg):
+            CocoInstanceSeg(img_dir, jf, imgsz=112)
+
+
 def test_dataset_defaults_are_the_same_as_the_trainers(tmp_path):
     """Regression: CocoInstanceSeg used to default to scale 0.5-1.0 while train() used 0.1-2.0."""
     import inspect

@@ -273,7 +273,8 @@ def _aux_coverage(train_ds) -> dict[str, tuple[int, int]]:
 def _aux_kind_str(spec) -> str:
     """``num_classes`` of a categorical head, the target space of a regression head (banner)."""
     if not spec.regression:
-        return str(spec.num_classes)
+        pairs = [f"{spec.names.get(a, a)}<->{spec.names.get(b, b)}" for a, b in (spec.flip_aware or {}).items() if a < b]
+        return str(spec.num_classes) + (f", flips {' '.join(pairs)}" if pairs else "")
     crop = f", crop {spec.crop}" + (f" < {spec.min_visible:g}" if spec.crop == "ignore" else "") if spec.crop else ""
     return f"regression{', log' if spec.log else ''}{crop}, mean {spec.mean:.4g} std {spec.std:.4g}"
 

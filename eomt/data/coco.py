@@ -105,7 +105,7 @@ def _load_attr_schema(root: Path):
             else:  # bare label -> auto id by position
                 cats.append({"id": i, "name": str(c)})
         entry = {"name": d["name"], "categories": cats}
-        for key in ("applies_to", "type", "log", "range", "crop", "min_visible"):
+        for key in ("applies_to", "type", "log", "range", "crop", "min_visible", "flip_aware"):
             if d.get(key) is not None:
                 entry[key] = d[key]
         norm.append(entry)
@@ -204,16 +204,40 @@ def _attr_ignored(spec: AuxHeadSpec, n: int) -> torch.Tensor:
     return _attr_tensor(spec, [math.nan if spec.regression else -100] * n)
 
 
-def _crop_attrs(specs: list[AuxHeadSpec], attr_t: dict, visible: torch.Tensor) -> dict:
-    """The crop-aware regression values after the augmentation, given the fraction of each instance it kept in view
-    (``TrainAugment.last_info["visible"]``): ``crop="scale"`` multiplies the value by it, ``crop="ignore"`` drops the
-    value (NaN) when less than ``min_visible`` is kept."""
+def _follow_aug(specs: list[AuxHeadSpec], attr_t: dict, info: dict) -> dict:
+    """The attribute values after the augmentation, given what it measured per instance (``TrainAugment.last_info``):
+    a ``crop="scale"`` value is multiplied by the fraction of the instance kept in view, a ``crop="ignore"`` one is
+    dropped (NaN) when less than ``min_visible`` is kept, and a ``flip_aware`` category is swapped where the instance
+    was flipped horizontally."""
     out = dict(attr_t)
     for s in specs:
+        a = attr_t[s.name]
         if s.crop == "scale":
-            out[s.name] = attr_t[s.name] * visible
+            out[s.name] = a * info["visible"]
         elif s.crop == "ignore":
-            out[s.name] = attr_t[s.name].masked_fill(visible < s.min_visible, math.nan)
+            out[s.name] = a.masked_fill(info["visible"] < s.min_visible, math.nan)
+        elif s.flip_aware:
+            swap = torch.arange(s.num_classes)
+            swap[list(s.flip_aware)] = torch.tensor(list(s.flip_aware.values()))
+            out[s.name] = torch.where(info["flipped"] & (a >= 0), swap[a.clamp(min=0)], a)
+    return out
+
+
+def _resolve_flip_aware(raw, names: dict, attr_name: str) -> dict[int, int] | None:
+    """A definition's ``flip_aware`` (``{category: category}`` by name) as contiguous ids; each pair swaps both ways, so
+    ``{left: right}`` is enough."""
+    if not raw:
+        return None
+    name2contig = {v: k for k, v in names.items()}
+    out: dict[int, int] = {}
+    for a, b in raw.items():
+        if a not in name2contig or b not in name2contig:
+            raise ValueError(f"attribute {attr_name!r}: flip_aware {a!r} -> {b!r} names a category it does not have "
+                             f"({sorted(name2contig)})")
+        a, b = name2contig[a], name2contig[b]
+        if out.get(a, b) != b or out.get(b, a) != a:
+            raise ValueError(f"attribute {attr_name!r}: flip_aware pairs a category with two others")
+        out[a], out[b] = b, a
     return out
 
 
@@ -255,7 +279,8 @@ def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=Non
     and the per-annotation ``"attributes": {"color": 0, "posture": 2}`` field.
     ``{"name": "cost", "type": "regression", "log": true, "range": [0, 20000]}`` defines a head that
     regresses a real number instead (``"attributes": {"cost": 812.5}``; ``log`` and ``range`` optional;
-    ``"crop": "scale" | "ignore"`` and ``min_visible`` tie it to the augmentation, see :func:`_crop_attrs`).
+    ``"crop": "scale" | "ignore"`` and ``min_visible`` tie it to the augmentation, see :func:`_follow_aug`).
+    ``"flip_aware": {"left": "right"}`` swaps those categories of an instance the augmentation flips horizontally.
     Falls back to inferring each attribute's id set from the annotations when a
     definition omits ``categories``. The optional ``applies_to`` scopes a head to a
     subset of primary classes (category names or raw ids); it is resolved against
@@ -282,6 +307,8 @@ def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=Non
             raise ValueError(f"attribute {name!r}: unknown type {kind!r} (categorical or regression)")
         if kind != "regression" and d.get("crop") is not None:
             raise ValueError(f"attribute {name!r}: 'crop' applies to regression attributes only")
+        if kind == "regression" and d.get("flip_aware"):
+            raise ValueError(f"attribute {name!r}: 'flip_aware' applies to categorical attributes only")
         if kind == "regression":
             applies_to = _resolve_applies_to(d.get("applies_to"), cat2contig, contig_names, name)
             specs.append(_regression_spec(d, anns, cat2contig, applies_to))
@@ -307,9 +334,10 @@ def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=Non
             disp = {r: str(r) for r in raw_ids}
         names = {raw2contig[r]: disp.get(r, str(r)) for r in raw_ids}
         applies_to = _resolve_applies_to(d.get("applies_to"), cat2contig, contig_names, name)
-        specs.append(
-            AuxHeadSpec(name=name, num_classes=len(raw2contig), names=names, applies_to=applies_to)
-        )
+        specs.append(AuxHeadSpec(
+            name=name, num_classes=len(raw2contig), names=names, applies_to=applies_to,
+            flip_aware=_resolve_flip_aware(d.get("flip_aware"), names, name),
+        ))
         id_maps[name] = raw2contig
     return specs, id_maps
 
@@ -490,7 +518,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
                 image_t, masks_t, class_t, attr_t = self.transform(
                     image_tv, masks_tv, class_t, attr_t, sampler=self._sample_other if multi else None
                 )
-                attr_t = _crop_attrs(self.aux_specs, attr_t, self.transform.last_info["visible"])  # instances pasted in
+                attr_t = _follow_aug(self.aux_specs, attr_t, self.transform.last_info)  # instances pasted in
             else:
                 image_t, masks_t = self.transform(image_tv, masks_tv)
             return image_t, masks_t.float(), class_t, attr_t
@@ -511,7 +539,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
                 )
                 keep = masks_t.flatten(1).sum(1) >= c.min_mask_mass
                 if keep.any():
-                    attr_o = _crop_attrs(self.aux_specs, attr_o, tf.last_info["visible"])
+                    attr_o = _follow_aug(self.aux_specs, attr_o, tf.last_info)
                     break
             else:
                 image_t, masks_t = self._fallback_transform(image_tv, masks_tv)
@@ -661,7 +689,7 @@ class CocoDetection(_InstanceWeights, Dataset):
             keep = ((boxes_t[:, 2] - boxes_t[:, 0]) > 1) & ((boxes_t[:, 3] - boxes_t[:, 1]) > 1)
             if keep.any():
                 if built_in:
-                    attr_t = _crop_attrs(self.aux_specs, attr_t, self.transform.last_info["visible"])
+                    attr_t = _follow_aug(self.aux_specs, attr_t, self.transform.last_info)
                 break
         else:
             image_t, boxes_t = self._fallback_transform(image_tv, boxes_tv)

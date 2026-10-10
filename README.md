@@ -250,6 +250,23 @@ label set, in one model:
 At inference a scoped head reports `ids = -1` ("not applicable") for detections whose class it
 does not cover. The scope is stored in the checkpoint, so it survives reload.
 
+**Flip-aware attributes.** A horizontal flip mirrors the photo but not the labels, so an attribute
+that encodes a side (a left door shows up as a right one) is corrupted by `flip_prob > 0`. Give
+its definition `flip_aware`, a map of category names to the ones they become on a horizontal
+flip, and the training augmentation swaps them for every instance it flips (each pair swaps both
+ways, so `{"left": "right"}` is enough; unlisted categories stay as they are):
+
+```jsonc
+{"name": "laterality", "categories": [{"id": 0, "name": "left"}, {"id": 1, "name": "center"}, {"id": 2, "name": "right"}],
+ "flip_aware": {"left": "right"}}
+```
+
+Mosaic, mixup and copy-paste flip each source image independently, and the swap follows each
+instance. Only the horizontal flip is handled: keep `vflip_prob` and `rot90_prob` off for such an
+attribute. It is categorical only, training-only (not stored in the checkpoint), and inference
+is unchanged, so keep TTA's `flip` off for these models. The training banner lists each head's
+swapped pairs.
+
 **Regression attributes.** `"type": "regression"` makes a head regress one real number per
 instance instead of choosing a category; categorical and regression heads mix freely in one
 dataset. `log` (regress `log1p` of the value, for heavy-tailed positives such as costs) and
@@ -577,8 +594,9 @@ python scripts/train.py --data my/data.yaml --aug min_scale=0.6 --aug instance_c
 Things worth knowing:
 
 - **Orientation.** Flips, 90° turns and rotations change the pixels but not the label. If an attribute encodes
-  orientation (e.g. a `viewpoint` head) set `flip_prob=0` and `rotate_prob=0`; `vflip_prob` / `rot90_prob` stay off
-  unless your scenes have no canonical "up".
+  orientation (e.g. a `viewpoint` head) set `flip_prob=0` and `rotate_prob=0`, or, for a left / right attribute,
+  mark it `flip_aware` (see *Flip-aware attributes*) and keep the horizontal flip; `vflip_prob` / `rot90_prob` stay
+  off unless your scenes have no canonical "up".
 - **Thin or tiny objects.** Large-Scale Jitter at 0.1 shrinks a 5 px crack to under a pixel; keep the effective
   scale within ~[0.4, 1.0] (`min_scale = 0.4·long_side/imgsz`, `max_scale = 1.0·long_side/imgsz`). The instance-aware
   crop pays off when the crop is much smaller than the image (high zoom, small `imgsz`), and

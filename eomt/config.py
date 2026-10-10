@@ -51,6 +51,10 @@ class AuxHeadSpec:
     (crop, warp, copy-paste occlusion): ``"scale"`` multiplies it by that fraction (an extensive quantity such as an
     area), ``"ignore"`` drops it when less than ``min_visible`` is kept (a property of the whole instance). ``None``
     (the default) ⇒ the value does not change under augmentation. Training only; not stored in checkpoints.
+
+    ``flip_aware`` (categorical heads) maps a contiguous id to the one it becomes when the training augmentation flips
+    the instance horizontally (``{left: right, right: left}``), so a laterality survives ``flip_prob > 0``. Ids it
+    does not list stay as they are. Training only; not stored in checkpoints.
     """
 
     name: str
@@ -64,6 +68,7 @@ class AuxHeadSpec:
     value_range: tuple[float, float] | None = None
     crop: str | None = None
     min_visible: float = 0.9
+    flip_aware: dict[int, int] | None = None
 
     def encode(self, y):
         """Real values -> the standardized space the head is trained in (tensor in, tensor out)."""
