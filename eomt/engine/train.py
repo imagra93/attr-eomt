@@ -5,8 +5,9 @@ on the pretrained encoder, full LR on the mask/class head), a cosine schedule
 with warmup, AMP and gradient clipping. The masked-attention probability is
 annealed 1->0 over training (EoMT recipe) so the model converges to efficient
 mask-free inference. Validates every ``val_interval`` epochs with COCO segm mAP
-(in the mask-free regime) and keeps both ``last.pt`` and the ``best.pt`` (highest
-``segm/mAP``). The EoMT segmentation loss is computed inside the HF model.
+(in the training regime, at the current annealing, as the official EoMT does) and
+keeps both ``last.pt`` and the ``best.pt`` (highest mask-free ``segm/mAP``, so only
+once the annealing is over). The EoMT segmentation loss is computed inside the HF model.
 ``device="0,1"`` trains on several GPUs, one process each (DistributedDataParallel).
 """
 
@@ -358,7 +359,7 @@ def train(
     size: str = "l",
     family: str = "instance",
     imgsz: int = 644,
-    epochs: int = 50,
+    epochs: int = 12,
     batch: int = 4,
     nominal_batch: int = 16,
     accum: int = 0,
@@ -392,7 +393,7 @@ def train(
     letterbox: bool = True,
     project: str = "runs/train",
     name: str | None = None,
-    val_interval: int = 1,
+    val_interval: int = 2,
     conf_thres: float = 0.0,
     max_det: int = 100,
     aux_w: float = 1.0,
@@ -485,7 +486,15 @@ def train(
     = (500, 1000): the head warms up while the ViT LR is held at 0, then the ViT ramps up. Masked
     attention is annealed per query block, one window after the other (``mask_anneal_start`` /
     ``mask_anneal_end``: one fraction of training per block; ``(1 - progress) ** poly_power`` inside a
-    window), and the last sixth of training is mask-free. ``amp_dtype`` selects the autocast dtype:
+    window), and the last sixth of training is mask-free. ``epochs=12`` and ``val_interval=2`` are the official COCO
+    instance recipe (about 89k optimizer steps at batch 16).
+
+    **Validation** (every ``val_interval`` epochs and after the last one) runs the model in the regime it is trained in,
+    as the official EoMT does: masked attention at the annealing probabilities of the epoch's end. A model that still
+    masks is far worse without its masks (part damage, ViT-L at epoch 11 of 50: 0.034 segm mAP mask-free against 0.114
+    masked), so a mask-free curve before the last sixth follows the annealing, not the model. ``best.pt`` must be
+    deployable mask-free, so it is only chosen once every block's annealing is over (a run stopped earlier has
+    ``last.pt`` alone); every checkpoint is saved mask-free. ``amp_dtype`` selects the autocast dtype:
     ``"auto"`` uses bf16 on hardware that supports it (no GradScaler, more stable),
     else fp16; force with ``"bf16"`` / ``"fp16"``.
     """
@@ -899,6 +908,21 @@ def train(
     n_q_blocks = int(core.eomt.attn_mask_probs.numel())
     anneal_starts = _per_block(mask_anneal_start, n_q_blocks, "mask_anneal_start")
     anneal_ends = _per_block(mask_anneal_end, n_q_blocks, "mask_anneal_end")
+    if main and val_ds is not None and mask_anneal:
+        mask_free_epoch = max(anneal_ends) * epochs
+        windows = ", ".join(f"{a * epochs:.1f}-{b * epochs:.1f}" for a, b in zip(anneal_starts, anneal_ends))
+        print(
+            f"[val] every {val_interval} epoch(s) and after the last, in the training regime (as the official EoMT): "
+            f"masked attention at the current annealing (query-block windows at epochs {windows}; mask-free from "
+            f"epoch {mask_free_epoch:.1f})."
+        )
+        print(
+            "[val] A model that still masks scores far lower without its masks, so a mask-free curve would follow the "
+            f"annealing, not the model. best.pt runs mask-free: it is only chosen from epoch {mask_free_epoch:.1f} on, "
+            "and every checkpoint is saved mask-free."
+        )
+        if stop_after_epochs is not None and stop_after_epochs < mask_free_epoch:
+            print(f"[val] stop_after_epochs={stop_after_epochs} ends before the annealing: no best.pt, use last.pt")
 
     head_group = next(g for g in reversed(optimizer.param_groups) if not g.get("is_backbone"))  # shown in the log
 
@@ -1054,56 +1078,64 @@ def train(
                 if tb is not None:
                     tb.log({f"train/aux_acc/{n}": aux_acc[n] for n in aux_acc}, epoch)
 
-        # Evaluate and checkpoint in the deployment regime: masked attention off
-        # (deterministic, mask-free) so val mAP and the saved buffer match how the
-        # model is later run via predict/val. Training stochasticity resumes on the
-        # next epoch's first step. When annealing is disabled, leave the buffer as is.
-        # The EMA copy is what gets validated and exported as best.pt, so zero its
-        # buffer too (its buffers track the live model, which was just annealing).
+        # Validate in the regime the model is trained in (official EoMT): masked attention at the annealing
+        # probabilities of the epoch's end. The EMA copy is what gets validated and exported as best.pt.
+        # When annealing is disabled, leave the buffers as they are.
         eval_model = ema_model.module if ema_model is not None else core
+        val_probs = _attn_mask_probs((epoch + 1) * iters_per_epoch, total_iters, anneal_starts, anneal_ends, poly_power)
         if mask_anneal:
-            core.eomt.attn_mask_probs.zero_()
-            if ema_model is not None:
-                eval_model.eomt.attn_mask_probs.zero_()
+            eval_model.eomt.set_attn_mask_probs(val_probs)
+        # best.pt must run mask-free (as predict/val run it), so it is only chosen once the annealing is over.
+        deployable = not mask_anneal or not any(val_probs)
 
         # --- validation (several GPUs: each runs its share, the main process gets the metrics) ---
         metrics = {}
         epoch_aux_pc: dict[str, dict[int, tuple[int, int]]] | None = None
-        if val_ds is not None and (epoch + 1) % val_interval == 0:
-            if is_detect:
-                metrics = evaluate_detection(
-                    eval_model, val_ds, device=dev, batch_size=batch,
-                    num_workers=workers, conf_thres=conf_thres, max_det=max_det,
-                    amp=amp, verbose=main,
-                )
-                print(
-                    f"[epoch {epoch}] bbox mAP {metrics.get('bbox/mAP', 0):.4f} "
-                    f"mAP50 {metrics.get('bbox/mAP50', 0):.4f}"
-                )
-            else:
-                metrics = evaluate(
-                    eval_model, val_ds, device=dev, batch_size=batch,
-                    num_workers=workers, conf_thres=conf_thres, max_det=max_det,
-                    amp=amp, verbose=main,
-                )
-                print(
-                    f"[epoch {epoch}] segm mAP {metrics.get('segm/mAP', 0):.4f} "
-                    f"mAP50 {metrics.get('segm/mAP50', 0):.4f} "
-                    f"bbox mAP {metrics.get('bbox/mAP', 0):.4f}"
-                )
-            if val_seg_ds is not None:  # held-out matched-query accuracy per head
-                val_aux, epoch_aux_pc = aux_evaluate(
-                    eval_model, val_seg_ds, device=dev, batch_size=batch,
-                    num_workers=workers, amp=amp, verbose=main,
-                    iou_gate=aux_iou_gate, class_gate=aux_class_gate,
-                )
-                metrics.update({f"aux_acc/{n}": v for n, v in val_aux.items()})
-                print(
-                    f"[epoch {epoch}] val aux acc: "
-                    + "  ".join(f"{n}={v:.3f}" for n, v in val_aux.items())
-                )
-            if tb is not None:
-                tb.log({f"val/{k}": v for k, v in metrics.items()}, epoch)
+        last_epoch = epoch + 1 in (epochs, stop_after_epochs)
+        # A block mid-window unmasks a random share of its queries: seed it so every validation draws the same
+        # queries, without touching the training RNG.
+        if val_ds is not None and ((epoch + 1) % val_interval == 0 or last_epoch):
+            with torch.random.fork_rng(devices=[dev] if dev.type == "cuda" else []):
+                torch.manual_seed(0)
+                if is_detect:
+                    metrics = evaluate_detection(
+                        eval_model, val_ds, device=dev, batch_size=batch,
+                        num_workers=workers, conf_thres=conf_thres, max_det=max_det,
+                        amp=amp, verbose=main,
+                    )
+                    print(
+                        f"[epoch {epoch}] bbox mAP {metrics.get('bbox/mAP', 0):.4f} "
+                        f"mAP50 {metrics.get('bbox/mAP50', 0):.4f}"
+                    )
+                else:
+                    metrics = evaluate(
+                        eval_model, val_ds, device=dev, batch_size=batch,
+                        num_workers=workers, conf_thres=conf_thres, max_det=max_det,
+                        amp=amp, verbose=main,
+                    )
+                    print(
+                        f"[epoch {epoch}] segm mAP {metrics.get('segm/mAP', 0):.4f} "
+                        f"mAP50 {metrics.get('segm/mAP50', 0):.4f} "
+                        f"bbox mAP {metrics.get('bbox/mAP', 0):.4f}"
+                    )
+                if val_seg_ds is not None:  # held-out matched-query accuracy per head
+                    val_aux, epoch_aux_pc = aux_evaluate(
+                        eval_model, val_seg_ds, device=dev, batch_size=batch,
+                        num_workers=workers, amp=amp, verbose=main,
+                        iou_gate=aux_iou_gate, class_gate=aux_class_gate,
+                    )
+                    metrics.update({f"aux_acc/{n}": v for n, v in val_aux.items()})
+                    print(
+                        f"[epoch {epoch}] val aux acc: "
+                        + "  ".join(f"{n}={v:.3f}" for n, v in val_aux.items())
+                    )
+                if tb is not None:
+                    tb.log({f"val/{k}": v for k, v in metrics.items()}, epoch)
+
+        # Checkpoints are saved mask-free, as predict/val run them; the next step sets the training probabilities again.
+        if mask_anneal:
+            core.eomt.attn_mask_probs.zero_()
+            eval_model.eomt.attn_mask_probs.zero_()
 
         if main:  # the main process alone writes the checkpoints, the metrics row and the plots
             # --- checkpoints ---
@@ -1113,7 +1145,7 @@ def train(
             # (it used to lag one epoch and could overwrite a better best.pt).
             best_key = "bbox/mAP" if is_detect else "segm/mAP"
             cur = metrics.get(best_key, None)
-            improved = cur is not None and cur > best_metric
+            improved = deployable and cur is not None and cur > best_metric
             if improved:
                 best_metric = cur
             _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True)

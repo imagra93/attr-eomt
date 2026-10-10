@@ -4,7 +4,7 @@
     from eomt import EoMT
 
     model = EoMT("l")                       # fresh large model (DINOv2 backbone)
-    model.train(data="coco", epochs=50)     # COCO auto-downloads if missing
+    model.train(data="coco")                # COCO auto-downloads if missing; 12 epochs, the official recipe
 
     model = EoMT("runs/train/eomt-l")       # reload a run (everything auto-detected)
     model.val(data="coco")

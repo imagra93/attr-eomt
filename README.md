@@ -32,7 +32,7 @@ It's a clean-room, Apache-2.0 reimplementation: the weights you train are yours 
 from eomt import EoMT
 
 model = EoMT("l")                            # fresh large model (DINOv2 backbone)
-model.train(data="coco", epochs=50)          # COCO 2017 auto-downloads if missing
+model.train(data="coco")                     # COCO 2017 auto-downloads if missing; 12 epochs, the official recipe
 
 model = EoMT("runs/train/eomt-l")            # reload a run — size/classes/heads auto-detected
 model.predict("images/", plot=True)          # render masks/boxes + per-instance attributes
@@ -366,7 +366,7 @@ size, normalization and any auxiliary heads are auto-detected from the `.pt`):
 from eomt import EoMT
 
 # Train on COCO 2017 (auto-downloaded on first run):
-EoMT("l").train(data="coco", epochs=50, batch=4)
+EoMT("l").train(data="coco", batch=4)   # 12 epochs, validated every 2: the official recipe
 
 # ...or any COCO-format dataset (point at its data.yaml):
 EoMT("s").train(data="sample_data/data.yaml", epochs=1, batch=1)
@@ -384,7 +384,7 @@ GPUs; the main process scores them and alone logs and writes checkpoints. The pr
 argument must be picklable.
 
 ```python
-EoMT("l", device="0,1").train(data="coco", epochs=50, batch=2)   # 2 per GPU x accum 4 x 2 GPUs = effective 16
+EoMT("l", device="0,1").train(data="coco", batch=2)   # 2 per GPU x accum 4 x 2 GPUs = effective 16
 ```
 
 **Test-time augmentation and tiled inference** (instance family). `predict()` and `val()` take `augment=True` (the
@@ -422,11 +422,18 @@ LR, every step of the LR schedule, and the masked-attention annealing agree exac
 | encoder LR | layer-wise decay `llrd=0.8`, `backbone_lr_mult=1.0`: the **top ViT block is at the full `lr0`** and each block below is 0.8× the one above; embeddings follow the first block, the final norm is at `lr0` |
 | schedule | polynomial decay (`poly_power=0.9`) to 0 after a two-stage warmup in optimizer steps `warmup_steps=(500, 1000)`: the head warms up while the ViT LR is held at 0, then the ViT ramps up |
 | masked attention | annealed block by block (`mask_anneal_start/end`, fractions of training: 1/6–2/6, 2/6–3/6, 3/6–4/6, 4/6–5/6, polynomial); the last sixth of training is mask-free |
+| length | `epochs=12`, validated every `val_interval=2` epochs and after the last (official COCO instance recipe, about 89k optimizer steps at batch 16) |
 
 In EoMT the last four transformer blocks are the ones that process the queries and predict the masks, so they must learn at
 close to the head's speed: scaling the whole encoder by 0.1 (as detector-style recipes do for a backbone) starves them. The
-LR decay and the annealing span `epochs`, and validation runs mask-free, so metrics logged early in a long run understate
-the model. The official COCO recipe trains for 12 epochs (about 89k optimizer steps at batch 16).
+LR decay and the annealing span `epochs`.
+
+**Validation follows the training regime**, as in the official EoMT: masked attention at the annealing probabilities of
+the epoch's end. A model that still masks is far worse without its masks (part damage, ViT-L at epoch 11 of 50: 0.034
+segm mAP mask-free against 0.114 masked), so a mask-free curve before the last sixth follows the annealing and jumps as each
+block finishes it, not the model. `best.pt` is deployed mask-free, so it is only chosen once every block's annealing is
+over (a run stopped earlier, e.g. with `stop_after_epochs`, has `last.pt` alone), and every checkpoint is saved mask-free.
+Training prints the windows in epochs when it starts.
 
 ### Architecture options
 

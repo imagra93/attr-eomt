@@ -136,3 +136,25 @@ def test_train_applies_the_recipe_to_the_optimizer(tmp_path):
     assert top_backbone == pytest.approx(LR)                        # the top ViT block learns at the head's LR
     with pytest.raises(ValueError, match="one per query block"):
         train(name="bad", mask_anneal_start=(0.1, 0.2), **kw)
+
+
+def test_validation_follows_the_annealing_and_best_waits_until_mask_free(tmp_path, monkeypatch):
+    """Validation runs at the epoch-end annealing (official EoMT); best.pt is only chosen once that is mask-free (its
+    deployment regime), and every checkpoint is saved mask-free."""
+    import sys
+
+    from eomt.engine.train import train
+
+    seen = []
+    monkeypatch.setattr(sys.modules["eomt.engine.train"], "evaluate",  # the package re-exports train() under that name
+                        lambda model, *a, **k: seen.append(model.eomt.attn_mask_probs.tolist()) or {"segm/mAP": 0.5})
+    img_dir, jf = _mini_coco(tmp_path)
+    kw = dict(train_images=str(img_dir), train_json=str(jf), val_images=str(img_dir), val_json=str(jf), size="s", imgsz=112,
+              epochs=2, val_interval=1, batch=1, accum=1, workers=0, device="cpu", amp=False, pretrained=False, ema=True,
+              seed=0, project=str(tmp_path / "runs"), name="v", warmup_steps=(1, 1))
+    res = train(stop_after_epochs=1, **kw)
+    assert seen == [[0.0, 0.0, 1.0, 1.0]] and res["best"] is None    # half-way: the last two blocks still mask
+    ck = torch.load(res["last"], weights_only=False)
+    assert not ck["model"]["eomt.attn_mask_probs"].any() and not ck["ema"]["module"]["eomt.attn_mask_probs"].any()
+    res = train(resume=res["last"], **kw)
+    assert seen[-1] == [0.0] * 4 and res["best"] is not None

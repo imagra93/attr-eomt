@@ -4,7 +4,7 @@
 Defaults to COCO 2017 instance segmentation, which is auto-downloaded on first run.
 
     python scripts/train.py                          # COCO, large model
-    python scripts/train.py --size s --epochs 50 --batch 16
+    python scripts/train.py --size s --batch 16      # 12 epochs, the official COCO recipe
     python scripts/train.py --data sample_data/data.yaml --epochs 1
 
 Augmentation defaults are a strong general recipe (see ``eomt.data.transforms.AugConfig``). Override any knob:
@@ -44,7 +44,7 @@ def main() -> None:
         "--task", default="instance", choices=["instance", "detect"],
         help="Head family: 'instance' (mask segmentation) or 'detect' (boxes only).",
     )
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=12, help="Total epochs (official COCO recipe: 12); the LR schedule and mask anneal span them.")
     p.add_argument("--batch", type=int, default=4, help="Micro-batch size (per optimizer micro-step).")
     p.add_argument("--imgsz", type=int, default=644, help="Square input size (divisible by 14).")
     p.add_argument("--device", default="auto", help="auto (GPU 0), cpu, cuda:N / N, or GPU indices such as 0,1 to train on several.")

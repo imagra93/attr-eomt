@@ -371,7 +371,7 @@ def aux_evaluate(
 
     ``val_seg_ds`` is a :class:`~eomt.data.coco.CocoInstanceSeg` over the val split
     (deterministic val transform, sharing train's attribute id map). Runs the model
-    mask-free, matches predictions to GT with EoMT's matcher, and reports top-1
+    as given (the trainer sets its masked-attention regime), matches predictions to GT with EoMT's matcher, and reports top-1
     accuracy on matched queries (ignoring ``-100`` labels).
 
     The scalar accuracy uses the same gate as training (``iou_gate`` + ``class_gate``)
