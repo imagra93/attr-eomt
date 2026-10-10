@@ -46,6 +46,11 @@ class AuxHeadSpec:
     size). It is trained on ``(t(y) - mean) / std`` with ``t = log1p`` when ``log`` else the identity, the
     statistics of the train split; :meth:`encode` / :meth:`decode` map between real values and that space.
     ``value_range`` (optional) bounds the valid values and clips the predictions.
+
+    ``crop`` makes a regression value follow the fraction of the instance the training augmentation keeps in view
+    (crop, warp, copy-paste occlusion): ``"scale"`` multiplies it by that fraction (an extensive quantity such as an
+    area), ``"ignore"`` drops it when less than ``min_visible`` is kept (a property of the whole instance). ``None``
+    (the default) ⇒ the value does not change under augmentation. Training only; not stored in checkpoints.
     """
 
     name: str
@@ -57,6 +62,8 @@ class AuxHeadSpec:
     mean: float = 0.0
     std: float = 1.0
     value_range: tuple[float, float] | None = None
+    crop: str | None = None
+    min_visible: float = 0.9
 
     def encode(self, y):
         """Real values -> the standardized space the head is trained in (tensor in, tensor out)."""

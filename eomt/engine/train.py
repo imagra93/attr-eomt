@@ -274,7 +274,8 @@ def _aux_kind_str(spec) -> str:
     """``num_classes`` of a categorical head, the target space of a regression head (banner)."""
     if not spec.regression:
         return str(spec.num_classes)
-    return f"regression{', log' if spec.log else ''}, mean {spec.mean:.4g} std {spec.std:.4g}"
+    crop = f", crop {spec.crop}" + (f" < {spec.min_visible:g}" if spec.crop == "ignore" else "") if spec.crop else ""
+    return f"regression{', log' if spec.log else ''}{crop}, mean {spec.mean:.4g} std {spec.std:.4g}"
 
 
 def _aux_metric(spec) -> str:

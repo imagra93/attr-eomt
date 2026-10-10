@@ -7,6 +7,7 @@ import csv
 import json
 import math
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -15,9 +16,10 @@ from PIL import Image
 from eomt import build_model
 from eomt.aux_cls import aux_loss
 from eomt.config import AuxHeadSpec
-from eomt.data import CocoInstanceSeg
+from eomt.data import CocoInstanceSeg, TrainAugment
+from eomt.data.transforms import _homography
 
-from test_augment import _mini_coco  # noqa: E402  (tests/ is on sys.path)
+from test_augment import _mini_coco, _rects  # noqa: E402  (tests/ is on sys.path)
 
 
 def _with_cost(tmp_path):
@@ -92,3 +94,49 @@ def test_train_with_a_regression_head_then_predict_real_values(tmp_path):
     assert set(pred["aux"]) == {"kind"}
     with pytest.raises(ValueError, match="regression"):
         validate_group_by(("class", "cost"), model.aux_specs)
+
+
+def test_augmentation_measures_the_fraction_of_each_instance_kept_in_view():
+    img, masks, boxes = _rects()  # green 140x80 at x 90-230, red 30x70 at x 40-70, in a 320x240 image
+    tf = TrainAugment(112)
+    m = masks.float()
+    for tgt, is_boxes in ((m, False), (boxes, True)):  # a window over x >= 160: half the green one, none of the red
+        vis = tf._crop(img, tgt, is_boxes, (240, 320), (240, 160), (0, 160), None)[2]
+        assert torch.allclose(vis, torch.tensor([0.5, 0.0]))
+    # a warp that halves the size and bends the perspective keeps both whole: the shrink must not count as a loss
+    quad = np.array([[0, 0], [160, 0], [160, 120], [0, 120]], dtype=np.float64)
+    fwd = _homography(quad, quad + [[4, 3], [-6, 2], [-3, -5], [5, -4]]) @ np.diag([0.5, 0.5, 1.0])
+    for tgt, is_boxes in ((m, False), (boxes, True)):
+        vis = tf._crop(img, tgt, is_boxes, (240, 320), (120, 160), (0, 0), fwd)[2]
+        assert torch.allclose(vis, torch.ones(2), atol=0.03), vis
+
+
+def test_crop_aware_values_follow_the_augmentation(tmp_path):
+    img_dir, jf = _with_cost(tmp_path)
+    coco = json.loads(jf.read_text())
+    coco["attributes"] += [{"name": "area", "type": "regression", "crop": "scale"},
+                           {"name": "whole", "type": "regression", "crop": "ignore", "min_visible": 0.8}]
+    for a in coco["annotations"]:
+        a["attributes"].update(area=100.0, whole=7.0)
+    jf.write_text(json.dumps(coco))
+    # zoomed in (the window sees ~half of the image) and min_mask_mass 0, so every instance is kept, cut or not; the
+    # multi-image ops add instances from other samples, whose values must follow their own crops
+    aug = {"min_scale": 2.0, "max_scale": 2.0, "flip_prob": 0.0, "min_mask_mass": 0.0,
+           "mosaic_prob": 0.25, "copy_paste_prob": 0.25, "mixup_prob": 0.25}
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=112, aug=aug)
+    assert [s.crop for s in ds.aux_specs] == [None, None, "scale", "ignore"]
+    torch.manual_seed(0)
+    partial, multi = False, set()
+    for _ in range(20):
+        a = ds[0][3]
+        vis = ds.transform.last_info["visible"]
+        multi.add(ds.transform.last_info["multi"])
+        assert torch.allclose(a["area"], 100.0 * vis)
+        assert torch.equal(a["whole"].isnan(), vis < 0.8) and (a["whole"][vis >= 0.8] == 7.0).all()
+        assert a["cost"][1] == 1000.0  # not crop-aware: untouched
+        partial |= bool(((vis > 0.05) & (vis < 0.95)).any())
+    assert partial and multi == {None, "mosaic", "copy_paste", "mixup"}  # the crops did cut instances
+    coco["attributes"][0]["crop"] = "scale"  # "kind", a categorical head
+    jf.write_text(json.dumps(coco))
+    with pytest.raises(ValueError, match="regression attributes only"):
+        CocoInstanceSeg(img_dir, jf, imgsz=112)

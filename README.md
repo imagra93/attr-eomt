@@ -271,6 +271,34 @@ mean absolute error in real units (`val/aux_mae/<head>`), and predicted in real 
 rotation): a cost or a score is fine, a pixel area or an angle is not. Tracking votes on the
 categorical heads only, and re-identification cannot gate on a regression head.
 
+A value that depends on how much of the instance is in view can say so with `crop`: the
+training augmentation measures, per instance, the fraction it keeps in view (mask mass, or box
+area, inside the crop window, after copy-paste occlusion), and the value follows it.
+`"crop": "scale"` multiplies the value by that fraction — for an extensive quantity such as the
+object's area in cm² (half the damage cropped away ⇒ half the area). `"crop": "ignore"` drops the
+value when less than `min_visible` (default `0.9`) is kept — for a property of the whole object
+that a cut view no longer shows. Validation and inference see whole images, so the head predicts
+the full value there:
+
+```jsonc
+{"name": "damage_area", "type": "regression", "log": true, "crop": "scale"},
+{"name": "part_length", "type": "regression", "crop": "ignore", "min_visible": 0.95}
+```
+
+How the fraction is measured: for masks, the share of the instance's mask mass that lands in
+the crop window, corrected for the area change of a rotation / shear / perspective warp (a warp
+alone is not a cut); copy-paste occlusion counts as hidden, and instances brought in by mosaic,
+mixup or copy-paste are measured against their own crops. For boxes (detect family), the ratio of
+the box areas: exact for a crop, approximate under rotation. Each call of the built-in
+augmentation exposes it as `TrainAugment.last_info["visible"]`.
+
+Limits: the head's mean / std and its `aux_class_weights` density come from the unscaled values,
+so with `"scale"` the values trained on sit somewhat lower than those statistics. Only the visible
+fraction is tracked, not the scale jitter, so a pixel area is still not supported. A custom
+`transform=` gets no adjustment. `crop` is rejected on a categorical attribute, and it is a
+training-only setting (not stored in the checkpoint). The training banner prints each head's crop
+mode.
+
 **Sidecar format (optional).** You can keep the COCO JSON as plain, standard COCO and put the
 attributes beside it instead of inside it: an `attributes.yaml` schema (same keys, regression heads included) in the dataset root plus
 `attributes/<split>.json` values keyed by annotation id (`{ann_id: {head: value}}`). If present

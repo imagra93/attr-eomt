@@ -87,7 +87,7 @@ def _load_attr_schema(root: Path):
 
     Each head is ``{name, categories:[{id,name}], applies_to?}``. ``categories`` may be
     written as bare labels (auto-id 0..n-1) or explicit ``{id,name}`` dicts. A regression head is
-    ``{name, type: regression, log?, range?, applies_to?}`` (no categories). Returns
+    ``{name, type: regression, log?, range?, crop?, min_visible?, applies_to?}`` (no categories). Returns
     ``None`` when the schema file is absent.
     """
     import yaml
@@ -105,7 +105,7 @@ def _load_attr_schema(root: Path):
             else:  # bare label -> auto id by position
                 cats.append({"id": i, "name": str(c)})
         entry = {"name": d["name"], "categories": cats}
-        for key in ("applies_to", "type", "log", "range"):
+        for key in ("applies_to", "type", "log", "range", "crop", "min_visible"):
             if d.get(key) is not None:
                 entry[key] = d[key]
         norm.append(entry)
@@ -204,12 +204,29 @@ def _attr_ignored(spec: AuxHeadSpec, n: int) -> torch.Tensor:
     return _attr_tensor(spec, [math.nan if spec.regression else -100] * n)
 
 
+def _crop_attrs(specs: list[AuxHeadSpec], attr_t: dict, visible: torch.Tensor) -> dict:
+    """The crop-aware regression values after the augmentation, given the fraction of each instance it kept in view
+    (``TrainAugment.last_info["visible"]``): ``crop="scale"`` multiplies the value by it, ``crop="ignore"`` drops the
+    value (NaN) when less than ``min_visible`` is kept."""
+    out = dict(attr_t)
+    for s in specs:
+        if s.crop == "scale":
+            out[s.name] = attr_t[s.name] * visible
+        elif s.crop == "ignore":
+            out[s.name] = attr_t[s.name].masked_fill(visible < s.min_visible, math.nan)
+    return out
+
+
 def _regression_spec(d: dict, anns: list, cat2contig: dict, applies_to) -> AuxHeadSpec:
     """A regression head from its definition, standardized by the statistics of this split's valid, in-scope values."""
     rng = d.get("range")
+    crop = d.get("crop")
+    min_visible = float(d.get("min_visible", 0.9))
+    if crop not in (None, "scale", "ignore") or not 0.0 <= min_visible <= 1.0:
+        raise ValueError(f"attribute {d['name']!r}: crop={crop!r} ('scale' or 'ignore'), min_visible={min_visible} (in [0, 1])")
     spec = AuxHeadSpec(
         name=d["name"], num_classes=1, applies_to=applies_to, regression=True, log=bool(d.get("log", False)),
-        value_range=(float(rng[0]), float(rng[1])) if rng is not None else None,
+        value_range=(float(rng[0]), float(rng[1])) if rng is not None else None, crop=crop, min_visible=min_visible,
     )
     vals = [
         _attr_label(spec, {}, a.get("attributes", {}), cat2contig.get(a.get("category_id")))
@@ -237,7 +254,8 @@ def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=Non
 
     and the per-annotation ``"attributes": {"color": 0, "posture": 2}`` field.
     ``{"name": "cost", "type": "regression", "log": true, "range": [0, 20000]}`` defines a head that
-    regresses a real number instead (``"attributes": {"cost": 812.5}``; ``log`` and ``range`` optional).
+    regresses a real number instead (``"attributes": {"cost": 812.5}``; ``log`` and ``range`` optional;
+    ``"crop": "scale" | "ignore"`` and ``min_visible`` tie it to the augmentation, see :func:`_crop_attrs`).
     Falls back to inferring each attribute's id set from the annotations when a
     definition omits ``categories``. The optional ``applies_to`` scopes a head to a
     subset of primary classes (category names or raw ids); it is resolved against
@@ -262,6 +280,8 @@ def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=Non
         kind = d.get("type", "categorical")
         if kind not in ("categorical", "regression"):
             raise ValueError(f"attribute {name!r}: unknown type {kind!r} (categorical or regression)")
+        if kind != "regression" and d.get("crop") is not None:
+            raise ValueError(f"attribute {name!r}: 'crop' applies to regression attributes only")
         if kind == "regression":
             applies_to = _resolve_applies_to(d.get("applies_to"), cat2contig, contig_names, name)
             specs.append(_regression_spec(d, anns, cat2contig, applies_to))
@@ -470,6 +490,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
                 image_t, masks_t, class_t, attr_t = self.transform(
                     image_tv, masks_tv, class_t, attr_t, sampler=self._sample_other if multi else None
                 )
+                attr_t = _crop_attrs(self.aux_specs, attr_t, self.transform.last_info["visible"])  # instances pasted in
             else:
                 image_t, masks_t = self.transform(image_tv, masks_tv)
             return image_t, masks_t.float(), class_t, attr_t
@@ -490,6 +511,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
                 )
                 keep = masks_t.flatten(1).sum(1) >= c.min_mask_mass
                 if keep.any():
+                    attr_o = _crop_attrs(self.aux_specs, attr_o, tf.last_info["visible"])
                     break
             else:
                 image_t, masks_t = self._fallback_transform(image_tv, masks_tv)
@@ -638,6 +660,8 @@ class CocoDetection(_InstanceWeights, Dataset):
             boxes_t = torch.as_tensor(boxes_t)
             keep = ((boxes_t[:, 2] - boxes_t[:, 0]) > 1) & ((boxes_t[:, 3] - boxes_t[:, 1]) > 1)
             if keep.any():
+                if built_in:
+                    attr_t = _crop_attrs(self.aux_specs, attr_t, self.transform.last_info["visible"])
                 break
         else:
             image_t, boxes_t = self._fallback_transform(image_tv, boxes_tv)

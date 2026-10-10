@@ -331,6 +331,19 @@ def _clipped_aabb(quad: np.ndarray, w: float, h: float) -> tuple[float, float, f
     return max(min(xs), 0.0), max(min(ys), 0.0), min(max(xs), w), min(max(ys), h)
 
 
+def _fraction(kept: torch.Tensor, whole: torch.Tensor) -> torch.Tensor:
+    """Per instance ``kept / whole`` in [0, 1]; 0 for an instance with nothing to keep."""
+    return torch.where(whole > 0, kept / whole.clamp(min=1e-12), torch.zeros_like(whole)).clamp_(0.0, 1.0)
+
+
+def _mass(masks: torch.Tensor) -> torch.Tensor:
+    return masks.flatten(1).sum(1)
+
+
+def _box_area(b: torch.Tensor) -> torch.Tensor:
+    return (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+
+
 def _translate(tx: float, ty: float) -> np.ndarray:
     return np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
 
@@ -430,6 +443,10 @@ class TrainAugment:
       ``image``, ``target``, ``labels``, ``attrs`` (and optionally ``weights``).
 
     ``weights`` (per instance, any positive scale) drive the instance-aware crop's choice of focus instance.
+
+    After each call, ``last_info["visible"]`` holds, per output instance, the fraction of it still in view: its mask
+    mass (box area) inside the crop window, measured before the warp, times the share copy-paste did not occlude. The
+    datasets scale or drop the crop-aware attribute values with it (``AuxHeadSpec.crop``).
     """
 
     #: the dataset checks this to decide whether to use the full call form
@@ -476,14 +493,16 @@ class TrainAugment:
 
         S = self.imgsz
         if multi == "mosaic":
-            img_f, tgt, labels_o, attrs_o = self._mosaic(img, tgt, labels, attrs, w, sampler)
+            img_f, tgt, labels_o, attrs_o, visible = self._mosaic(img, tgt, labels, attrs, w, sampler)
         else:
             img_f, tgt, info = self._geometry(img, tgt, (S, S), w, is_boxes)
             self.last_info.update(info)
+            visible = info["visible"]
             if multi == "copy_paste":
-                img_f, tgt, labels_o, attrs_o = self._copy_paste(img_f, tgt, labels, attrs, sampler)
+                img_f, tgt, labels_o, attrs_o, visible = self._copy_paste(img_f, tgt, labels, attrs, visible, sampler)
             elif multi == "mixup":
-                img_f, tgt, labels_o, attrs_o = self._mixup(img_f, tgt, labels, attrs, sampler)
+                img_f, tgt, labels_o, attrs_o, visible = self._mixup(img_f, tgt, labels, attrs, visible, sampler)
+        self.last_info["visible"] = visible
 
         occupied = None
         if c.erasing_prob > 0 and c.erasing_avoid_instances:
@@ -620,8 +639,9 @@ class TrainAugment:
             if focus is None or self._focus_visible(cand, tgt, is_boxes, focus, (Ho, Wo)):
                 fwd = cand
                 break
-        info = {"scale": s, "eff_scale": r, "mode": mode, "focus": focus, "warp": fwd is not None, "origin": (y0, x0)}
-        out_img, out_tgt = self._crop(img, tgt, is_boxes, (Hs, Ws), (Ho, Wo), (y0, x0), fwd)
+        out_img, out_tgt, visible = self._crop(img, tgt, is_boxes, (Hs, Ws), (Ho, Wo), (y0, x0), fwd)
+        info = {"scale": s, "eff_scale": r, "mode": mode, "focus": focus, "warp": fwd is not None, "origin": (y0, x0),
+                "visible": visible}
         return out_img, out_tgt, info
 
     def _pick_focus(self, n, weights) -> int:
@@ -688,7 +708,8 @@ class TrainAugment:
         return bool((pts[:, 0] >= 0).all() and (pts[:, 1] >= 0).all() and (pts[:, 0] <= Wo).all() and (pts[:, 1] <= Ho).all())
 
     def _crop(self, img, tgt, is_boxes, hw, out_hw, origin, fwd):
-        """Crop (and warp) image + target to ``out_hw``. Returns float image in [0, 1] and the target."""
+        """Crop (and warp) image + target to ``out_hw``. Returns float image in [0, 1], the target and the fraction of
+        each instance still in view (mask mass, or box area)."""
         Hs, Ws = hw
         Ho, Wo = out_hw
         y0, x0 = origin
@@ -702,13 +723,14 @@ class TrainAugment:
                 out[:, ya - y0:yb - y0, xa - x0:xb - x0] = imgf[:, ya:yb, xa:xb]
             if is_boxes:
                 b = tgt - torch.tensor([x0, y0, x0, y0], dtype=tgt.dtype)
+                whole = _box_area(b)
                 b[:, [0, 2]] = b[:, [0, 2]].clamp(0, Wo)
                 b[:, [1, 3]] = b[:, [1, 3]].clamp(0, Ho)
-                return out, b
+                return out, b, _fraction(_box_area(b), whole)
             m = torch.zeros(tgt.shape[0], Ho, Wo, dtype=torch.float32)
             if yb > ya and xb > xa and tgt.shape[0]:
                 m[:, ya - y0:yb - y0, xa - x0:xb - x0] = tgt[:, ya:yb, xa:xb]
-            return out, m
+            return out, m, _fraction(_mass(m), _mass(tgt))
 
         inv = np.linalg.inv(fwd)
         jj, ii = np.meshgrid(np.arange(Wo, dtype=np.float64) + 0.5, np.arange(Ho, dtype=np.float64) + 0.5)
@@ -724,14 +746,21 @@ class TrainAugment:
                 [np.array([[x0_, y0_], [x1_, y0_], [x1_, y1_], [x0_, y1_]], dtype=np.float64) for x0_, y0_, x1_, y1_ in tgt.tolist()]
             ) if tgt.shape[0] else np.zeros((0, 4, 2))
             res = np.zeros((len(corners), 4), dtype=np.float32)
+            whole = np.zeros((len(corners), 4), dtype=np.float32)
             for k, quad in enumerate(corners):
                 q = _apply_h(fwd, quad)
                 res[k] = _clipped_aabb(q, Wo, Ho)
-            return out, torch.from_numpy(res)
+                whole[k] = (*q.min(0), *q.max(0))
+            res = torch.from_numpy(res)
+            # ponytail: area ratio of the axis-aligned boxes; exact for a crop, approximate under rotation / shear.
+            return out, res, _fraction(_box_area(res), _box_area(torch.from_numpy(whole)))
         if tgt.shape[0] == 0:
-            return out, torch.zeros(0, Ho, Wo)
-        m = F.grid_sample(tgt[None], grid, mode="bilinear", padding_mode="zeros", align_corners=False)[0]
-        return out, m.clamp_(0.0, 1.0)
+            return out, torch.zeros(0, Ho, Wo), torch.zeros(0)
+        m = F.grid_sample(tgt[None], grid, mode="bilinear", padding_mode="zeros", align_corners=False)[0].clamp_(0.0, 1.0)
+        # source pixels per output pixel (|det| of the inverse homography's Jacobian: det(inv) / w**3), so the warped
+        # mass is counted in the source frame's units
+        jac = torch.from_numpy((abs(np.linalg.det(inv)) / np.abs(src[2]) ** 3).reshape(Ho, Wo)).to(torch.float32)
+        return out, m, _fraction(_mass(m * jac), _mass(tgt))
 
     # ------------------------------------------------------------------------------------------------ image-only finish
 
@@ -766,12 +795,12 @@ class TrainAugment:
         samples = [(img, tgt, labels, attrs, weights)] + [self._raw(sampler) for _ in range(3)]
         order = torch.randperm(4).tolist()
         canvas = self._mean.expand(3, S, S).clone()
-        masks, labs, atts = [], [], []
+        masks, labs, atts, vis = [], [], [], []
         for k, cell in enumerate(order):
             ri, ci = divmod(cell, 2)
             im_k, t_k, l_k, a_k, w_k = samples[k]
             Ho, Wo = hs[ri], ws[ci]
-            out_i, out_m, _ = self._geometry(im_k, t_k, (Ho, Wo), w_k, False)
+            out_i, out_m, info = self._geometry(im_k, t_k, (Ho, Wo), w_k, False)
             y_off, x_off = ri * hs[0], ci * ws[0]
             canvas[:, y_off:y_off + Ho, x_off:x_off + Wo] = out_i
             full = torch.zeros(out_m.shape[0], S, S)
@@ -779,24 +808,27 @@ class TrainAugment:
             masks.append(full)
             labs.append(l_k)
             atts.append(a_k)
-        return canvas, torch.cat(masks, 0), torch.cat(labs, 0), {k: torch.cat([a[k] for a in atts], 0) for k in atts[0]}
+            vis.append(info["visible"])
+        attrs_o = {k: torch.cat([a[k] for a in atts], 0) for k in atts[0]}
+        return canvas, torch.cat(masks, 0), torch.cat(labs, 0), attrs_o, torch.cat(vis, 0)
 
-    def _mixup(self, img_f, tgt, labels, attrs, sampler):
+    def _mixup(self, img_f, tgt, labels, attrs, visible, sampler):
         """Blend with a second augmented sample (lambda ~ Beta(a, a)); the instances of both are kept."""
         im2, t2, l2, a2, w2 = self._raw(sampler)
-        o2, m2, _ = self._geometry(im2, t2, (self.imgsz, self.imgsz), w2, False)
+        o2, m2, info = self._geometry(im2, t2, (self.imgsz, self.imgsz), w2, False)
         lam = float(torch.distributions.Beta(self.cfg.mixup_alpha, self.cfg.mixup_alpha).sample())
-        return lam * img_f + (1.0 - lam) * o2, torch.cat([tgt, m2], 0), torch.cat([labels, l2], 0), {k: torch.cat([attrs[k], a2[k]], 0) for k in attrs}
+        attrs_o = {k: torch.cat([attrs[k], a2[k]], 0) for k in attrs}
+        return lam * img_f + (1.0 - lam) * o2, torch.cat([tgt, m2], 0), torch.cat([labels, l2], 0), attrs_o, torch.cat([visible, info["visible"]], 0)
 
-    def _copy_paste(self, img_f, tgt, labels, attrs, sampler):
+    def _copy_paste(self, img_f, tgt, labels, attrs, visible, sampler):
         """Paste up to ``copy_paste_max`` instances (their pixels, feathered) from another sample; they occlude existing masks."""
         c = self.cfg
         im2, t2, l2, a2, w2 = self._raw(sampler)
-        o2, m2, _ = self._geometry(im2, t2, (self.imgsz, self.imgsz), w2, False)
+        o2, m2, info = self._geometry(im2, t2, (self.imgsz, self.imgsz), w2, False)
         mass = m2.flatten(1).sum(1)
         cand = [i for i in range(m2.shape[0]) if float(mass[i]) >= max(c.min_mask_mass, 1.0)]
         if not cand:
-            return img_f, tgt, labels, attrs
+            return img_f, tgt, labels, attrs, visible
         perm = torch.randperm(len(cand)).tolist()
         pick = [cand[i] for i in perm[: _randint(1, min(c.copy_paste_max, len(cand)))]]
         sel = m2[pick]
@@ -808,12 +840,14 @@ class TrainAugment:
             alpha = TF.gaussian_blur(alpha, kernel_size=[k, k], sigma=[max(c.copy_paste_context_px / 2.0, 0.3)] * 2).clamp_(0, 1)
             alpha = torch.maximum(alpha, union)
         img_f = img_f * (1.0 - alpha) + o2 * alpha
-        tgt = tgt * (1.0 - union)  # occlusion: pasted pixels replace the old instances there
+        occluded = tgt * (1.0 - union)  # occlusion: pasted pixels replace the old instances there
+        visible = visible * _fraction(_mass(occluded), _mass(tgt))
         return (
             img_f,
-            torch.cat([tgt, sel], 0),
+            torch.cat([occluded, sel], 0),
             torch.cat([labels, l2[pick]], 0),
             {k: torch.cat([attrs[k], a2[k][pick]], 0) for k in attrs},
+            torch.cat([visible, info["visible"][pick]], 0),
         )
 
 
