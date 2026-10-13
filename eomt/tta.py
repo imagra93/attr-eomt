@@ -5,8 +5,10 @@ Both run the model on several *views* of one image and merge the instances the v
 * ``augment=True``: the whole image at ``imgsz`` and zoomed to 1.5x ``imgsz`` (the zoom is what helps small and thin
   objects; on the windscreen damages it gave +5 % mask mAP and +23 % small-object AP, where the mirror gave ~0).
   ``augment={...}`` overrides ``scales`` (whole-image input sizes as multiples of ``imgsz``, default ``[1.0, 1.5]``)
-  and ``flip`` (also run every view mirrored, default False). Keep ``flip`` off for a model whose classes or
-  attributes depend on orientation (left / right): a mirrored view predicts them swapped and the merge averages it in.
+  and ``flip`` (also run every view mirrored, default False). A categorical head marked ``flip_aware`` (stored in the
+  checkpoint) is swapped back in a mirrored view's prediction before the merge; regression heads are taken as flip-
+  invariant. Keep ``flip`` off for a model whose classes or orientation-dependent attributes (left / right) are not
+  flip-aware (e.g. a checkpoint saved before the mapping was stored): a mirrored view predicts them swapped.
 * ``tiles=True``: overlapping ``size`` x ``size`` px crops (default ``size`` = ``imgsz``: native resolution), each run
   at ``imgsz``, ``overlap`` 0.25, plus the whole image (``full``), so the small objects of a large image are seen at a
   useful scale. ``tiles=1024`` sets the size; ``tiles={...}`` overrides ``size`` / ``overlap`` / ``full``. With
@@ -173,7 +175,7 @@ def _crop(image: np.ndarray, view: View) -> np.ndarray:
     return np.ascontiguousarray(crop[:, ::-1] if view.flip else crop)
 
 
-def _view_instances(out, b, view, meta, cells, conf_thres, max_det, mask_thresh, embed) -> dict | None:
+def _view_instances(out, b, view, meta, cells, conf_thres, max_det, mask_thresh, embed, flip_perms=None) -> dict | None:
     """One view's kept queries, their mask logits resampled onto the view's grid ``cells`` (None when it kept none)."""
     mask_logits = out["masks_queries_logits"][b].float()
     quality = out.get("quality_logits")
@@ -190,13 +192,17 @@ def _view_instances(out, b, view, meta, cells, conf_thres, max_det, mask_thresh,
     if view.flip:
         logits = logits.flip(-1)
     gbox = boxes_from_masks(logits > _logit(mask_thresh)) + torch.tensor([x0, y0, x0, y0], device=logits.device)
+    aux = {n: lg[b].float().softmax(-1)[sel] for n, lg in (out.get("aux_queries_logits") or {}).items()}
+    for n, perm in (flip_perms or {}).items() if view.flip else ():  # a mirrored view's left is the image's right
+        if n in aux:
+            aux[n] = aux[n][:, perm.to(aux[n].device)]
     return {
         "cells": cells,
         "logits": logits.half() if logits.is_cuda else logits,  # (n, H, W) per view: halved on the GPU
         "gbox": gbox.cpu().numpy(),  # mask extent in grid cells (x0, y0, x1, y1); x0 == x1 for an empty mask
         "scores": scores[sel],
         "classes": classes[sel],
-        "aux": {n: lg[b].float().softmax(-1)[sel] for n, lg in (out.get("aux_queries_logits") or {}).items()},
+        "aux": aux,
         "aux_values": {n: v[b].float()[sel] for n, v in (out.get("aux_queries_values") or {}).items()},
         "embed": out["query_embed"][b, sel].float() if embed else None,
     }
@@ -304,6 +310,7 @@ def predict_views(
     pool = max(1, round(g / density))
     view_cells = [_grid_cells(v.rect, g, hg, wg) for v in views]
 
+    flip_perms = {s.name: s.flip_perm() for s in getattr(model, "aux_specs", []) if s.flip_perm() is not None}
     found: list[dict] = []
     for size in dict.fromkeys(v.size for v in views):
         idx = [i for i, v in enumerate(views) if v.size == size]
@@ -317,7 +324,8 @@ def predict_views(
             with ctx:
                 out = model(x)
             for b, (i, (_, meta)) in enumerate(zip(chunk, pre)):
-                inst = _view_instances(out, b, views[i], meta, view_cells[i], conf_thres, max_det, mask_thresh, embed)
+                inst = _view_instances(out, b, views[i], meta, view_cells[i], conf_thres, max_det, mask_thresh, embed,
+                                       flip_perms)
                 if inst is not None:
                     inst["view"] = i
                     found.append(inst)

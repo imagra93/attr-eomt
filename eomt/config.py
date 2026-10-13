@@ -54,7 +54,9 @@ class AuxHeadSpec:
 
     ``flip_aware`` (categorical heads) maps a contiguous id to the one it becomes when the training augmentation flips
     the instance horizontally (``{left: right, right: left}``), so a laterality survives ``flip_prob > 0``. Ids it
-    does not list stay as they are. Training only; not stored in checkpoints.
+    does not list stay as they are. Stored in checkpoints: the horizontal-flip test-time augmentation (:mod:`eomt.tta`)
+    swaps it back in a mirrored view's prediction. A regression head is flip-invariant (an area does not change when
+    the photo is mirrored), so the merge averages it as it is.
     """
 
     name: str
@@ -69,6 +71,17 @@ class AuxHeadSpec:
     crop: str | None = None
     min_visible: float = 0.9
     flip_aware: dict[int, int] | None = None
+
+    def flip_perm(self):
+        """``(num_classes,)`` long tensor: index it by a mirrored view's class probabilities' columns to get the original
+        image's (``flip_aware`` is an involution: left <-> right); None when the head is not flip-aware."""
+        if not self.flip_aware:
+            return None
+        import torch
+
+        perm = torch.arange(self.num_classes)
+        perm[list(self.flip_aware)] = torch.tensor(list(self.flip_aware.values()))
+        return perm
 
     def encode(self, y):
         """Real values -> the standardized space the head is trained in (tensor in, tensor out)."""
@@ -89,6 +102,8 @@ def aux_specs_to_meta(specs: list[AuxHeadSpec] | None) -> list[dict]:
         d = {"name": s.name, "num_classes": int(s.num_classes), "names": dict(s.names)}
         if s.applies_to is not None:
             d["applies_to"] = sorted(int(c) for c in s.applies_to)
+        if s.flip_aware:
+            d["flip_aware"] = {int(a): int(b) for a, b in s.flip_aware.items()}
         if s.regression:
             d.update(regression=True, log=s.log, mean=float(s.mean), std=float(s.std))
             if s.value_range is not None:
@@ -105,10 +120,12 @@ def aux_specs_from_meta(meta: list[dict] | None) -> list[AuxHeadSpec]:
         raw = d.get("applies_to")
         applies_to = frozenset(int(c) for c in raw) if raw is not None else None
         vr = d.get("value_range")
+        flip = d.get("flip_aware")
         out.append(AuxHeadSpec(
             str(d["name"]), int(d["num_classes"]), names, applies_to, regression=bool(d.get("regression", False)),
             log=bool(d.get("log", False)), mean=float(d.get("mean", 0.0)), std=float(d.get("std", 1.0)),
             value_range=tuple(float(v) for v in vr) if vr is not None else None,
+            flip_aware={int(a): int(b) for a, b in flip.items()} if flip else None,
         ))
     return out
 

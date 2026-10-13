@@ -14,6 +14,14 @@ Augmentation defaults are a strong general recipe (see ``eomt.data.transforms.Au
 
 To train on a dataset with secondary per-instance attributes (the auxiliary-class
 feature), just point --data at it; the heads are discovered from the COCO JSON.
+
+Fine-tune or resume (use one, not both):
+
+    python scripts/train.py --data my/data.yaml --resume runs/train/eomt-l                  # continue a run: epoch, optimizer, EMA
+    python scripts/train.py --data my/data.yaml --weights runs/train/eomt-l/weights/best.pt \
+        --name eomt-l-ft --epochs 3 --lr 2e-5 --warmup 100,200 --ema-decay 0.999 --mask-free  # a short, gentle warm start
+
+A flag left out keeps ``EoMT.train()``'s default (see the README, "Optimisation recipe").
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ import argparse
 import yaml
 
 from eomt import EoMT
+from eomt.engine.train import EOMT_MASK_ANNEAL_START
 
 
 def _parse_aug(items: list[str], preset: str | None) -> dict | None:
@@ -71,7 +80,33 @@ def main() -> None:
         "--aug-preset", choices=["default", "legacy"], default=None,
         help="Start from the strong default recipe or from the original flip + LSJ + crop + colour-jitter recipe.",
     )
+    g = p.add_argument_group("optimisation (default: EoMT.train()'s, the reference EoMT recipe)")
+    g.add_argument("--lr", type=float, default=None, help="Peak head LR (lr0, default 1e-4); the encoder follows with layer-wise decay.")
+    g.add_argument("--warmup", default=None, metavar="HEAD,VIT", help="Two-stage warmup in optimizer steps, e.g. 500,1000 (the default).")
+    g.add_argument("--nominal-batch", type=int, default=None, help="Global effective batch (16); --batch is per GPU, the rest is accumulated.")
+    g.add_argument("--ema-decay", type=float, default=None, help="EMA decay (0.9999). Lower it for a short run, which would barely leave its start.")
+    g.add_argument("--ema-tau", type=float, default=None, help="EMA warmup time constant in steps (2000).")
+    g.add_argument("--mask-free", action="store_true",
+                   help="No masked attention from the first step (annealing windows 0 -> 0): for fine-tuning a model that is deployed mask-free.")
+    g.add_argument("--aux-dropout", type=float, default=None, help="Dropout in the attribute heads (0).")
+    g.add_argument("--val-interval", type=int, default=None, help="Validate every N epochs and after the last (2).")
+    g.add_argument("--workers", type=int, default=None, help="Data-loader workers per GPU (8).")
+    g.add_argument("--seed", type=int, default=None, help="Seed (ignored when resuming, so the epoch's shuffle is not replayed).")
     args = p.parse_args()
+
+    if args.weights and args.resume:
+        raise SystemExit("pass --resume (continue a run) or --weights (warm-start a fresh run), not both.")
+    overrides = {
+        "lr0": args.lr, "nominal_batch": args.nominal_batch, "ema_decay": args.ema_decay, "ema_tau": args.ema_tau,
+        "aux_head_dropout": args.aux_dropout, "val_interval": args.val_interval, "workers": args.workers,
+        "seed": None if args.resume else args.seed,
+    }
+    if args.warmup:
+        overrides["warmup_steps"] = tuple(int(x) for x in args.warmup.split(","))
+    if args.mask_free:
+        zeros = (0.0,) * len(EOMT_MASK_ANNEAL_START)
+        overrides.update(mask_anneal_start=zeros, mask_anneal_end=zeros)
+    overrides = {k: v for k, v in overrides.items() if v is not None}
 
     if args.fpn_scales.strip().lower() in ("", "none", "off", "0"):
         fpn_scales = None
@@ -96,6 +131,7 @@ def main() -> None:
         quality_weight=args.quality_weight,
         val_imgsz=args.val_imgsz,
         aug=_parse_aug(args.aug, args.aug_preset),
+        **overrides,
     )
     if result["best_metric"] >= 0:
         metric = "bbox mAP" if args.task == "detect" else "segm mAP"

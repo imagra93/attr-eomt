@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import io
+import warnings
 
 import numpy as np
 import torch
@@ -51,6 +52,73 @@ def _encode_mask(mask: np.ndarray):
 
 
 
+def _attr_metric(spec) -> str:
+    """Key prefix of a head's metric (as the trainer logs it): accuracy, or mean absolute error in real units."""
+    return "aux_mae" if spec.regression else "aux_acc"
+
+
+def _check_attr_vocab(model, val_ds) -> list:
+    """The val dataset's head specs that the model also has, after checking both use the same categories (a different
+    contiguous-id order would score every prediction against the wrong label)."""
+    model_specs = {s.name: s for s in getattr(model, "aux_specs", [])}
+    specs = [s for s in val_ds.aux_specs if s.name in model_specs]
+    for s in specs:
+        if not s.regression and s.names != model_specs[s.name].names:
+            raise ValueError(
+                f"attribute {s.name!r}: the val categories {s.names} differ from the model's {model_specs[s.name].names}"
+            )
+    return specs
+
+
+def _adopt_flip_aware(model, val_ds) -> None:
+    """Mirrored views need each categorical head's flip mapping. A checkpoint saved before it was stored has none, so
+    take the val dataset's (the definition the trainer swapped by), with a warning."""
+    declared = {s.name: s for s in val_ds.aux_specs}
+    for s in getattr(model, "aux_specs", []):
+        d = declared.get(s.name)
+        if not s.regression and not s.flip_aware and d is not None and d.flip_aware:
+            pairs = {s.names[a]: s.names[b] for a, b in d.flip_aware.items() if a < b}
+            warnings.warn(f"attribute {s.name!r}: the checkpoint stores no flip_aware mapping (saved by an older version); "
+                          f"mirrored views swap {pairs} as the val dataset declares", stacklevel=3)
+            s.flip_aware = dict(d.flip_aware)
+
+
+def _count_attrs(res, rles, val_ds, img_id, specs, iou_gate, hits, tot) -> None:
+    """Add one image's attribute hits to ``hits`` / ``tot``: each GT instance is matched to the kept detection of its
+    class with the highest mask IoU (one to one, IoU >= ``iou_gate``) and every head is scored on it (accuracy; for a
+    regression head the absolute error in real units). Labels follow the trainer's (``_attr_label``: missing,
+    out-of-vocabulary and out-of-scope values are ignored)."""
+    from pycocotools import mask as mask_utils
+
+    from ..data.coco import _attr_label
+
+    gts = [a for a in val_ds.coco.imgToAnns.get(img_id, []) if not a.get("iscrowd")]
+    if not gts or not rles:
+        return
+    iou = np.asarray(mask_utils.iou(rles, [val_ds.coco.annToRLE(a) for a in gts], [0] * len(gts)))
+    gt_cls = np.array([val_ds.cat2contig[a["category_id"]] for a in gts])
+    iou[res["classes"].cpu().numpy()[:, None] != gt_cls[None, :]] = 0.0
+    taken_d: set[int] = set()
+    taken_g: set[int] = set()
+    for flat in np.argsort(-iou, axis=None):
+        d, g = divmod(int(flat), len(gts))
+        if iou[d, g] < iou_gate:
+            break
+        if d in taken_d or g in taken_g:
+            continue
+        taken_d.add(d)
+        taken_g.add(g)
+        for s in specs:
+            label = _attr_label(s, val_ds._attr_id_maps, gts[g].get("attributes") or {}, int(gt_cls[g]))
+            if s.regression:
+                if label == label:  # not NaN
+                    hits[s.name] += abs(float(res["aux_values"][s.name][d]) - label)
+                    tot[s.name] += 1
+            elif label != -100:
+                hits[s.name] += int(res["aux"][s.name]["ids"][d]) == label
+                tot[s.name] += 1
+
+
 def _cocoeval(coco_gt, results, img_ids, iou_type: str, verbose: bool) -> dict:
     from pycocotools.cocoeval import COCOeval
 
@@ -86,11 +154,20 @@ def evaluate(
     verbose: bool = True,
     augment: bool | dict = False,
     tiles: bool | int | dict = False,
+    attributes: bool = False,
+    attr_iou: float = 0.5,
 ) -> dict[str, float]:
     """Evaluate ``model`` on ``val_ds`` and return a COCO metrics dict.
 
     ``augment`` / ``tiles`` (see :mod:`eomt.tta`) evaluate with test-time augmentation / tiled inference: each image is
     predicted alone from its views, at ``val_ds.imgsz`` with its letterbox and normalisation.
+
+    ``attributes`` adds the secondary heads' metrics, scored on the same predictions as the mAP (so also under
+    ``augment`` / ``tiles``): ``aux_acc/<head>`` accuracy, or ``aux_mae/<head>`` mean absolute error in real units for a
+    regression head, over the GT instances matched to a same-class detection with mask IoU >= ``attr_iou``. That
+    population is the deployed one (kept detections), not the trainer's matched queries, so the numbers are close to the
+    ``val/aux_*`` columns of ``metrics.csv`` but not equal. ``val_ds`` needs the attribute definitions (it builds them
+    from its JSON) and the model the same heads and categories.
     """
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
@@ -112,6 +189,11 @@ def evaluate(
 
     segm_results: list[dict] = []
     bbox_results: list[dict] = []
+    attr_specs = _check_attr_vocab(model, val_ds) if attributes else []
+    if attr_specs and cfg is not None and cfg.flip:
+        _adopt_flip_aware(model, val_ds)
+    attr_hits = {s.name: 0.0 for s in attr_specs}
+    attr_tot = {s.name: 0 for s in attr_specs}
 
     for pixel_values, image_ids, sizes, metas in tqdm(
         loader, desc="val", unit="batch", leave=False, disable=not verbose
@@ -137,6 +219,8 @@ def evaluate(
                         "masks_queries_logits": mql[b : b + 1],
                         "class_queries_logits": cql[b : b + 1],
                         **({"quality_logits": out["quality_logits"][b : b + 1]} if "quality_logits" in out else {}),
+                        **({k: {n: v[b : b + 1] for n, v in out[k].items()}
+                            for k in ("aux_queries_logits", "aux_queries_values") if k in out} if attr_specs else {}),
                     },
                     conf_thres,
                     (orig_w, orig_h),
@@ -150,15 +234,17 @@ def evaluate(
 
         for img_id, res in zip(image_ids, batch_results):
             n = res["num_detections"]
+            rles = []
             for i in range(n):
                 cat_id = int(contig2cat[int(res["classes"][i])])
                 score = float(res["scores"][i])
                 mask_np = res["masks"][i].cpu().numpy()
+                rles.append(_encode_mask(mask_np))
                 segm_results.append(
                     {
                         "image_id": int(img_id),
                         "category_id": cat_id,
-                        "segmentation": _encode_mask(mask_np),
+                        "segmentation": rles[-1],
                         "score": score,
                     }
                 )
@@ -172,7 +258,10 @@ def evaluate(
                             "score": score,
                         }
                     )
+            if attr_specs:
+                _count_attrs(res, rles, val_ds, int(img_id), attr_specs, attr_iou, attr_hits, attr_tot)
 
+    attr_counts = sum_over_processes((attr_hits, attr_tot)) if attr_specs else None
     parts = gather((segm_results, bbox_results))
     if parts is None:  # several GPUs: the main process scores the results of all
         return {}
@@ -181,6 +270,10 @@ def evaluate(
     metrics = _cocoeval(val_ds.coco, segm_results, val_ds.ids, "segm", verbose)
     if also_bbox:
         metrics.update(_cocoeval(val_ds.coco, bbox_results, val_ds.ids, "bbox", verbose))
+    if attr_specs:
+        hits, tot = attr_counts
+        metrics.update({f"{_attr_metric(s)}/{s.name}": hits[s.name] / tot[s.name] if tot[s.name] else float("nan")
+                        for s in attr_specs})
     return metrics
 
 

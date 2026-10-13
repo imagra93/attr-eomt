@@ -263,9 +263,10 @@ ways, so `{"left": "right"}` is enough; unlisted categories stay as they are):
 
 Mosaic, mixup and copy-paste flip each source image independently, and the swap follows each
 instance. Only the horizontal flip is handled: keep `vflip_prob` and `rot90_prob` off for such an
-attribute. It is categorical only, training-only (not stored in the checkpoint), and inference
-is unchanged, so keep TTA's `flip` off for these models. The training banner lists each head's
-swapped pairs.
+attribute. It is categorical only. The mapping is stored in the checkpoint, and test-time augmentation with
+`flip` swaps it back in each mirrored view's prediction before the views are merged (a checkpoint saved before the
+mapping was stored takes it from the val JSON, with a warning). The training banner lists each head's swapped pairs. A
+regression head needs no mapping: its value must not change under a flip (see below).
 
 **Regression attributes.** `"type": "regression"` makes a head regress one real number per
 instance instead of choosing a category; categorical and regression heads mix freely in one
@@ -468,8 +469,9 @@ image at `imgsz` and zoomed to 1.5x `imgsz`) and `tiles=True` (overlapping tiles
 mask IoU >= 0.5 measured where both views can see, so an object cut by a tile border is put back together; the mask
 logits are averaged and the score is the mean over the views that could see the object (one that missed it votes 0).
 Each takes a dict of overrides; see
-[`eomt/tta.py`](eomt/tta.py). `augment={"flip": True}` also merges mirrored views: never with left / right classes or
-attributes, which a mirrored view predicts swapped.
+[`eomt/tta.py`](eomt/tta.py). `augment={"flip": True}` also merges mirrored views. Attributes marked `flip_aware` are swapped
+back in a mirrored view; left / right *primary classes* are not (a mirrored view predicts them swapped), so keep `flip` off
+for those, and for attributes that encode a side without being flip-aware.
 
 ```python
 m = EoMT("runs/train/eomt-l")
@@ -478,7 +480,8 @@ m.val(data="data.yaml", tiles=True)                                 # native til
 m.predict("images/", augment={"flip": True}, tiles=1024)            # 1x / 1.5x and mirrored; 1024 px tiles
 ```
 
-`scripts/val.py` and `scripts/predict.py` take `--augment` and `--tiles [SIZE]`. Each view is a forward pass: `augment`
+`scripts/val.py` and `scripts/predict.py` take `--augment` and `--tiles [SIZE]` (`scripts/val.py` also `--flip`; its arguments are
+in [Command-line scripts](#command-line-scripts-arguments-and-things-to-take-into-account)). Each view is a forward pass: `augment`
 costs ~3.5x one prediction (the 1.5x view has 2.25x the pixels); a 1280 x 960 photo at `imgsz` 644 makes 6 tiles + the
 whole image.
 
@@ -509,6 +512,77 @@ segm mAP mask-free against 0.114 masked), so a mask-free curve before the last s
 block finishes it, not the model. `best.pt` is deployed mask-free, so it is only chosen once every block's annealing is
 over (a run stopped earlier, e.g. with `stop_after_epochs`, has `last.pt` alone), and every checkpoint is saved mask-free.
 Training prints the windows in epochs when it starts.
+
+### Command-line scripts: arguments and things to take into account
+
+**`scripts/train.py`.** Every flag is a keyword of `train()`; a flag left out keeps `train()`'s default.
+
+| flag | `train()` keyword | what it does |
+|---|---|---|
+| `--data` | `data` | dataset YAML, or `coco` (auto-downloads) |
+| `--size` / `--task` | | model size `s` `b` `l`; head family `instance` (masks) or `detect` (boxes) |
+| `--epochs` | `epochs` | total epochs: the LR schedule and the masked-attention annealing span them |
+| `--batch` / `--nominal-batch` | `batch` / `nominal_batch` | micro-batch **per GPU** / global effective batch (16); the difference is gradient accumulation |
+| `--device` | `device` | `auto`, `cpu`, `cuda:N`, or `0,1` for several GPUs (one process each) |
+| `--weights` / `--resume` | `init_weights` / `resume` | warm-start a fresh run from a checkpoint / continue a run. **One of the two, not both** |
+| `--lr`, `--warmup HEAD,VIT` | `lr0`, `warmup_steps` | peak head LR (the encoder follows with layer-wise decay) and the two-stage warmup in optimizer steps |
+| `--ema-decay`, `--ema-tau` | `ema_decay`, `ema_tau` | EMA of the weights (what is validated and exported as `best.pt`) |
+| `--mask-free` | `mask_anneal_start/end` | no masked attention from step 0 (annealing windows 0 -> 0) |
+| `--aux-dropout` | `aux_head_dropout` | dropout in the attribute heads |
+| `--val-interval`, `--workers`, `--seed` | same | validate every N epochs (and after the last); data-loader workers per GPU; seed |
+| `--aug KEY=VALUE`, `--aug-preset` | `aug` | augmentation overrides (see [Augmentation](#augmentation)) |
+| `--fpn-scales`, `--box-head`, `--no-deep-supervision`, `--upscale-blocks`, `--iou-aware-cls`, `--quality-weight`, `--val-imgsz` | same | [architecture options](#architecture-options) |
+
+Things to take into account when training:
+
+- **Resume or warm start.** `--resume` continues a run exactly (epoch, optimizer, schedule, EMA, best metric) and re-reads the
+  architecture from the checkpoint: keep the other flags as they were, and the seed is ignored so the shuffle is not replayed.
+  `--weights` loads the weights only and starts a new run at epoch 0. Start from a `best.pt` (the EMA, saved mask-free); a
+  `last.pt` holds the live weights.
+- **A short fine-tune needs its own recipe.** Lower `--lr`, shorten `--warmup`, and lower `--ema-decay` (at 0.9999 the EMA
+  averages over ~10k steps and barely leaves its starting point in a few epochs). If the model is deployed mask-free, pass
+  `--mask-free`: with the default annealing a warm-started model is trained *masked* for the first sixth of the run, a regime it
+  no longer runs in.
+- **`best.pt` is only chosen mask-free.** With the default annealing that means from 5/6 of the schedule on; with `--mask-free`
+  every validation is eligible.
+- **Validated epochs only.** With `--val-interval N` the other epochs have empty validation cells in `metrics.csv`; the curves in
+  `metrics.png` join the validated points.
+- **Attribute heads follow the dataset's definitions.** Categories, `applies_to`, `flip_aware` and `crop` / zoom settings come
+  from the dataset (the training banner lists them). The flip mapping, scope and regression statistics are stored in the
+  checkpoint; `crop` and the zoom settings are training-only.
+
+**`scripts/val.py`.**
+
+| flag | what it does |
+|---|---|
+| `weights` | checkpoint `.pt` or a run / weights folder (`best.pt` preferred) |
+| `--data`, `--batch`, `--workers`, `--device` | dataset YAML (`coco`), batch, data-loader workers, device |
+| `--imgsz` | evaluation input size (default: the trained one; the positional embeddings are interpolated) |
+| `--augment` | add the image at 1.5x `imgsz` |
+| `--tiles [SIZE]` | overlapping tiles (default `imgsz` px, native resolution) plus the whole image |
+| `--flip` | also run every view mirrored (alone: `--augment` with mirrored views) |
+| `--no-attributes` | mAP only |
+| `--ema`, `--mask annealed\|free` | validate the EMA weights of a `last.pt` (see below) |
+
+Things to take into account when validating:
+
+- **What is reported.** `segm/*` and `bbox/*` mAP and, for a model with secondary heads, `aux_acc/<head>` (accuracy) and
+  `aux_mae/<head>` (regression heads, mean absolute error in real units). They are scored on the same predictions as the mAP, so
+  they also work with `--augment`, `--tiles` and `--flip`.
+- **The attribute population is the deployed one.** Each GT instance is matched to the kept detection of its class with the
+  highest mask IoU (one to one, IoU >= 0.5). The trainer's `val/aux_*` columns score matched *queries* instead, so the two differ
+  slightly: compare TTA against plain within the script's numbers, not against `metrics.csv`. A regression head's MAE is
+  dominated by its large values, so also look at a relative error before concluding.
+- **Regime.** A model that is still annealing is only meaningful with its masks: `--ema --mask annealed` reproduces the trainer's
+  validation of a `last.pt` (EMA weights, the masked-attention probabilities of that epoch, read from the run's `args.yaml`),
+  `--ema --mask free` is the deployed regime, and `best.pt` is already the EMA, mask-free.
+- **TTA is not free and not uniform.** It costs one forward pass per view and mostly helps small objects and strict-IoU mAP; the
+  classification heads often do not move. A regression head's prediction is *averaged over views at different zoom*, so a value
+  that depends on the object's apparent size can drift under TTA: check it against the plain run before relying on it.
+- **`--flip` and the heads.** Heads the checkpoint stores as flip-aware are swapped back in mirrored views; an older checkpoint
+  takes the mapping from the dataset's JSON, with a warning. Left / right *primary classes* are not handled: keep `--flip` off for
+  them. The val categories of every head must match the model's, or the run stops instead of scoring against the wrong ids.
+- **One process.** `scripts/val.py` runs on one device; the trainer's own validation uses all the GPUs.
 
 ### Architecture options
 

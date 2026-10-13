@@ -286,7 +286,8 @@ class EoMT:
     # -------------------------------------------------------------------- val
     def val(self, data: str | Path = "coco", *, batch: int = 4, workers: int = 4,
             conf_thres: float = 0.0, max_det: int = 100, letterbox: bool | None = None,
-            imgsz: int | None = None, **kw) -> dict:
+            imgsz: int | None = None, augment: bool | dict = False, tiles: bool | int | dict = False,
+            attributes: bool = True, **kw) -> dict:
         """Evaluate on a dataset's val split, returning COCO mAP metrics.
 
         Segmentation models report ``segm/*`` (+ ``bbox/*``); detection
@@ -294,6 +295,11 @@ class EoMT:
         evaluation image size (defaults to the trained size); the model interpolates
         its positional embeddings to the new resolution, so any multiple of the patch
         size works.
+
+        ``augment`` / ``tiles`` evaluate with test-time augmentation / tiled inference (instance family; see
+        :mod:`eomt.tta`; a head marked ``flip_aware`` is swapped back in mirrored views). For a segmentation model with
+        secondary heads, ``attributes`` (default on) adds ``aux_acc/<head>`` (accuracy) and ``aux_mae/<head>`` (regression
+        heads, real units), scored on the same predictions as the mAP; see :func:`eomt.engine.validate.evaluate`.
         """
         cfg = _resolve_data(data)
         if not (cfg["val_images"] and cfg["val_json"]):
@@ -304,12 +310,14 @@ class EoMT:
         lb = letterbox if letterbox is not None else bool(getattr(model, "preprocess_letterbox", False))
         val_ds = CocoValImages(
             cfg["val_images"], cfg["val_json"], imgsz=_resolve_imgsz(imgsz, model), letterbox=lb,
-            mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None),
+            mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None), attributes=attributes,
         )
-        eval_fn = _evaluate_detection if getattr(model, "family", "instance") == "detect" else _evaluate
+        detect = getattr(model, "family", "instance") == "detect"
+        eval_fn = _evaluate_detection if detect else _evaluate
         return eval_fn(
             model, val_ds, device=dev, batch_size=batch, num_workers=workers,
-            conf_thres=conf_thres, max_det=max_det, **kw,
+            conf_thres=conf_thres, max_det=max_det, augment=augment, tiles=tiles,
+            **({} if detect else {"attributes": attributes}), **kw,
         )
 
     # -------------------------------------------------------------- compress

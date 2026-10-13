@@ -208,3 +208,81 @@ def test_evaluate_with_tta_and_tiles_scores_the_ground_truth(tmp_path):
         m = evaluate(_Blobs(), ds, device="cpu", batch_size=2, num_workers=0, verbose=False, augment=augment,
                      tiles=tiles)
         assert m["segm/mAP50"] > 0.99, (augment, tiles, m)
+
+
+class _Sided(_Blobs):
+    """_Blobs plus a "side" head that says "left" (0) when the object is in the left half of its input, else "right"."""
+
+    def __init__(self, flip_aware):
+        super().__init__()
+        self.aux_specs = [AuxHeadSpec("side", 2, {0: "left", 1: "right"}, flip_aware=flip_aware)]
+
+    def forward(self, x):
+        out = super().forward(x)
+        n = out["masks_queries_logits"].shape[-1]
+        left = (out["masks_queries_logits"][:, 0, :, : n // 2] > 0).sum((1, 2)) > (out["masks_queries_logits"][:, 0, :, n // 2 :] > 0).sum((1, 2))
+        logits = torch.zeros(x.shape[0], 3, 2)
+        logits[left, :, 0], logits[~left, :, 1] = 8.0, 8.0
+        return {**out, "aux_queries_logits": {"side": logits}}
+
+
+def test_flip_tta_swaps_a_flip_aware_head_back_and_the_mapping_survives_the_checkpoint():
+    from eomt.config import aux_specs_from_meta, aux_specs_to_meta
+
+    img = _image(140, 140, 14, 35, 56, 91)  # on the left: the plain view says "left", the mirrored view "right"
+    aware = predict_views(_Sided({0: 1, 1: 0}), img, TTAConfig(flip=True), imgsz=IMGSZ, conf_thres=0.3)
+    naive = predict_views(_Sided(None), img, TTAConfig(flip=True), imgsz=IMGSZ, conf_thres=0.3)
+    assert aware["aux"]["side"]["ids"].tolist() == [0] and float(aware["aux"]["side"]["probs"][0, 0]) > 0.99
+    assert float(naive["aux"]["side"]["probs"][0, 0]) == pytest.approx(0.5, abs=0.01)  # the views cancel out
+    spec = _Sided({0: 1, 1: 0}).aux_specs[0]
+    assert aux_specs_from_meta(aux_specs_to_meta([spec]))[0].flip_aware == {0: 1, 1: 0}
+    assert aux_specs_from_meta(aux_specs_to_meta([_Sided(None).aux_specs[0]]))[0].flip_aware is None  # old checkpoints
+
+
+
+def test_evaluate_scores_the_attribute_heads_plain_and_under_tta(tmp_path):
+    from eomt.data import CocoValImages
+    from eomt.engine.validate import evaluate
+
+    class Attr(_Sided):
+        """_Sided plus a "size" regression head that always says 100."""
+
+        def __init__(self, flip_aware):
+            super().__init__(flip_aware)
+            self.aux_specs.append(AuxHeadSpec("size", 1, regression=True))
+
+        def forward(self, x):
+            out = super().forward(x)
+            return {**out, "aux_queries_values": {"size": torch.full(out["aux_queries_logits"]["side"].shape[:2], 100.0)}}
+
+    rects = [(70, 42, 315, 98), (28, 14, 112, 126)]  # both mostly in the left half: the model says "left" for both
+    images, anns = [], []
+    for i, (x0, y0, x1, y1) in enumerate(rects):
+        Image.fromarray(_image(140, 420, x0, y0, x1, y1)).save(tmp_path / f"{i}.png")
+        images.append({"id": i + 1, "file_name": f"{i}.png", "width": 420, "height": 140})
+        anns.append({"id": i + 1, "image_id": i + 1, "category_id": 1, "iscrowd": 0, "area": (x1 - x0) * (y1 - y0),
+                     "bbox": [x0, y0, x1 - x0, y1 - y0], "segmentation": [[x0, y0, x1, y0, x1, y1, x0, y1]],
+                     "attributes": {"side": i, "size": 100.0 + 50.0 * i}})  # GT: left / right; 100 / 150
+    anns[1]["attributes"]["side"] = 1
+    cats = [{"id": 0, "name": "left"}, {"id": 1, "name": "right"}]
+    jf = tmp_path / "val.json"
+    jf.write_text(json.dumps({
+        "images": images, "annotations": anns, "categories": [{"id": 1, "name": "blob"}],
+        "attributes": [{"name": "side", "categories": cats, "flip_aware": {"left": "right"}},
+                       {"name": "size", "type": "regression"}],
+    }))
+    ds = CocoValImages(tmp_path, jf, imgsz=IMGSZ)
+    for augment in (False, True, {"flip": True}):
+        m = evaluate(Attr({0: 1, 1: 0}), ds, device="cpu", batch_size=2, num_workers=0, verbose=False,
+                     augment=augment, attributes=True)
+        assert m["aux_acc/side"] == pytest.approx(0.5) and m["aux_mae/size"] == pytest.approx(25.0), (augment, m)
+        assert m["segm/mAP50"] > 0.99
+    old = Attr(None)  # a checkpoint saved before the mapping was stored: mirrored views take the val JSON's
+    with pytest.warns(UserWarning, match="stores no flip_aware"):
+        evaluate(old, ds, device="cpu", batch_size=2, num_workers=0, verbose=False, augment={"flip": True}, attributes=True)
+    assert old.aux_specs[0].flip_aware == {0: 1, 1: 0}
+    assert "aux_acc/side" not in evaluate(Attr(None), ds, device="cpu", batch_size=2, num_workers=0, verbose=False)
+    bad = Attr(None)
+    bad.aux_specs[0].names = {0: "right", 1: "left"}  # the model's ids mean the opposite of the val JSON's
+    with pytest.raises(ValueError, match="differ from the model's"):
+        evaluate(bad, ds, device="cpu", batch_size=2, num_workers=0, verbose=False, attributes=True)
