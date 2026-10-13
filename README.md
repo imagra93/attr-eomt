@@ -283,7 +283,8 @@ dataset. `log` (regress `log1p` of the value, for heavy-tailed positives such as
 
 A missing, non-numeric or out-of-range value is ignored. The head is trained on the value
 standardized by the train split's mean and std (stored in the checkpoint), validated as the
-mean absolute error in real units (`val/aux_mae/<head>`), and predicted in real units
+mean absolute error in real units (`val/aux_mae/<head>`; `metrics.png` gives each regression
+head its own MAE panel, `aux_per_class.png` its MAE per primary class), and predicted in real units
 (`aux_values`). The value must not change under the augmentations (scale, crop, flip,
 rotation): a cost or a score is fine, a pixel area or an angle is not. Tracking votes on the
 categorical heads only, and re-identification cannot gate on a regression head.
@@ -302,10 +303,10 @@ the full value there:
 {"name": "part_length", "type": "regression", "crop": "ignore", "min_visible": 0.95}
 ```
 
-How the fraction is measured: for masks, the share of the instance's mask mass that lands in
-the crop window, corrected for the area change of a rotation / shear / perspective warp (a warp
-alone is not a cut); copy-paste occlusion counts as hidden, and instances brought in by mosaic,
-mixup or copy-paste are measured against their own crops. For boxes (detect family), the ratio of
+How the fraction is measured: for masks, the share of the instance's mask mass whose source pixels
+the crop (and rotation / shear / perspective warp) lands inside the window: exact, so an instance
+the window does not cut keeps exactly 1 (a warp alone is not a cut); copy-paste occlusion counts as
+hidden, and instances brought in by mosaic, mixup or copy-paste are measured against their own crops. For boxes (detect family), the ratio of
 the box areas: exact for a crop, approximate under rotation. Each call of the built-in
 augmentation exposes it as `TrainAugment.last_info["visible"]`.
 
@@ -566,7 +567,7 @@ mass-preserving), so thin objects are not shredded into dots by nearest-neighbou
 | geometry | `flip_prob` 0.5 · `vflip_prob` 0 · `rot90_prob` 0 · LSJ `min_scale`/`max_scale` 0.1–2.0 · `rotate_prob` 0.3 (±10°) · `shear_prob` 0.2 (±5°) · `perspective_prob` 0.15 |
 | optics / sensor | colour jitter 1.0 · `gamma_prob` 0.3 · `grayscale_prob` 0.05 · `blur_prob` 0.2 · `noise_prob` 0.2 · `jpeg_prob` 0.3 · `glare_prob` 0.15 · `erasing_prob` 0.2 |
 | multi-image (instance family) | `mosaic_prob` 0 · `mixup_prob` 0 · `copy_paste_prob` 0 |
-| crop | `instance_crop_prob` 0 (instance-aware crop) · `instance_crop_empty_prob` 0 |
+| crop | `instance_crop_prob` 0 (instance-aware crop) · `instance_crop_empty_prob` 0 · `zoom_prob` 0 (close-ups, `zoom_scale` 4–5x) |
 | masks | `mask_resize="area"` (or `"nearest"`) |
 
 Override per run, per dataset, or from the CLI — precedence is explicit keywords (`flip_prob`, `min_scale`,
@@ -601,6 +602,12 @@ Things worth knowing:
   scale within ~[0.4, 1.0] (`min_scale = 0.4·long_side/imgsz`, `max_scale = 1.0·long_side/imgsz`). The instance-aware
   crop pays off when the crop is much smaller than the image (high zoom, small `imgsz`), and
   `instance_crop_rarity_attr` makes rare attribute values the crop's focus more often.
+- **Close-ups.** `zoom_prob` makes an occasional sample a close-up: scaled by `s ~ U(zoom_scale)` (default 4–5x
+  the whole-image view, past the photo's own resolution) instead of the LSJ range, with the window on one instance
+  (whole when it fits, else a window inside it). `zoom_attr` restricts it to instances with a value of that
+  attribute and to the samples that have one, e.g. `{"zoom_prob": 0.1, "zoom_attr": "area"}` so a crop-scaled area
+  head also learns that a part filling the frame keeps its real area, and that a cut part keeps the share in view.
+  It resizes the whole photo first (~1.5x the time of a normal sample at 5x), so keep it occasional.
 - **Multi-image ops** (`mosaic`, `mixup`, `copy_paste`) add instances from other samples and are *off*: they splice or
   blend long thin structures, so try them deliberately and look at the result.
 - **Negatives.** Images with no annotations are dropped from the train set by default. `train(keep_empty=True)` keeps

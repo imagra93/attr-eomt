@@ -50,11 +50,11 @@ _STD = IMAGENET_STD.tolist()
 # border is ~0 after normalization. Masks always pad with 0 (background).
 _PAD_RGB = [int(round(m * 255)) for m in _MEAN]
 
-_RANGE_FIELDS = ("gamma_range", "blur_sigma", "noise_std", "jpeg_quality", "glare_strength", "erasing_scale")
+_RANGE_FIELDS = ("gamma_range", "blur_sigma", "noise_std", "jpeg_quality", "glare_strength", "erasing_scale", "zoom_scale")
 _PROB_FIELDS = (
     "flip_prob", "vflip_prob", "rot90_prob", "rotate_prob", "shear_prob", "perspective_prob", "color_jitter_prob",
     "gamma_prob", "grayscale_prob", "blur_prob", "noise_prob", "jpeg_prob", "glare_prob", "erasing_prob",
-    "mosaic_prob", "mixup_prob", "copy_paste_prob", "instance_crop_prob", "instance_crop_empty_prob",
+    "mosaic_prob", "mixup_prob", "copy_paste_prob", "instance_crop_prob", "instance_crop_empty_prob", "zoom_prob",
 )
 
 
@@ -113,6 +113,11 @@ class AugConfig:
       ``instance_crop_rarity_power`` weights the focus choice by ``1/freq**power`` of the instance's class or of the
       attribute named by ``instance_crop_rarity_attr`` (e.g. ``"material"``); ``instance_crop_visibility_px`` raises
       the scale so the focus instance's band is at least this wide at the model input (``0`` = off).
+    * ``zoom_prob`` / ``zoom_scale`` / ``zoom_attr`` — a close-up now and then: with probability ``zoom_prob`` a sample
+      is scaled by ``s ~ U(zoom_scale)`` instead of the LSJ range (``(4, 5)``: 4-5x the whole-image view, past the
+      photo's own resolution) and the window is placed on a focus instance, kept whole when it fits, else a window
+      inside it. ``zoom_attr`` restricts the focus to instances with a value of that attribute (e.g. ``"area"``) and
+      the zoom to samples that have one. A crop-aware value follows the kept share as in any crop.
 
     **Masks**
 
@@ -165,6 +170,9 @@ class AugConfig:
     instance_crop_rarity_power: float = 0.5
     instance_crop_rarity_attr: str | None = None
     instance_crop_visibility_px: float = 0.0
+    zoom_prob: float = 0.0
+    zoom_scale: tuple[float, float] = (4.0, 5.0)
+    zoom_attr: str | None = None
     # masks
     mask_resize: str = "area"
     min_mask_mass: float = 1.0
@@ -184,6 +192,8 @@ class AugConfig:
                 raise ValueError(f"AugConfig.{name} must be a probability in [0, 1], got {p}")
         if not 0 < self.min_scale <= self.max_scale:
             raise ValueError(f"need 0 < min_scale <= max_scale, got {self.min_scale}, {self.max_scale}")
+        if self.zoom_scale[0] <= 0:
+            raise ValueError(f"AugConfig.zoom_scale must be positive, got {self.zoom_scale}")
         if self.mask_resize not in ("area", "nearest"):
             raise ValueError(f"AugConfig.mask_resize must be 'area' or 'nearest', got {self.mask_resize!r}")
         if self.gamma_range[0] <= 0:
@@ -506,7 +516,7 @@ class TrainAugment:
         if multi == "mosaic":
             img_f, tgt, labels_o, attrs_o, signals = self._mosaic(img, tgt, labels, attrs, w, sampler)
         else:
-            img_f, tgt, info = self._geometry(img, tgt, (S, S), w, is_boxes)
+            img_f, tgt, info = self._geometry(img, tgt, (S, S), w, is_boxes, zoom_ok=self._zoom_ok(tgt, attrs, is_boxes))
             self.last_info.update(info)
             signals = {k: info[k] for k in _SIGNALS}
             if multi == "copy_paste":
@@ -589,8 +599,22 @@ class TrainAugment:
         edge = float(F.max_pool2d(m, 3, 1, 1).sum() - (-F.max_pool2d(-m, 3, 1, 1)).sum())  # ~ 2 x perimeter
         return 4.0 * area / max(edge, 1.0)
 
-    def _geometry(self, img, tgt, out_hw, weights, is_boxes, *, with_focus=True):
-        """Flip/turn, source optics, LSJ, window choice, rotate/shear/perspective + crop. Returns (img [0,1], tgt, info)."""
+    def _zoom_ok(self, tgt, attrs, is_boxes):
+        """Per instance, may the close-up focus on it (``zoom_ok``); None when the zoom is off or has no candidate."""
+        c = self.cfg
+        if c.zoom_prob <= 0 or is_boxes or tgt.shape[0] == 0:
+            return None
+        if c.zoom_attr is None:
+            return torch.ones(tgt.shape[0], dtype=torch.bool)
+        v = (attrs or {}).get(c.zoom_attr)
+        if v is None:
+            return None
+        ok = ~torch.isnan(v) if v.is_floating_point() else v >= 0
+        return ok if bool(ok.any()) else None
+
+    def _geometry(self, img, tgt, out_hw, weights, is_boxes, *, with_focus=True, zoom_ok=None):
+        """Flip/turn, source optics, LSJ (or a close-up), window choice, rotate/shear/perspective + crop. Returns
+        (img [0,1], tgt, info)."""
         c = self.cfg
         S = self.imgsz
         Ho, Wo = out_hw
@@ -606,15 +630,19 @@ class TrainAugment:
         if _coin(c.jpeg_prob):
             img = _jpeg_u8(img, int(round(_uniform(c.jpeg_quality))))
 
-        # focus instance (instance-aware crop) and the scale it implies
-        focus = None
-        if with_focus and n > 0 and (c.instance_crop_prob > 0 or c.instance_crop_empty_prob > 0):
+        # focus instance (instance-aware crop, or a close-up of one) and the scale it implies
+        focus, zoom = None, False
+        if with_focus and zoom_ok is not None and _coin(c.zoom_prob):
+            ok = zoom_ok.numpy().astype(np.float64)
+            focus = self._pick_focus(n, ok * weights if weights is not None and len(weights) == n else ok)
+            zoom = bool(ok[focus])  # False only when the weights of every candidate are 0 (then it is a plain focus)
+        elif with_focus and n > 0 and (c.instance_crop_prob > 0 or c.instance_crop_empty_prob > 0):
             u = _rand()
             if u < c.instance_crop_prob:
                 focus = self._pick_focus(n, weights)
-        s = _uniform((c.min_scale, c.max_scale))
+        s = _uniform(c.zoom_scale) if zoom else _uniform((c.min_scale, c.max_scale))
         fit = min(S / H, S / W)
-        if focus is not None and c.instance_crop_visibility_px > 0 and not is_boxes:
+        if focus is not None and not zoom and c.instance_crop_visibility_px > 0 and not is_boxes:
             w0 = self._band_width(tgt[focus])
             if w0 > 0:
                 s = min(max(s, c.instance_crop_visibility_px / (w0 * fit)), c.max_scale * 1.5)
@@ -632,7 +660,7 @@ class TrainAugment:
                 ext = (Ws // 2, Hs // 2, Ws // 2 + 1, Hs // 2 + 1)
             x0 = _origin_axis(ext[0], ext[2], Ws, Wo)
             y0 = _origin_axis(ext[1], ext[3], Hs, Ho)
-            mode = "focus"
+            mode = "zoom" if zoom else "focus"
         elif n > 0 and c.instance_crop_empty_prob > 0 and _coin(c.instance_crop_empty_prob):
             found = self._empty_window(tgt, is_boxes, (Hs, Ws), (Ho, Wo))
             if found is not None:
@@ -770,10 +798,13 @@ class TrainAugment:
         if tgt.shape[0] == 0:
             return out, torch.zeros(0, Ho, Wo), torch.zeros(0)
         m = F.grid_sample(tgt[None], grid, mode="bilinear", padding_mode="zeros", align_corners=False)[0].clamp_(0.0, 1.0)
-        # source pixels per output pixel (|det| of the inverse homography's Jacobian: det(inv) / w**3), so the warped
-        # mass is counted in the source frame's units
-        jac = torch.from_numpy((abs(np.linalg.det(inv)) / np.abs(src[2]) ** 3).reshape(Ho, Wo)).to(torch.float32)
-        return out, m, _fraction(_mass(m * jac), _mass(tgt))
+        # the share of each instance's source mass whose pixel centre the warp lands inside the output window: exact, so
+        # an instance the window does not cut keeps exactly 1 (the resampled mass is off by a few per cent)
+        ys, xs = torch.nonzero(tgt.amax(0) > 0, as_tuple=True)
+        p = _apply_h(fwd, np.stack([xs.numpy() + 0.5, ys.numpy() + 0.5], 1).astype(np.float64))
+        inside = torch.zeros(Hs, Ws, dtype=tgt.dtype)
+        inside[ys, xs] = torch.from_numpy((p[:, 0] >= 0) & (p[:, 0] < Wo) & (p[:, 1] >= 0) & (p[:, 1] < Ho)).to(tgt.dtype)
+        return out, m, _fraction(_mass(tgt * inside), _mass(tgt))
 
     # ------------------------------------------------------------------------------------------------ image-only finish
 

@@ -1272,10 +1272,10 @@ def train(
                         for n, buckets in aux_pc.items()
                     }
                 if epoch_aux_pc is not None:
-                    try:  # accuracy bars: the categorical heads
+                    try:  # accuracy bars for the categorical heads, MAE bars for the regression ones
                         plot_aux_per_class(
-                            {n: b for n, b in epoch_aux_pc.items() if metric_of[n] == "aux_acc"}, names,
-                            run_dir / "aux_per_class.png",
+                            epoch_aux_pc, names, run_dir / "aux_per_class.png",
+                            regression={n for n in epoch_aux_pc if metric_of[n] == "aux_mae"},
                         )
                     except Exception as e:  # noqa: BLE001
                         print(f"[plot] aux_per_class.png failed: {e}")

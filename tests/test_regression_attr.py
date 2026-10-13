@@ -109,6 +109,10 @@ def test_augmentation_measures_the_fraction_of_each_instance_kept_in_view():
     for tgt, is_boxes in ((m, False), (boxes, True)):
         vis = tf._crop(img, tgt, is_boxes, (240, 320), (120, 160), (0, 0), fwd)[2]
         assert torch.allclose(vis, torch.ones(2), atol=0.03), vis
+    assert torch.equal(tf._crop(img, m, False, (240, 320), (120, 160), (0, 0), fwd)[2], torch.ones(2))  # masks: exact
+    # the same warp into the left half of that window (x < 80): the green one (x ~45-115) is cut, the red one stays whole
+    vis = tf._crop(img, m, False, (240, 320), (120, 80), (0, 0), fwd)[2]
+    assert 0.0 < vis[0] < 1.0 and vis[1] == 1.0, vis
 
 
 def test_crop_aware_values_follow_the_augmentation(tmp_path):
@@ -140,3 +144,93 @@ def test_crop_aware_values_follow_the_augmentation(tmp_path):
     jf.write_text(json.dumps(coco))
     with pytest.raises(ValueError, match="regression attributes only"):
         CocoInstanceSeg(img_dir, jf, imgsz=112)
+
+
+
+def test_zoom_closes_in_on_an_instance_with_the_attribute_and_its_area_follows_the_kept_share(tmp_path):
+    """zoom_prob / zoom_scale / zoom_attr: a 4x close-up placed on an instance that has an area, never on a sample
+    without one; the area of every instance (cut or whole) is its full area x the share of its mask mass kept in view,
+    checked against the output masks themselves (mass / (source mass x scale^2), exact for a crop with no warp)."""
+    img_dir, jf = _with_cost(tmp_path)
+    coco = json.loads(jf.read_text())
+    coco["attributes"].append({"name": "area", "type": "regression", "log": True, "crop": "scale"})
+    for a in coco["annotations"]:
+        if a["attributes"]["kind"] == 1:  # only the lines have an area
+            a["attributes"]["area"] = 500.0
+    lines_of_image0 = [a for a in coco["annotations"] if a["image_id"] == coco["images"][0]["id"] and a["attributes"]["kind"] == 1]
+    assert lines_of_image0
+    jf.write_text(json.dumps(coco))
+    aug = {"zoom_prob": 1.0, "zoom_scale": (4.0, 4.0), "zoom_attr": "area", "flip_prob": 0.0, "rotate_prob": 0.0,
+           "shear_prob": 0.0, "perspective_prob": 0.0, "min_mask_mass": 0.0}
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=112, aug=aug)
+    kind = next(s for s in ds.aux_specs if s.name == "kind")
+    torch.manual_seed(0)
+    cut = False
+    for i in range(len(ds)):
+        _, src_masks, _, src_attrs, _ = ds._load_raw(i)
+        _, masks, _, attrs = ds[i]
+        info = ds.transform.last_info
+        assert info["mode"] == "zoom" and info["scale"] == 4.0
+        assert not torch.isnan(src_attrs["area"][info["focus"]])  # the close-up is on an instance with an area
+        assert int(src_attrs["kind"][info["focus"]]) == 1 and kind.names[1] == "line"
+        kept = masks.flatten(1).sum(1) / (src_masks.flatten(1).float().sum(1) * info["eff_scale"] ** 2)
+        assert torch.allclose(info["visible"], kept.clamp(max=1.0), atol=0.02), (info["visible"], kept)
+        has = ~torch.isnan(src_attrs["area"])
+        assert torch.allclose(attrs["area"][has], 500.0 * info["visible"][has])
+        cut |= bool(((info["visible"] > 0.05) & (info["visible"] < 0.95) & has).any())
+    assert cut  # some close-ups cut the part: the area followed the share kept
+    for a in coco["annotations"]:  # no instance with an area: never a close-up
+        a["attributes"].pop("area", None)
+    jf.write_text(json.dumps(coco))
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=112, aug=aug)
+    ds[0]
+    assert ds.transform.last_info["mode"] != "zoom"
+
+
+def test_log_regressed_area_follows_the_crop_in_real_units_before_the_log(tmp_path):
+    """A crop-scaled log1p head (an area): the value is scaled by the kept fraction in real units, then log1p'd."""
+    img_dir, jf = _with_cost(tmp_path)
+    coco = json.loads(jf.read_text())
+    coco["attributes"].append({"name": "area", "type": "regression", "log": True, "crop": "scale"})
+    for i, a in enumerate(coco["annotations"]):
+        a["attributes"]["area"] = 400.0 * (1 + i % 3)  # spread, so the standardization is not trivial
+    jf.write_text(json.dumps(coco))
+    ds = CocoInstanceSeg(img_dir, jf, imgsz=112, aug={"min_scale": 0.5, "max_scale": 2.0, "flip_prob": 0.0, "min_mask_mass": 0.0})
+    spec = next(s for s in ds.aux_specs if s.name == "area")
+    torch.manual_seed(0)
+    cut = False
+    for _ in range(20):
+        whole = torch.tensor([400.0 * (1 + i % 3) for i in range(2)])  # image 0: annotations 0 and 1
+        a = ds[0][3]["area"]
+        vis = ds.transform.last_info["visible"]
+        assert torch.allclose(a, whole * vis)  # the proportion in real units ...
+        z = spec.encode(a.double())
+        assert torch.allclose(z, (torch.log1p(whole.double() * vis.double()) - spec.mean) / spec.std, atol=1e-5)  # ... then the log
+        cut |= bool((vis < 1).any())
+    assert cut
+
+
+def test_metric_plots_show_each_regression_head_as_its_mae(tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+
+    from eomt.plotting import plot_aux_per_class, plot_metrics_csv
+
+    figs = []
+    monkeypatch.setattr(plt, "close", figs.append)  # keep the figures to look at their panels
+    heads = ["kind", "cost", "area"]
+    cols = ["epoch", "train/loss", "val/segm/mAP"] + [f"{s}/{'aux_acc' if h == 'kind' else 'aux_mae'}/{h}"
+                                                      for h in heads for s in ("train", "val")]
+    (tmp_path / "metrics.csv").write_text(",".join(cols) + "\n0,2.0,0.1,0.5,0.4,90,120,30,35\n1,1.5,0.2,0.6,0.5,60,80,20,25\n")
+    plot_metrics_csv(tmp_path / "metrics.csv", tmp_path / "metrics.png")
+    panels = {ax.get_title(): ax for ax in figs[0].axes if ax.axison}
+    assert {"Loss", "Aux head accuracy", "Aux 'cost' mean absolute error", "Aux 'area' mean absolute error"} <= set(panels)
+    assert [ln.get_label() for ln in panels["Aux head accuracy"].get_lines()] == ["tr kind", "va kind"]
+    assert list(panels["Aux 'cost' mean absolute error"].get_lines()[1].get_ydata()) == [120.0, 80.0]
+    assert (tmp_path / "metrics.png").stat().st_size > 0
+
+    plot_aux_per_class({"kind": {0: (3, 4)}, "cost": {0: (50.0, 2), 1: (10.0, 1)}}, {0: "a", 1: "b"},
+                       tmp_path / "aux_per_class.png", regression={"cost"})
+    acc, mae = figs[1].axes
+    assert acc.get_title() == "aux 'kind' accuracy by primary class" and acc.get_ylim()[1] == 1.08
+    assert mae.get_title() == "aux 'cost' mean absolute error by primary class"
+    assert [b.get_height() for b in mae.patches] == [25.0, 10.0] and mae.get_ylim()[1] > 25.0
