@@ -56,7 +56,8 @@ def _plot_series(ax, x, cols, keys_labels, title, ylabel):
     plotted = False
     for key, label in keys_labels:
         if key in cols and _has_data(cols[key]):
-            ax.plot(x, cols[key], marker=".", ms=3, label=label)
+            pts = [(xi, yi) for xi, yi in zip(x, cols[key]) if not math.isnan(yi)]  # val every N epochs: join the points
+            ax.plot(*zip(*pts), marker=".", ms=3, label=label)
             plotted = True
     ax.set_title(title)
     ax.set_xlabel("epoch")
