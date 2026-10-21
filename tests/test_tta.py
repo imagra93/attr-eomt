@@ -172,6 +172,15 @@ def test_flip_tta_merges_the_two_views_and_scores_their_agreement():
     assert _iou(mean["masks"][0], 14, 35, 56, 91) > 0.95
 
 
+def test_device_preprocessed_views_find_the_same_instances():
+    img = _image(280, 420, 70, 42, 315, 98)
+    cfg = TTAConfig(flip=True, scales=(1.0, 1.5), tiles=True, tile_size=140)
+    cpu = predict_views(_Blobs(), img, cfg, imgsz=IMGSZ, conf_thres=0.3)
+    dev = predict_views(_Blobs(), img, cfg, imgsz=IMGSZ, conf_thres=0.3, device_preprocess=True)
+    assert dev["num_detections"] == cpu["num_detections"] == 1
+    assert torch.allclose(dev["scores"], cpu["scores"]) and _same(dev["masks"], cpu["masks"])
+
+
 def test_predict_image_with_tta_keeps_the_result_contract():
     from eomt.engine.predict import predict_image
 

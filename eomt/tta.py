@@ -38,6 +38,7 @@ repair / replace rules). Attribute probabilities and embeddings are score-weight
 from __future__ import annotations
 
 import contextlib
+import functools
 import itertools
 import math
 from dataclasses import dataclass
@@ -47,7 +48,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 
 from .postprocess import _masks_to_original, aux_result, aux_value_result, boxes_from_masks, query_scores
-from .preprocess import preprocess_numpy
+from .preprocess import preprocess_numpy, preprocess_torch
 
 _AUGMENT_KEYS = {"flip", "scales"}
 _TILES_KEYS = {"size", "overlap", "full"}
@@ -288,12 +289,16 @@ def predict_views(
     amp_dtype: torch.dtype | None = None,
     aux_scopes: dict | None = None,
     embed: bool = False,
+    device_preprocess: bool = False,
 ) -> dict:
     """Instances of the RGB ``image`` ``(H, W, 3)`` uint8, merged over the views of ``cfg``.
 
     Returns the :func:`~eomt.postprocess.postprocess_instance` dict (``boxes`` / ``scores`` / ``classes`` / ``masks``
     and, with attribute heads, ``aux``), plus ``embed`` ``(N, hidden)`` with ``embed=True``. There is no ``query_idx``:
     a merged instance comes from several queries.
+
+    With ``device_preprocess=True`` the views are preprocessed on the model's device
+    (:func:`~eomt.preprocess.preprocess_torch`) instead of with PIL on the CPU; the inputs match within one grey level.
     """
     if getattr(model, "family", "instance") != "instance":
         raise NotImplementedError("TTA / tiled inference supports the instance family only.")
@@ -311,15 +316,14 @@ def predict_views(
     view_cells = [_grid_cells(v.rect, g, hg, wg) for v in views]
 
     flip_perms = {s.name: s.flip_perm() for s in getattr(model, "aux_specs", []) if s.flip_perm() is not None}
+    prep = functools.partial(preprocess_torch, device=dev) if device_preprocess else preprocess_numpy
     found: list[dict] = []
     for size in dict.fromkeys(v.size for v in views):
         idx = [i for i, v in enumerate(views) if v.size == size]
         for start in range(0, len(idx), cfg.batch):
             chunk = idx[start : start + cfg.batch]
-            pre = [
-                preprocess_numpy(_crop(image, views[i]), size, letterbox=letterbox, mean=mean, std=std) for i in chunk
-            ]
-            x = torch.from_numpy(np.stack([chw for chw, _ in pre])).to(dev)
+            pre = [prep(_crop(image, views[i]), size, letterbox=letterbox, mean=mean, std=std) for i in chunk]
+            x = torch.stack([torch.as_tensor(chw) for chw, _ in pre]).to(dev)
             ctx = torch.autocast(dev.type, dtype=amp_dtype) if amp_dtype is not None else contextlib.nullcontext()
             with ctx:
                 out = model(x)
