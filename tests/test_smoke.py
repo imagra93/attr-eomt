@@ -514,6 +514,20 @@ def test_preprocess_letterbox_meta_and_padding():
     assert not meta2["letterbox"] and meta2["content_hw"] == (20, 20)
 
 
+@pytest.mark.parametrize("letterbox", [True, False])
+def test_preprocess_torch_matches_preprocess_numpy_within_one_grey_level(letterbox):
+    import numpy as np
+
+    from eomt.preprocess import IMAGENET_STD, preprocess_numpy, preprocess_torch
+
+    img = np.random.default_rng(0).integers(0, 255, (97, 151, 3), dtype=np.uint8)
+    chw, meta = preprocess_torch(img, 64, letterbox=letterbox)
+    expected, expected_meta = preprocess_numpy(img, 64, letterbox=letterbox)
+    assert chw.shape == (3, 64, 64) and chw.dtype == torch.float32 and meta == expected_meta
+    diff = np.abs(chw.numpy() - expected) * IMAGENET_STD.reshape(3, 1, 1) * 255  # in grey levels
+    assert diff.max() <= 1.01 and diff.mean() < 0.25
+
+
 def test_letterbox_inverse_crops_content_not_padding():
     from eomt.postprocess import _masks_to_original
     from eomt.preprocess import make_preprocess_meta
