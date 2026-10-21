@@ -178,7 +178,7 @@ def test_device_preprocessed_views_find_the_same_instances():
     cpu = predict_views(_Blobs(), img, cfg, imgsz=IMGSZ, conf_thres=0.3)
     dev = predict_views(_Blobs(), img, cfg, imgsz=IMGSZ, conf_thres=0.3, device_preprocess=True)
     assert dev["num_detections"] == cpu["num_detections"] == 1
-    assert torch.allclose(dev["scores"], cpu["scores"]) and _same(dev["masks"], cpu["masks"])
+    assert torch.equal(dev["scores"], cpu["scores"]) and torch.equal(dev["masks"], cpu["masks"])
 
 
 def test_predict_image_with_tta_keeps_the_result_contract():

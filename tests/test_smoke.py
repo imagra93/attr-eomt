@@ -514,18 +514,23 @@ def test_preprocess_letterbox_meta_and_padding():
     assert not meta2["letterbox"] and meta2["content_hw"] == (20, 20)
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="no GPU"))])
 @pytest.mark.parametrize("letterbox", [True, False])
-def test_preprocess_torch_matches_preprocess_numpy_within_one_grey_level(letterbox):
+@pytest.mark.parametrize("shape, size", [((97, 151), 64), ((720, 1280), 644), ((300, 200), 644), ((5, 900), 140)])
+def test_preprocess_torch_equals_preprocess_numpy(shape, size, letterbox, device):
+    """Downscaled, upscaled and extreme aspect ratios: the same input as PIL's, value for value."""
     import numpy as np
 
-    from eomt.preprocess import IMAGENET_STD, preprocess_numpy, preprocess_torch
+    from eomt.preprocess import preprocess_numpy, preprocess_torch
 
-    img = np.random.default_rng(0).integers(0, 255, (97, 151, 3), dtype=np.uint8)
-    chw, meta = preprocess_torch(img, 64, letterbox=letterbox)
-    expected, expected_meta = preprocess_numpy(img, 64, letterbox=letterbox)
-    assert chw.shape == (3, 64, 64) and chw.dtype == torch.float32 and meta == expected_meta
-    diff = np.abs(chw.numpy() - expected) * IMAGENET_STD.reshape(3, 1, 1) * 255  # in grey levels
-    assert diff.max() <= 1.01 and diff.mean() < 0.25
+    img = np.random.default_rng(0).integers(0, 256, (*shape, 3), dtype=np.uint8)
+    chw, meta = preprocess_torch(img, size, letterbox=letterbox, mean=(0.5, 0.4, 0.3), std=(0.2, 0.3, 0.25),
+                                 device=device)
+    expected, expected_meta = preprocess_numpy(img, size, letterbox=letterbox, mean=(0.5, 0.4, 0.3),
+                                               std=(0.2, 0.3, 0.25))
+    assert chw.shape == (3, size, size) and chw.dtype == torch.float32 and meta == expected_meta
+    assert np.array_equal(chw.cpu().numpy(), expected)
 
 
 def test_letterbox_inverse_crops_content_not_padding():
