@@ -5,7 +5,8 @@ including the **secondary per-instance classification** (attributes) extension.
 
 ```
 sample_data/
-├── data.yaml                         # dataset config (point --data here)
+├── data.yaml                         # dataset config: the paths only
+├── run.yaml                          # run config: the paths + heads, augmentation, training, inference
 ├── annotations/
 │   ├── instances_train.json          # 2 images, 3 instances, 2 attribute heads
 │   └── instances_val.json            # 1 image, 2 instances
@@ -33,13 +34,24 @@ segments each garment and reads off two independent attributes per detection.
 The head names (`scale`, `viewpoint`) are just examples; define whatever
 attributes your task needs.
 
+The JSONs hold only data. How a model learns them is the **run config**,
+[`run.yaml`](run.yaml): which attributes get a head and how each one behaves
+(`applies_to`, `flip_aware`, a regression's `log` / `range`, `crop`), the
+augmentation, the `train()` settings and the inference settings saved in every
+checkpoint, in one commented file. Copy it for your own dataset.
+
 ## Try it
+
+```bash
+python scripts/train.py --data sample_data/run.yaml --size s              # everything from run.yaml
+python scripts/train.py --data sample_data/run.yaml --size s --epochs 1   # a flag beats the file
+```
 
 ```python
 from eomt import EoMT
 
-EoMT("s").train(data="sample_data/data.yaml", epochs=1, batch=1)
+EoMT("s").train(data="sample_data/run.yaml", epochs=1, batch=1)   # keywords beat the file too
 ```
 
 Per-epoch train/val metrics (segmentation mAP and, when present, per-head
-attribute accuracy) are written to `runs/train/eomt-s/metrics.csv`.
+attribute accuracy) are written to `runs/train/sample/metrics.csv` (run.yaml's `project` / `name`).

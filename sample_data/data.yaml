@@ -26,16 +26,11 @@
 # The attribute names used here (`scale`, `viewpoint`) are only examples — use
 # whatever attributes your task needs, and as many heads as you like.
 #
-# Class-conditional heads (optional): give an attribute definition an
-# `applies_to` list of primary-class names or ids, and that head is only trained
-# on — and only emitted for — instances of those classes. This is hard routing on
-# the primary class, so different attributes can attach to different classes and
-# each keeps its own label vocabulary. Omit `applies_to` and the head applies to
-# every class (the original behaviour):
-#
-#   "attributes": [
-#     {"name": "posture", "categories": [...], "applies_to": ["cat", "dog"]}
-#   ]
+# The JSONs hold only data. Which attributes get a head and how each one learns
+# (`applies_to` a subset of classes, `flip_aware`, a regression's `log` / `range`,
+# `crop`), the augmentation, the training settings and the inference settings
+# saved with the model are the run config's: see run.yaml beside this file, the
+# same paths plus all of that, commented (`--data sample_data/run.yaml`).
 #
 # Missing / untagged values are always fine: an instance with no value for a head
 # (or an out-of-scope instance for an `applies_to` head) is ignored by that head's

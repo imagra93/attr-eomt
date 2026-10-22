@@ -1,0 +1,55 @@
+# A run config: one YAML with the data paths and everything about how a model is trained on them and run. Copy it for
+# your dataset and write every setting out here, in one file.
+#
+#   python scripts/train.py --data sample_data/run.yaml          # the images are not shipped: add yours first
+#   python scripts/train.py --data sample_data/run.yaml --epochs 1   # a flag (or a train() keyword in code) beats the file
+#
+# The dataset (the COCO JSONs) holds only data: the images, the instances, and each attribute's name, type
+# (categorical, or "type": "regression") and categories. Everything below is how a model learns it. Every section is
+# optional: without one, the library's defaults. Relative paths are relative to this file.
+
+# --- data
+path: .
+train_images: images/train
+train_json: annotations/instances_train.json
+val_images: images/val
+val_json: annotations/instances_val.json
+
+# --- the per-instance heads: which attributes of the data get a head, and how each one learns. An attribute of the data
+# not listed gets no head; without this section every attribute is trained as the data declares it.
+attributes:
+  scale:                           # a categorical head over the data's categories (small / modest / large)
+  viewpoint:                       # frontal / side / back
+  # The other behaviours, for attributes your data might have:
+  # posture: {applies_to: [skirt, trousers]}       # only trained on (and emitted for) these primary classes
+  # side: {flip_aware: {left: right}}               # swapped when the augmentation mirrors the photo
+  # price: {log: true, range: [0, 20000]}           # a regression head: regress log1p; values outside are ignored
+  # surface_cm2: {log: true, crop: scale}           # follows the share of the instance a crop keeps in view
+  # length_cm: {crop: ignore, min_visible: 0.95}    # dropped when less than 95 % of the instance is in view
+
+# --- augmentation: eomt.data.transforms.AugConfig fields over its defaults (see the README, "Augmentation")
+aug:
+  flip_prob: 0.5
+  min_scale: 0.4                   # large-scale jitter: the long side of a sample is imgsz x 0.4-1.6
+  max_scale: 1.6
+  rotate_prob: 0.3
+  rotate_deg: 10.0
+
+# --- train() keywords (anything train() takes but the data paths; the model size: --size / EoMT("s"))
+train:
+  project: ../runs/train
+  name: sample
+  epochs: 12
+  imgsz: 644
+  batch: 4                         # per GPU; accumulated to nominal_batch
+  nominal_batch: 16
+  val_interval: 2
+  # init_weights: ../runs/train/eomt-l/weights/best.pt   # warm start from a checkpoint instead of DINOv2
+  # hires_epochs: 2                                       # the last epochs at a larger input (the photos' native size)
+  # hires_imgsz: 1022
+
+# --- saved in every checkpoint: the defaults of predict() / track() with the trained model
+inference:
+  conf_thres: 0.3
+  mask_thresh: 0.5
+  max_det: 100

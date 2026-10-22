@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .config import SIZES
+from .config import INFERENCE_DEFAULTS, SIZES
 from .data import CocoValImages, load_data_config
 from .device import resolve_device
 from .engine import evaluate as _evaluate
@@ -55,6 +55,12 @@ def _looks_like_checkpoint(spec: str | Path) -> bool:
         # A run folder if it (or its weights/ subdir) holds a best/last checkpoint.
         return any((p / sub).is_file() for sub in ("best.pt", "last.pt", "weights/best.pt", "weights/last.pt"))
     return False
+
+
+def _inference_kw(model, **given) -> dict:
+    """Each setting as the call gives it, else as the checkpoint saved it, else :data:`INFERENCE_DEFAULTS`."""
+    saved = getattr(model, "inference", None) or {}
+    return {k: given[k] if given.get(k) is not None else saved.get(k, d) for k, d in INFERENCE_DEFAULTS.items()}
 
 
 def _resolve_imgsz(imgsz: int | None, model) -> int:
@@ -250,7 +256,11 @@ class EoMT:
         a fresh run (fine-tune). Returns the engine's result dict and reloads the best
         weights into this object.
 
-        Augmentation: the dataset YAML may carry a ``train_aug`` mapping (any
+        The YAML is also the run config (:mod:`eomt.data.config`): its ``train`` section supplies the keyword args not
+        passed here (``init_weights`` included, when this object was built from a size), ``attributes`` which heads
+        train and how, ``inference`` the settings saved in the checkpoints.
+
+        Augmentation: the dataset YAML may carry an ``aug`` (or ``train_aug``) mapping (any
         :class:`~eomt.data.transforms.AugConfig` field, or ``preset: legacy``); an ``aug=`` passed here is merged
         over it key by key, and the explicit ``flip_prob`` / ``min_scale`` / ``max_scale`` keywords beat both.
         ``train_transform=`` replaces the built-in pipeline with your own callable.
@@ -259,8 +269,20 @@ class EoMT:
         if not (cfg["train_images"] and cfg["train_json"]):
             raise ValueError(f"dataset {data!r} has no train split (train_images/train_json).")
 
+        # The run config's `train` section under the explicit keywords; its `init_weights` applies to a model built from
+        # a size (a checkpoint given to EoMT() wins), its `attributes` and `inference` as the YAML sets them.
+        yaml_hp = dict(cfg.get("train") or {})
+        yaml_init = yaml_hp.pop("init_weights", None)
+        if resume:  # re-seeding a resumed run would replay its first epoch's shuffle
+            yaml_hp.pop("seed", None)
+        hp = {**yaml_hp, **hp}
+        for key in ("attributes", "inference"):
+            if cfg.get(key) is not None:
+                hp.setdefault(key, cfg[key])
         if self._ckpt is not None:
             hp["resume" if resume else "init_weights"] = self._ckpt
+        elif yaml_init and not resume:
+            hp.setdefault("init_weights", yaml_init)
 
         yaml_aug = cfg.get("train_aug")
         if yaml_aug:
@@ -391,24 +413,26 @@ class EoMT:
 
     # ---------------------------------------------------------------- predict
     def predict(self, source: str | Path, *, plot: bool = False, save: str | None = "runs/predict",
-                conf_thres: float = 0.3, max_det: int = 100, mask_thresh: float = 0.5,
+                conf_thres: float | None = None, max_det: int | None = None, mask_thresh: float | None = None,
                 imgsz: int | None = None, **kw) -> list[dict]:
         """Run inference on an image or a directory.
 
         Returns one result dict per image (``boxes`` / ``scores`` / ``classes`` /
         ``masks`` and, for models with secondary heads, ``aux``). With ``plot=True``
         each image is rendered with masks/boxes/labels and saved under ``save``.
-        ``imgsz`` overrides the inference image size (defaults to the trained size).
+        ``imgsz`` overrides the inference image size (defaults to the trained size). ``conf_thres`` / ``max_det`` /
+        ``mask_thresh`` left out are the checkpoint's (its run config's ``inference``), else
+        :data:`INFERENCE_DEFAULTS`.
         """
         return _predict(
             self.model, str(source), plot=plot, save=save,
-            conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
+            **_inference_kw(self.model, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh),
             imgsz=_resolve_imgsz(imgsz, self.model), **kw,
         )
 
     # ------------------------------------------------------------------ track
     def track(self, source: str | Path, *, plot: bool = True, save: str | None = "runs/track",
-              conf_thres: float = 0.3, max_det: int = 100, mask_thresh: float = 0.5,
+              conf_thres: float | None = None, max_det: int | None = None, mask_thresh: float | None = None,
               imgsz: int | None = None, min_hits: int = 3, with_attr: bool = False,
               details: bool = False, trace: bool = False, hud: bool = True,
               tracker_kwargs: dict | None = None, **kw) -> list[dict] | dict:
@@ -433,7 +457,7 @@ class EoMT:
         """
         return _track(
             self.model, str(source), plot=plot, save=save,
-            conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
+            **_inference_kw(self.model, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh),
             imgsz=_resolve_imgsz(imgsz, self.model), min_hits=min_hits,
             with_attr=with_attr, details=details, trace=trace,
             hud=hud, tracker_kwargs=tracker_kwargs, **kw,

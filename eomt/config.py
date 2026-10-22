@@ -26,6 +26,9 @@ from dataclasses import dataclass, field
 DEFAULT_IMAGE_SIZE = 644
 #: DINOv2 / EoMT patch size.
 PATCH_SIZE = 14
+#: The inference settings a run config may save in a checkpoint (``inference:``), with the defaults of predict() /
+#: track() for a checkpoint that saves none.
+INFERENCE_DEFAULTS = {"conf_thres": 0.3, "max_det": 100, "mask_thresh": 0.5}
 
 
 @dataclass

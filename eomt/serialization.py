@@ -277,6 +277,8 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     # Restore normalization (legacy checkpoints predate it → keep the ImageNet default).
     model.pixel_mean = tuple(float(x) for x in ckpt.get("norm_mean", model.pixel_mean))
     model.pixel_std = tuple(float(x) for x in ckpt.get("norm_std", model.pixel_std))
+    # How the model is meant to be run (the run config's `inference`: conf_thres, ...): predict / track's defaults.
+    model.inference = dict(ckpt.get("inference") or {})
     # Stash the compression recipe so a re-save round-trips it (see EoMT.save).
     model._compression_meta = dict(compression) if compression else None
     if compression:

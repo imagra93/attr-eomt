@@ -22,7 +22,7 @@ def main() -> None:
     p.add_argument("weights", help="Checkpoint .pt or a run/weights folder.")
     p.add_argument("source", nargs="?", default="scripts/sample_images", help="Image file or directory.")
     p.add_argument("--out", default="runs/predict", help="Output directory for annotated images.")
-    p.add_argument("--conf", type=float, default=0.3, help="Confidence threshold.")
+    p.add_argument("--conf", type=float, default=None, help="Confidence threshold (default: the checkpoint's inference setting, else 0.3).")
     p.add_argument("--device", default="auto")
     add_tta_args(p)
     args = p.parse_args()

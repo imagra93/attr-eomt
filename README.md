@@ -164,8 +164,10 @@ simply reuse that same query→GT assignment and read the answer off the matched
 
 Attributes live **inside the COCO annotations** — each annotation is already a
 per-instance object, so alignment is automatic and `pycocotools` still parses it. Just
-two additions to a standard COCO file; **no YAML changes** — heads (count, classes,
-names) are discovered from the JSON, the same as `nc`.
+two additions to a standard COCO file — heads (count, classes, names) are discovered from the
+JSON, the same as `nc`. The dataset holds **only data** (each attribute's name, type and
+categories); which attributes get a head and how each one learns (`applies_to`, `flip_aware`,
+`log`, `range`, `crop`) is the **run config**'s `attributes` section — see *Run config* below.
 
 **1. A top-level `attributes` list** — one entry per head, defining its vocabulary:
 
@@ -209,16 +211,16 @@ Notes:
   instances that actually carry its value. A JSON with **no** `attributes` ⇒ detection-only,
   exactly as before.
 
-**Class-conditional heads.** Give an attribute definition an optional `applies_to` list of
-primary-class names or ids, and that head is only trained on — and only emitted for —
+**Class-conditional heads.** Give an attribute an optional `applies_to` list of primary-class
+names or ids in the run config, and that head is only trained on — and only emitted for —
 instances of those classes (hard routing on the primary class). Omit it and the head applies
 to every class. So different attributes can attach to different classes, each with its own
 label set, in one model:
 
-```jsonc
-"attributes": [
-  {"name": "posture", "categories": [...], "applies_to": ["cat", "dog"]}
-]
+```yaml
+# run config
+attributes:
+  posture: {applies_to: [cat, dog]}
 ```
 
 At inference a scoped head reports `ids = -1` ("not applicable") for detections whose class it
@@ -226,13 +228,19 @@ does not cover. The scope is stored in the checkpoint, so it survives reload.
 
 **Flip-aware attributes.** A horizontal flip mirrors the photo but not the labels, so an attribute
 that encodes a side (a left shoe shows up as a right one) is corrupted by `flip_prob > 0`. Give
-its definition `flip_aware`, a map of category names to the ones they become on a horizontal
+it `flip_aware` in the run config, a map of category names to the ones they become on a horizontal
 flip, and the training augmentation swaps them for every instance it flips (each pair swaps both
-ways, so `{"left": "right"}` is enough; unlisted categories stay as they are):
+ways, so `{left: right}` is enough; unlisted categories stay as they are):
 
 ```jsonc
-{"name": "side", "categories": [{"id": 0, "name": "left"}, {"id": 1, "name": "center"}, {"id": 2, "name": "right"}],
- "flip_aware": {"left": "right"}}
+// data: the attribute's categories
+{"name": "side", "categories": [{"id": 0, "name": "left"}, {"id": 1, "name": "center"}, {"id": 2, "name": "right"}]}
+```
+
+```yaml
+# run config: how it learns
+attributes:
+  side: {flip_aware: {left: right}}
 ```
 
 Mosaic, mixup and copy-paste flip each source image independently, and the swap follows each
@@ -242,18 +250,26 @@ attribute. It is categorical only. The mapping is stored in the checkpoint, and 
 mapping was stored takes it from the val JSON, with a warning). The training banner lists each head's swapped pairs. A
 regression head needs no mapping: its value must not change under a flip (see below).
 
-**Regression attributes.** `"type": "regression"` makes a head regress one real number per
-instance instead of choosing a category; categorical and regression heads mix freely in one
-dataset. `log` (regress `log1p` of the value, for heavy-tailed positives such as costs) and
-`range` (valid values; predictions are clipped to it) are optional, and `applies_to` works as above:
+**Regression attributes.** `"type": "regression"` in the data makes a head regress one real number
+per instance instead of choosing a category; categorical and regression heads mix freely in one
+dataset. In the run config, `log` (regress `log1p` of the value, for heavy-tailed positives such as
+costs) and `range` (valid values; predictions are clipped to it) are optional, and `applies_to` works as above:
 
 ```jsonc
+// data
 "attributes": [
   {"name": "grade", "categories": [...]},
-  {"name": "price", "type": "regression", "log": true, "range": [0, 20000], "applies_to": ["sofa"]}
+  {"name": "price", "type": "regression", "unit": "EUR"}
 ]
 // per annotation:
 "attributes": {"grade": 3, "price": 812.5}
+```
+
+```yaml
+# run config
+attributes:
+  grade:
+  price: {log: true, range: [0, 20000], applies_to: [sofa]}
 ```
 
 A missing, non-numeric or out-of-range value is ignored. The head is trained on the value
@@ -273,9 +289,11 @@ value when less than `min_visible` (default `0.9`) is kept — for a property of
 that a cut view no longer shows. Validation and inference see whole images, so the head predicts
 the full value there:
 
-```jsonc
-{"name": "surface_cm2", "type": "regression", "log": true, "crop": "scale"},
-{"name": "length_cm", "type": "regression", "crop": "ignore", "min_visible": 0.95}
+```yaml
+# run config
+attributes:
+  surface_cm2: {log: true, crop: scale}
+  length_cm: {crop: ignore, min_visible: 0.95}
 ```
 
 The fraction is the share of the instance's mask mass kept inside the window (box overlap for the detect family),
@@ -290,9 +308,73 @@ dataset always works and the sidecar is picked up automatically when you add it.
 `attributes` in the JSON take precedence.
 
 A tiny, self-contained example (two heads, including a non-contiguous id set) lives in
-[sample_data/](sample_data/).
+[sample_data/](sample_data/), with its run config [sample_data/run.yaml](sample_data/run.yaml).
+
+Datasets built before the run config may still carry `applies_to` / `flip_aware` / `log` / `range` / `crop` in their
+attribute definitions: they are still read, and the run config's `attributes` win over them.
 
 ---
+
+## Run config (one YAML per run)
+
+**The dataset holds the data; one YAML holds the run.** The COCO JSONs carry the images, the instances and each
+attribute's name, type and categories — nothing about training. Everything else is written out in the YAML that
+`--data` points at, the **run config**: the data paths, which attributes get a head and how each learns, the
+augmentation, the `train()` settings and the inference settings saved with the model. One file says how a model was
+made, so a run can be read, repeated and compared from it. Start from the commented template
+[`sample_data/run.yaml`](sample_data/run.yaml):
+
+```yaml
+# --- data
+path: .
+train_images: images/train
+train_json: annotations/instances_train.json
+val_images: images/val
+val_json: annotations/instances_val.json
+
+# --- the heads, and how each learns: flip_aware, crop, min_visible, log, range, applies_to
+#     (an attribute of the data left out gets no head; no section: every attribute as the data declares it)
+attributes:
+  scale:
+  viewpoint:
+  # side: {flip_aware: {left: right}}
+  # price: {log: true, range: [0, 20000], applies_to: [sofa]}
+  # surface_cm2: {log: true, crop: scale}
+
+# --- augmentation: AugConfig fields over its defaults (`train_aug`, the older name, is the same section)
+aug:
+  flip_prob: 0.5
+  min_scale: 0.4
+  max_scale: 1.6
+
+# --- train() keywords: anything train() takes but the data paths (the size: --size, the device: --device)
+train:
+  project: ../runs/train
+  name: sample
+  epochs: 12
+  imgsz: 644
+  batch: 4
+  # init_weights: ../runs/train/eomt-l/weights/best.pt   # warm start from a checkpoint
+
+# --- saved in every checkpoint: the defaults of predict() / track() with that model
+inference:
+  conf_thres: 0.3
+  max_det: 100
+```
+
+```bash
+python scripts/train.py --data sample_data/run.yaml --size s --device 0,1     # the whole run from the file
+python scripts/train.py --data sample_data/run.yaml --size s --epochs 1       # a flag beats the file
+python scripts/predict.py runs/train/sample/weights/best.pt images/           # with the conf_thres it was saved with
+```
+
+- **Precedence:** explicit arguments (command line, `train()` / `EoMT.train()` keywords) beat the YAML, which beats the
+  library's defaults. Relative paths (`path`, `train.init_weights`, `train.project`) are relative to the YAML.
+- **Recorded:** `args.yaml` in the run folder and every checkpoint (`run_config`) hold the resolved run — every
+  hyper-parameter, the augmentation and how each head learned (with its regression statistics); the checkpoint also
+  keeps `inference`, which `predict()` / `track()` (and `scripts/predict.py`) use for any setting the call leaves out.
+- **Errors early:** an attribute the YAML configures but the data does not define, an unknown behavior or inference key,
+  or a data path / size / device inside `train` stops the run before it starts.
 
 ## Cross-photo re-identification
 
@@ -336,8 +418,9 @@ from eomt import EoMT
 # Train on COCO 2017 (auto-downloaded on first run):
 EoMT("l").train(data="coco", batch=4)   # 12 epochs, validated every 2: the official recipe
 
-# ...or any COCO-format dataset (point at its data.yaml):
-EoMT("s").train(data="sample_data/data.yaml", epochs=1, batch=1)
+# ...or any COCO-format dataset, the run written out in its run config (see "Run config"):
+EoMT("s").train(data="sample_data/run.yaml")
+EoMT("s").train(data="sample_data/run.yaml", epochs=1)   # a keyword beats the file
 
 # Validate and predict from a trained run:
 EoMT("runs/train/eomt-l").val(data="coco")
@@ -434,9 +517,10 @@ Things to take into account when training:
   every validation is eligible.
 - **Validated epochs only.** With `--val-interval N` the other epochs have empty validation cells in `metrics.csv`; the curves in
   `metrics.png` join the validated points.
-- **Attribute heads follow the dataset's definitions.** Categories, `applies_to`, `flip_aware` and `crop` / zoom settings come
-  from the dataset (the training banner lists them). The flip mapping, scope and regression statistics are stored in the
-  checkpoint; `crop` and the zoom settings are training-only.
+- **Attribute heads follow the run config.** Which attributes train and their `applies_to`, `flip_aware`, `crop`, `log` and
+  `range` come from the YAML's `attributes` section (see *Run config*), else from the dataset's definitions; the training
+  banner lists them. The flip mapping, scope and regression statistics are stored in the checkpoint, and the whole run
+  config in `args.yaml` and the checkpoint's `run_config`.
 
 **`scripts/val.py`.**
 
@@ -523,7 +607,7 @@ mass-preserving), so thin objects are not shredded into dots by nearest-neighbou
 | masks | `mask_resize="area"` (or `"nearest"`) |
 
 Override per run, per dataset, or from the CLI — precedence is explicit keywords (`flip_prob`, `min_scale`,
-`max_scale`) **>** `aug=` **>** the dataset YAML's `train_aug` block **>** defaults:
+`max_scale`) **>** `aug=` **>** the YAML's `aug` (or `train_aug`) block **>** defaults:
 
 ```python
 model.train(data="coco", aug={"rotate_prob": 0.5, "blur_prob": 0})   # in code

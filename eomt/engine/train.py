@@ -33,12 +33,12 @@ from ..aux_cls import (
     gate_indices,
     match_queries,
 )
-from ..config import normalize_loss_weights
+from ..config import INFERENCE_DEFAULTS, normalize_loss_weights
 from ..data import CocoDetection, CocoInstanceSeg, CocoValImages, collate_train
 from ..data.coco import _attr_label
 from ..data.transforms import AugConfig, build_val_transform
 from ..ema import ModelEMA, _unwrap
-from ..model import DEFAULT_FPN_SCALES, build_model, load_dinov2_backbone
+from ..model import DEFAULT_FPN_SCALES, _interp_pos_grid, build_model, load_dinov2_backbone
 from ..plotting import plot_aux_per_class, plot_metrics_csv
 from ..device import gpu_ids, resolve_device
 from ..serialization import load_raw, resolve_checkpoint, save_checkpoint, wrap_checkpoint
@@ -177,6 +177,35 @@ EOMT_MASK_ANNEAL_START = (1 / 6, 2 / 6, 3 / 6, 4 / 6)
 EOMT_MASK_ANNEAL_END = (2 / 6, 3 / 6, 4 / 6, 5 / 6)
 
 
+#: The high-resolution final phase (``hires_epochs``) is a short fine-tune of the averaged weights: its own short warmup
+#: and a faster EMA, as a warm-started run of a few epochs would have (the main run's 0.9999 would barely move).
+HIRES_WARMUP_STEPS = (100, 200)
+HIRES_EMA_DECAY, HIRES_EMA_TAU = 0.999, 500.0
+#: Share of a GPU's usable memory a high-resolution training step may take; the rest covers fragmentation and the
+#: peaks one probe step does not hit.
+HIRES_MEMORY_BUDGET = 0.9
+_POS_KEY = "eomt.embeddings.position_embeddings.weight"
+
+
+def _state_at_imgsz(state_dict: dict, from_imgsz: int, to_imgsz: int, patch: int) -> dict:
+    """The state of a model built at ``from_imgsz`` as one built at ``to_imgsz``: its position-embedding table resized
+    as the model resizes it on the fly for a ``to_imgsz`` input, so both predict the same at that size."""
+    if from_imgsz == to_imgsz or _POS_KEY not in state_dict:
+        return state_dict
+    g0, g1 = from_imgsz // patch, to_imgsz // patch
+    return {**state_dict, _POS_KEY: _interp_pos_grid(state_dict[_POS_KEY], (g0, g0), (g1, g1))}
+
+
+def _fit_batch(requested: int, fits) -> int:
+    """The largest micro-batch from ``requested`` down (halving) for which ``fits(batch)`` holds; 0 when none does."""
+    b = requested
+    while b >= 1:
+        if fits(b):
+            return b
+        b //= 2
+    return 0
+
+
 def _per_block(value, n_blocks: int, what: str) -> list[float]:
     """One fraction of training per query block."""
     vals = [float(v) for v in value]
@@ -277,6 +306,22 @@ def _aux_kind_str(spec) -> str:
         return str(spec.num_classes) + (f", flips {' '.join(pairs)}" if pairs else "")
     crop = f", crop {spec.crop}" + (f" < {spec.min_visible:g}" if spec.crop == "ignore" else "") if spec.crop else ""
     return f"regression{', log' if spec.log else ''}{crop}, mean {spec.mean:.4g} std {spec.std:.4g}"
+
+
+def _head_record(spec, class_names: dict) -> dict:
+    """How one attribute head learns, as the run records it (``args.yaml`` / ``run_config``): its type and categories
+    or regression space, and its behavior under the augmentation, in names rather than contiguous ids."""
+    if spec.regression:
+        rec = {"type": "regression", "log": spec.log, "range": list(spec.value_range) if spec.value_range else None,
+               "crop": spec.crop, "min_visible": spec.min_visible if spec.crop == "ignore" else None,
+               "mean": round(float(spec.mean), 6), "std": round(float(spec.std), 6)}
+    else:
+        rec = {"type": "categorical", "categories": [spec.names.get(i, str(i)) for i in range(spec.num_classes)],
+               "flip_aware": {spec.names.get(a, a): spec.names.get(b, b) for a, b in spec.flip_aware.items() if a < b}
+               if spec.flip_aware else None}
+    if spec.applies_to is not None:
+        rec["applies_to"] = sorted(class_names.get(c, str(c)) for c in spec.applies_to)
+    return {k: v for k, v in rec.items() if v is not None}
 
 
 def _aux_metric(spec) -> str:
@@ -473,6 +518,13 @@ def train(
     deep_supervision: bool = True,
     stop_after_epochs: int | None = None,
     val_imgsz: int | None = None,
+    hires_epochs: int = 0,
+    hires_imgsz: int | None = None,
+    hires_batch: int | None = None,
+    hires_lr: float | None = None,
+    hires_aug: dict | None = None,
+    attributes: dict | None = None,
+    inference: dict | None = None,
     logger: str = "none",
     resume: str | None = None,
     init_weights: str | None = None,
@@ -532,6 +584,30 @@ def train(
     so it composes with ``resume``) while the LR schedule and mask annealing still span ``epochs``: it is for
     truncated A/B comparisons that must follow exactly the schedule of a full run.
 
+    **High-resolution final phase.** ``hires_epochs`` > 0 trains the last ``hires_epochs`` of ``epochs`` at
+    ``hires_imgsz`` (e.g. the native size of the photos a model trained at 644 is deployed on). The main schedule (LR,
+    warmup, masked-attention annealing) spans the first ``epochs - hires_epochs`` epochs exactly as a run of that length
+    would; the final phase then starts from the EMA weights as a short fine-tune of its own: the same augmentation
+    settings at the new size, with ``hires_aug`` (:class:`~eomt.data.transforms.AugConfig` fields) overriding them for the
+    phase, e.g. a ``zoom_scale`` scaled by ``imgsz / hires_imgsz`` to keep the close-ups at the same magnification of the
+    photo (the instance-crop rarity weights stay those of ``aug``); ``hires_lr`` (default ``lr0 / 5``) with a
+    :data:`HIRES_WARMUP_STEPS` warmup and
+    polynomial decay, a fresh EMA (:data:`HIRES_EMA_DECAY`), mask-free, validated every epoch at ``hires_imgsz``. Its
+    micro-batch is ``hires_batch`` (default ``batch``), the accumulation adjusted to keep the effective batch. Before
+    training starts, one real training step at the high resolution is run on every GPU: when it does not fit in
+    :data:`HIRES_MEMORY_BUDGET` of the memory (with the optimizer, EMA and DDP buffers added), the micro-batch is halved
+    down to 1, and the run stops at once if even 1 does not fit. Each phase keeps its own best, ``best_<imgsz>.pt``
+    (saved at that size: its position-embedding table resized so it loads as a model of that size, same outputs);
+    ``best.pt`` is the best of the whole run, each phase validated at its own size; ``metrics.csv`` gains an
+    ``imgsz`` column. Instance family, built-in augmentation only.
+
+    **Run config.** ``attributes`` (``{name: behavior}``, the ``attributes`` section of the run config YAML, see
+    :mod:`eomt.data.config`) picks the attributes of the data that get a head and sets how each learns
+    (:data:`~eomt.data.coco.BEHAVIOR_KEYS`: ``flip_aware``, ``crop``, ``log``, ``range``, ...) over what the data
+    declares; ``None`` trains every attribute as the data declares it. ``inference`` (:data:`~eomt.config.INFERENCE_DEFAULTS`
+    keys) is saved in every checkpoint as the model's predict / track defaults. ``args.yaml`` and every checkpoint
+    (``run_config``) record the resolved run: these, the augmentation and every hyper-parameter.
+
     **Augmentation.** ``aug`` is an :class:`~eomt.data.transforms.AugConfig` (or a plain mapping, e.g. the ``train_aug``
     block of the dataset YAML) holding every augmentation knob; the defaults are a strong general recipe (flip,
     large-scale jitter, small rotation / shear / perspective, gamma, grayscale, blur, noise, JPEG, glare and
@@ -567,6 +643,16 @@ def train(
         raise ValueError(f"aux_balance={aux_balance!r}: 'static' or 'uncertainty'")
     if imgsz % 14 or (val_imgsz is not None and val_imgsz % 14):
         raise ValueError(f"imgsz={imgsz} and val_imgsz={val_imgsz} must be divisible by 14 (DINOv2 grid).")
+    if hires_epochs:
+        if not 0 < hires_epochs < epochs:
+            raise ValueError(f"hires_epochs={hires_epochs} must leave some of epochs={epochs} at imgsz")
+        if not hires_imgsz or hires_imgsz % 14:
+            raise ValueError(f"hires_imgsz={hires_imgsz} must be set and divisible by 14 (DINOv2 grid).")
+        if family == "detect" or train_transform is not None:
+            raise ValueError("hires_epochs needs the instance family and the built-in augmentation")
+    if inference and set(inference) - set(INFERENCE_DEFAULTS):
+        raise ValueError(f"inference: unknown keys {sorted(set(inference) - set(INFERENCE_DEFAULTS))} "
+                         f"(allowed: {', '.join(INFERENCE_DEFAULTS)})")
 
     gpus = gpu_ids(device)
     if len(gpus) > 1 and not dist.is_initialized():  # one process per GPU, each running this function on its own
@@ -579,6 +665,8 @@ def train(
         torch.seed()  # torch's default seed is the same constant in every process: draw distinct augmentations
 
     dev = resolve_device(device)
+    lo_epochs = epochs - hires_epochs  # the main schedule spans these
+    hires_lr = lr0 / 5 if hires_lr is None else hires_lr
 
     # Speed knobs (no accuracy cost): TF32 matmul/conv on Ampere+, and cudnn
     # autotuner — safe because the input is a fixed-size square every step.
@@ -726,6 +814,7 @@ def train(
         imgsz=imgsz,
         transform=train_transform,
         aug=aug_cfg,
+        attributes=True if attributes is None else attributes,
         **({"keep_empty": True} if keep_empty else {}),
     )
     nc, names = train_ds.num_classes, train_ds.names
@@ -742,102 +831,112 @@ def train(
                 for s in aux_specs
             )
         )
-    # Several GPUs: each process draws a disjoint share of every epoch's shuffle (same seed and epoch everywhere).
-    sampler = DistributedSampler(train_ds, shuffle=True, seed=seed or 0, drop_last=True) if world > 1 else None
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch,
-        shuffle=sampler is None,
-        sampler=sampler,
-        num_workers=workers,
-        collate_fn=collate_train,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=workers > 0,
-        prefetch_factor=prefetch if workers > 0 else None,
-    )
+    def make_loader(ds, micro_batch: int):
+        # Several GPUs: each process draws a disjoint share of every epoch's shuffle (same seed and epoch everywhere).
+        smp = DistributedSampler(ds, shuffle=True, seed=seed or 0, drop_last=True) if world > 1 else None
+        return smp, DataLoader(
+            ds,
+            batch_size=micro_batch,
+            shuffle=smp is None,
+            sampler=smp,
+            num_workers=workers,
+            collate_fn=collate_train,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=workers > 0,
+            prefetch_factor=prefetch if workers > 0 else None,
+        )
 
-    val_ds = None
-    val_seg_ds = None
-    val_size = val_imgsz or imgsz
-    if val_images and val_json:
-        val_ds = CocoValImages(val_images, val_json, imgsz=val_size, letterbox=letterbox)
-        print(f"[data] val:   {len(val_ds)} images" + (f" at {val_size} px" if val_size != imgsz else ""))
+    def make_val(size: int):
+        if not (val_images and val_json):
+            return None, None
+        vds = CocoValImages(val_images, val_json, imgsz=size, letterbox=letterbox)
+        print(f"[data] val:   {len(vds)} images" + (f" at {size} px" if size != imgsz else ""))
         # Held-out aux accuracy needs GT geometry/attrs in the train id space: a
         # deterministic (no-crop) view of the val split, sharing train's maps.
-        if aux_specs:
-            val_seg_ds = Dataset(
-                val_images,
-                val_json,
-                imgsz=val_size,
-                transform=build_val_transform(val_size, letterbox=letterbox),
-                shared_aux=(aux_specs, train_ds._attr_id_maps),
-            )
+        vseg = Dataset(
+            val_images,
+            val_json,
+            imgsz=size,
+            transform=build_val_transform(size, letterbox=letterbox),
+            shared_aux=(aux_specs, train_ds._attr_id_maps),
+        ) if aux_specs else None
+        return vds, vseg
+
+    sampler, train_loader = make_loader(train_ds, batch)
+    val_size = val_imgsz or imgsz
+    val_ds, val_seg_ds = make_val(val_size)
 
     # Optional per-class CE weights for imbalanced attributes (computed once).
     aux_class_weight = _compute_aux_class_weights(train_ds) if (aux_specs and aux_class_weights) else None
 
-    # Record how this run was trained (model size + key hyper-parameters).
-    _write_run_config(
-        run_dir / "args.yaml",
-        {
-            "size": size,
-            "family": family,
-            "imgsz": imgsz,
-            "val_imgsz": val_size,
-            "nc": nc,
-            "train_images": train_images,
-            "train_json": train_json,
-            "val_images": val_images,
-            "val_json": val_json,
-            "epochs": epochs,
-            "gpus": world,
-            "batch": batch,
-            "accum": accum_steps,
-            "effective_batch": eff_batch,
-            "lr0": lr0,
-            "weight_decay": weight_decay,
-            "backbone_lr_mult": backbone_lr_mult,
-            "llrd": llrd,
-            "poly_power": poly_power,
-            "warmup_steps": list(warmup_steps),
-            "clip_norm": clip_norm,
-            "ema": ema,
-            "ema_decay": ema_decay,
-            "ema_tau": ema_tau,
-            "amp": amp,
-            "amp_dtype": amp_dtype,
-            "tf32": tf32,
-            "seed": seed,
-            "pretrained": pretrained,
-            "mask_anneal": mask_anneal,
-            "mask_anneal_start": list(mask_anneal_start),
-            "mask_anneal_end": list(mask_anneal_end),
-            "flip_prob": aug_cfg.flip_prob,
-            "min_scale": aug_cfg.min_scale,
-            "max_scale": aug_cfg.max_scale,
-            "aug": aug_cfg.to_dict() if train_transform is None else "custom train_transform",
-            "keep_empty": keep_empty,
-            "letterbox": letterbox,
-            "val_interval": val_interval,
-            "conf_thres": conf_thres,
-            "max_det": max_det,
-            "aux_w": aux_w,
-            "aux_w_warmup": aux_w_warmup,
-            "aux_w_per_head": aux_w_per_head,
-            "aux_class_weights": aux_class_weights,
-            "aux_iou_gate": aux_iou_gate,
-            "aux_class_gate": aux_class_gate,
-            "aux_balance": aux_balance,
-            "aux_head_arch": aux_head_arch,
-            "aux_heads": {s.name: ("regression" if s.regression else s.num_classes) for s in aux_specs},
-            "loss_weights": loss_weights,
-            "num_upscale_blocks": num_upscale_blocks,
-            "fpn_scales": list(fpn_scales) if fpn_scales else None,
-            "box_head": box_head,
-            "deep_supervision": deep_supervision,
-        },
-    )
+    # Record how this run was trained (model size, hyper-parameters, augmentation, how each head learns, inference
+    # settings): args.yaml, and every checkpoint as `run_config`.
+    run_cfg = {
+        "size": size,
+        "family": family,
+        "imgsz": imgsz,
+        "val_imgsz": val_size,
+        "nc": nc,
+        "train_images": train_images,
+        "train_json": train_json,
+        "val_images": val_images,
+        "val_json": val_json,
+        "epochs": epochs,
+        "gpus": world,
+        "batch": batch,
+        "accum": accum_steps,
+        "effective_batch": eff_batch,
+        "lr0": lr0,
+        "weight_decay": weight_decay,
+        "backbone_lr_mult": backbone_lr_mult,
+        "llrd": llrd,
+        "poly_power": poly_power,
+        "warmup_steps": list(warmup_steps),
+        "clip_norm": clip_norm,
+        "ema": ema,
+        "ema_decay": ema_decay,
+        "ema_tau": ema_tau,
+        "amp": amp,
+        "amp_dtype": amp_dtype,
+        "tf32": tf32,
+        "seed": seed,
+        "pretrained": pretrained,
+        "mask_anneal": mask_anneal,
+        "mask_anneal_start": list(mask_anneal_start),
+        "mask_anneal_end": list(mask_anneal_end),
+        "flip_prob": aug_cfg.flip_prob,
+        "min_scale": aug_cfg.min_scale,
+        "max_scale": aug_cfg.max_scale,
+        "aug": aug_cfg.to_dict() if train_transform is None else "custom train_transform",
+        "keep_empty": keep_empty,
+        "letterbox": letterbox,
+        "val_interval": val_interval,
+        "conf_thres": conf_thres,
+        "max_det": max_det,
+        "aux_w": aux_w,
+        "aux_w_warmup": aux_w_warmup,
+        "aux_w_per_head": aux_w_per_head,
+        "aux_class_weights": aux_class_weights,
+        "aux_iou_gate": aux_iou_gate,
+        "aux_class_gate": aux_class_gate,
+        "aux_balance": aux_balance,
+        "aux_head_arch": aux_head_arch,
+        "aux_heads": {s.name: ("regression" if s.regression else s.num_classes) for s in aux_specs},
+        "loss_weights": loss_weights,
+        "num_upscale_blocks": num_upscale_blocks,
+        "fpn_scales": list(fpn_scales) if fpn_scales else None,
+        "box_head": box_head,
+        "deep_supervision": deep_supervision,
+        "hires_epochs": hires_epochs,
+        "hires_imgsz": hires_imgsz,
+        "hires_batch": hires_batch,
+        "hires_lr": hires_lr if hires_epochs else None,
+        "hires_aug": hires_aug,
+        "attributes": {s.name: _head_record(s, names) for s in aux_specs},
+        "inference": inference,
+    }
+    _write_run_config(run_dir / "args.yaml", run_cfg)
 
     # --- model ---
     model = build_model(
@@ -867,16 +966,22 @@ def train(
         print("[model] deep supervision off: a query block is supervised only while it uses masked attention")
     if aux_specs:
         print(f"[model] aux head arch: {model.aux_head_arch}")
-    start_epoch, best_metric = 0, -1.0
-    optimizer = build_optimizer(model, lr0, weight_decay, backbone_lr_mult, llrd)
+    start_epoch, best_metric, phase_best = 0, -1.0, -1.0
     # Uncertainty weighting: one learned log-variance per attribute head, outside the model so that inference
     # checkpoints stay as they are (saved with the trainer state in last.pt). Its own group: head LR, no decay.
     aux_log_vars = None
     if aux_balance == "uncertainty" and aux_specs:
         aux_log_vars = torch.nn.ParameterDict({s.name: torch.nn.Parameter(torch.zeros((), device=dev)) for s in aux_specs})
-        optimizer.add_param_group(
-            {"params": list(aux_log_vars.values()), "lr": lr0, "initial_lr": lr0, "weight_decay": 0.0, "is_backbone": False}
-        )
+
+    def make_optimizer(lr: float):
+        opt = build_optimizer(model, lr, weight_decay, backbone_lr_mult, llrd)
+        if aux_log_vars is not None:
+            opt.add_param_group(
+                {"params": list(aux_log_vars.values()), "lr": lr, "initial_lr": lr, "weight_decay": 0.0, "is_backbone": False}
+            )
+        return opt
+
+    optimizer = make_optimizer(lr0)
 
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model"], strict=False)
@@ -886,6 +991,7 @@ def train(
             optimizer.load_state_dict(resume_ckpt["optimizer"])
         start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
         best_metric = float(resume_ckpt.get("best_metric", -1.0))
+        phase_best = float(resume_ckpt.get("phase_best", -1.0))
         print(f"[resume] at epoch {start_epoch} (best segm mAP {best_metric:.4f})")
     elif init_ckpt is not None:
         # Warm start: load weights only. Optimizer/EMA/epoch/best stay fresh, so the
@@ -939,6 +1045,82 @@ def train(
             loss = loss + aux_w_eff * a_loss
         return loss, out, aux_indices, aux_gated, grads
 
+    # Precision: bf16 (Ampere+/Blackwell) needs no GradScaler and is more stable
+    # than fp16; "auto" picks bf16 when supported, else fp16. The GradScaler is
+    # only ever enabled for fp16 — with bf16 its scale/unscale/step/update calls
+    # below become no-ops, leaving the loop logic unchanged.
+    amp_on = amp and dev.type == "cuda"
+    if not amp_on:
+        autocast_dtype, use_fp16 = torch.float32, False
+    elif amp_dtype == "fp16":
+        autocast_dtype, use_fp16 = torch.float16, True
+    elif amp_dtype == "bf16":
+        autocast_dtype, use_fp16 = torch.bfloat16, False
+    else:  # "auto"
+        if torch.cuda.is_bf16_supported():
+            autocast_dtype, use_fp16 = torch.bfloat16, False
+        else:
+            autocast_dtype, use_fp16 = torch.float16, True
+    print(f"[amp] {'off' if not amp_on else str(autocast_dtype).split('.')[-1]}"
+          f"{' (+GradScaler)' if use_fp16 else ''}")
+
+    # High-resolution phase: its micro-batch, checked on every GPU before anything trains (here, before DDP: a probe
+    # that runs out of memory on one GPU must not leave the others waiting in a gradient all-reduce).
+    hires_b = hires_batch or batch
+    if hires_epochs and start_epoch < epochs:
+        hires_train_ds = train_ds.at_imgsz(hires_imgsz, aug=AugConfig.resolve(aug_cfg, **(hires_aug or {})))
+        stored = resume_ckpt.get("hires_batch") if resume_ckpt is not None else None
+        if dev.type == "cuda":
+            # the images with the most instances: the loss's memory grows with them
+            busiest = sorted(range(len(train_ds)), key=lambda i: -len(train_ds.coco.imgToAnns.get(train_ds.ids[i], [])))
+            # what the probe step does not allocate yet: the AdamW moments, DDP's gradient buckets, the EMA copy
+            extra = sum(p.numel() * p.element_size() for p in model.parameters()) * (2 + (world > 1) + bool(ema))
+
+            def hires_fits(b: int) -> bool:
+                """One real training micro-step at ``hires_imgsz``, micro-batch ``b``, mask-free, on this GPU: does it fit
+                in the budget with ``extra`` added?"""
+                pv, geom, cls, attrs = collate_train([hires_train_ds[i] for i in busiest[:b]])
+                pv, geom, cls = pv.to(dev), [g.to(dev) for g in geom], [c.to(dev) for c in cls]
+                attrs = {k: [t.to(dev) for t in v] for k, v in attrs.items()}
+                saved, loss, peak = model.eomt.attn_mask_probs.clone(), None, None
+                model.eomt.attn_mask_probs.zero_()
+                model.train()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(dev)
+                try:
+                    with torch.amp.autocast("cuda", enabled=amp_on, dtype=autocast_dtype):
+                        loss = micro_step(model, pv, geom, cls, attrs, aux_w)[0]
+                    loss.backward()
+                    peak = torch.cuda.max_memory_allocated(dev)
+                except torch.cuda.OutOfMemoryError:
+                    pass
+                finally:
+                    loss = None
+                    model.zero_grad(set_to_none=True)
+                    model.eomt.attn_mask_probs.copy_(saved)
+                    torch.cuda.empty_cache()
+                usable = torch.cuda.mem_get_info(dev)[0] + torch.cuda.memory_reserved(dev)
+                ok = peak is not None and peak + extra <= HIRES_MEMORY_BUDGET * usable
+                print(f"[hires] probe on GPU {dev.index}: micro-batch {b} at {hires_imgsz} px "
+                      + ("runs out of memory" if peak is None else f"needs {(peak + extra) / 2**30:.1f} of {usable / 2**30:.1f} GiB")
+                      + ("" if ok else f": over the {HIRES_MEMORY_BUDGET:.0%} budget"))
+                return ok
+
+            # a resumed run keeps its micro-batch: its LR schedule depends on it
+            chosen = (stored if hires_fits(stored) else 0) if stored else _fit_batch(hires_b, hires_fits)
+            if world > 1:
+                t = torch.tensor([chosen], device=dev)
+                dist.all_reduce(t, op=dist.ReduceOp.MIN)
+                chosen = int(t)
+            if not chosen:
+                raise RuntimeError(f"hires phase: a micro-batch of {stored or 1} at {hires_imgsz} px does not fit on every GPU; "
+                                   "free memory or lower hires_imgsz")
+            hires_b = chosen
+        else:
+            hires_b = stored or hires_b
+        if hires_b != (hires_batch or batch):
+            print(f"[hires] micro-batch {hires_batch or batch} does not fit at {hires_imgsz} px: {hires_b}, more accumulation")
+
     # Several GPUs: DDP copies process 0's weights to the others here and averages the gradients in backward. The
     # buffers (the annealed masked-attention probabilities) are set identically on every process, not broadcast.
     step_model = _Forward(model, micro_step, aux_log_vars)
@@ -962,34 +1144,18 @@ def train(
     # produced constant graph breaks/recompiles: no net speedup and highly variable
     # step times. Keep the encoder eager.
 
-    # Precision: bf16 (Ampere+/Blackwell) needs no GradScaler and is more stable
-    # than fp16; "auto" picks bf16 when supported, else fp16. The GradScaler is
-    # only ever enabled for fp16 — with bf16 its scale/unscale/step/update calls
-    # below become no-ops, leaving the loop logic unchanged.
-    amp_on = amp and dev.type == "cuda"
-    if not amp_on:
-        autocast_dtype, use_fp16 = torch.float32, False
-    elif amp_dtype == "fp16":
-        autocast_dtype, use_fp16 = torch.float16, True
-    elif amp_dtype == "bf16":
-        autocast_dtype, use_fp16 = torch.bfloat16, False
-    else:  # "auto"
-        if torch.cuda.is_bf16_supported():
-            autocast_dtype, use_fp16 = torch.bfloat16, False
-        else:
-            autocast_dtype, use_fp16 = torch.float16, True
-    print(f"[amp] {'off' if not amp_on else str(autocast_dtype).split('.')[-1]}"
-          f"{' (+GradScaler)' if use_fp16 else ''}")
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
     iters_per_epoch = max(1, len(train_loader))
-    total_iters = epochs * iters_per_epoch
+    total_iters = lo_epochs * iters_per_epoch  # the main schedule spans the epochs before a high-resolution phase
     total_opt_steps = max(1, math.ceil(total_iters / accum_steps))
+    # the current phase: its schedule (warmup, first micro-iteration and epoch), input size and micro-batch
+    sched_warmup, phase_it0, phase_epoch0, hires_on, cur_imgsz, cur_batch = warmup_steps, 0, 0, False, imgsz, batch
     n_q_blocks = int(core.eomt.attn_mask_probs.numel())
     anneal_starts = _per_block(mask_anneal_start, n_q_blocks, "mask_anneal_start")
     anneal_ends = _per_block(mask_anneal_end, n_q_blocks, "mask_anneal_end")
     if main and val_ds is not None and mask_anneal:
-        mask_free_epoch = max(anneal_ends) * epochs
-        windows = ", ".join(f"{a * epochs:.1f}-{b * epochs:.1f}" for a, b in zip(anneal_starts, anneal_ends))
+        mask_free_epoch = max(anneal_ends) * lo_epochs
+        windows = ", ".join(f"{a * lo_epochs:.1f}-{b * lo_epochs:.1f}" for a, b in zip(anneal_starts, anneal_ends))
         print(
             f"[val] every {val_interval} epoch(s) and after the last, in the training regime (as the official EoMT): "
             f"masked attention at the current annealing (query-block windows at epochs {windows}; mask-free from "
@@ -1006,12 +1172,15 @@ def train(
     head_group = next(g for g in reversed(optimizer.param_groups) if not g.get("is_backbone"))  # shown in the log
 
     def lr_factors(it: int) -> tuple[float, float]:
-        """(head, backbone) multiplier of each group's ``initial_lr`` at micro-iteration ``it``."""
-        return _poly_two_stage_factors(it // accum_steps, total_opt_steps, warmup_steps, poly_power)
+        """(head, backbone) multiplier of each group's ``initial_lr`` at micro-iteration ``it``, on the schedule of the
+        current phase."""
+        return _poly_two_stage_factors((it - phase_it0) // accum_steps, total_opt_steps, sched_warmup, poly_power)
 
     tb = _Logger(logger, run_dir, name) if logger != "none" and main else None
 
-    def _save(path: Path, *, state_dict, with_trainer_state: bool):
+    def _save(path: Path, *, state_dict, with_trainer_state: bool, at_imgsz: int = imgsz):
+        """``at_imgsz``: save as a model of that input size (inference checkpoints of the high-resolution phase); the
+        trainer state stays at ``imgsz``, the size the model is rebuilt at to resume."""
         extra = {}
         if with_trainer_state:
             extra = {
@@ -1023,11 +1192,13 @@ def train(
                 extra["ema"] = ema_model.state_dict()
             if aux_log_vars is not None:
                 extra["aux_log_vars"] = aux_log_vars.state_dict()
+            if hires_epochs:
+                extra.update(phase_best=phase_best, hires_batch=hires_b)
         ckpt = wrap_checkpoint(
-            state_dict,
+            _state_at_imgsz(state_dict, imgsz, at_imgsz, int(getattr(core, "patch_size", 14))),
             size=size,
             nc=nc,
-            imgsz=imgsz,
+            imgsz=at_imgsz,
             names=names,
             task=family,
             aux_heads=aux_specs,
@@ -1040,6 +1211,8 @@ def train(
             norm_mean=getattr(core, "pixel_mean", None),
             norm_std=getattr(core, "pixel_std", None),
             patch_size=getattr(core, "patch_size", None),
+            inference=inference,
+            run_config=run_cfg,
             **extra,
         )
         save_checkpoint(ckpt, path)
@@ -1055,6 +1228,8 @@ def train(
             csv_fields += [f"val/segm/{k}" for k in _SEGM_KEYS]
         csv_fields += [f"val/bbox/{k}" for k in _SEGM_KEYS]
         csv_fields += [f"val/{metric_of[s.name]}/{s.name}" for s in aux_specs]
+    if hires_epochs:
+        csv_fields.append("imgsz")
     csv_log = _CsvLogger(run_dir / "metrics.csv", csv_fields) if main else None
 
     # Per-primary aux accuracy is computed held-out in aux_evaluate when a val split
@@ -1063,6 +1238,32 @@ def train(
 
     # --- epochs ---
     for epoch in range(start_epoch, epochs):
+        if hires_epochs and epoch >= lo_epochs and not hires_on:
+            # The high-resolution phase. Entered at its first epoch it starts from the EMA weights (what best.pt
+            # holds) with a fresh optimizer and EMA, as a warm-started fine-tune; a run resumed inside it already has
+            # them back from last.pt.
+            fresh = epoch == lo_epochs
+            hires_on, cur_imgsz, cur_batch = True, hires_imgsz, hires_b
+            phase_it0, phase_epoch0 = lo_epochs * iters_per_epoch, lo_epochs
+            accum_steps = max(1, round(eff_batch / (cur_batch * world)))
+            sampler, train_loader = make_loader(hires_train_ds, cur_batch)
+            iters_per_epoch = max(1, len(train_loader))
+            total_opt_steps = max(1, math.ceil(hires_epochs * iters_per_epoch / accum_steps))
+            sched_warmup = HIRES_WARMUP_STEPS
+            val_ds, val_seg_ds = make_val(hires_imgsz)
+            core.eomt.attn_mask_probs.zero_()
+            if fresh:
+                if ema_model is not None:
+                    core.load_state_dict(ema_model.module.state_dict())
+                optimizer = make_optimizer(hires_lr)
+                if ema:
+                    ema_model = ModelEMA(model, decay=HIRES_EMA_DECAY, tau=HIRES_EMA_TAU, device=dev)
+                phase_best = -1.0
+            head_group = next(g for g in reversed(optimizer.param_groups) if not g.get("is_backbone"))
+            print(f"[hires] epochs {lo_epochs}-{epochs - 1} at {hires_imgsz} px: micro-batch {cur_batch} x accum "
+                  f"{accum_steps}{f' x {world} GPUs' if world > 1 else ''} -> effective {cur_batch * accum_steps * world}, "
+                  f"LR {hires_lr:g} (warmup {HIRES_WARMUP_STEPS}), EMA {HIRES_EMA_DECAY}, mask-free"
+                  + (f", aug overrides {hires_aug}" if hires_aug else "") + ("; from the EMA weights" if fresh else "; resumed"))
         step_model.train()
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -1073,14 +1274,15 @@ def train(
         # per-primary-class aux accuracy (only accumulated as the no-val fallback)
         aux_pc: dict[str, dict[int, list[int]]] = {s.name: {} for s in aux_specs}
         aux_grad: dict[str, list[float]] = {s.name: [] for s in aux_specs}  # the heads' pull, measured on the main process
-        pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs - 1}", unit="batch", disable=not main)
+        desc = f"epoch {epoch}/{epochs - 1}" + (f" @{cur_imgsz}" if hires_epochs else "")
+        pbar = tqdm(train_loader, desc=desc, unit="batch", disable=not main)
         for step, (pixel_values, geom_labels, class_labels, aux_labels) in enumerate(pbar):
-            it = epoch * iters_per_epoch + step
+            it = phase_it0 + (epoch - phase_epoch0) * iters_per_epoch + step
             head_factor, vit_factor = lr_factors(it)
             for g in optimizer.param_groups:
                 g["lr"] = g["initial_lr"] * (vit_factor if g.get("is_backbone") else head_factor)
 
-            if mask_anneal:
+            if mask_anneal and not hires_on:
                 probs = _attn_mask_probs(it, total_iters, anneal_starts, anneal_ends, poly_power)
                 core.eomt.set_attn_mask_probs(probs)
 
@@ -1181,7 +1383,8 @@ def train(
         # probabilities of the epoch's end. The EMA copy is what gets validated and exported as best.pt.
         # When annealing is disabled, leave the buffers as they are.
         eval_model = ema_model.module if ema_model is not None else core
-        val_probs = _attn_mask_probs((epoch + 1) * iters_per_epoch, total_iters, anneal_starts, anneal_ends, poly_power)
+        val_probs = [0.0] * n_q_blocks if hires_on else _attn_mask_probs(
+            (epoch + 1) * iters_per_epoch, total_iters, anneal_starts, anneal_ends, poly_power)
         if mask_anneal:
             eval_model.eomt.set_attn_mask_probs(val_probs)
         # best.pt must run mask-free (as predict/val run it), so it is only chosen once the annealing is over.
@@ -1192,13 +1395,14 @@ def train(
         epoch_aux_pc: dict[str, dict[int, tuple[int, int]]] | None = None
         last_epoch = epoch + 1 in (epochs, stop_after_epochs)
         # A block mid-window unmasks a random share of its queries: seed it so every validation draws the same
-        # queries, without touching the training RNG.
-        if val_ds is not None and ((epoch + 1) % val_interval == 0 or last_epoch):
+        # queries, without touching the training RNG. The high-resolution phase is short: every epoch of it, and the
+        # last one before it, are validated.
+        if val_ds is not None and ((epoch + 1) % val_interval == 0 or last_epoch or hires_on or epoch + 1 == lo_epochs):
             with torch.random.fork_rng(devices=[dev] if dev.type == "cuda" else []):
                 torch.manual_seed(0)
                 if is_detect:
                     metrics = evaluate_detection(
-                        eval_model, val_ds, device=dev, batch_size=batch,
+                        eval_model, val_ds, device=dev, batch_size=cur_batch,
                         num_workers=workers, conf_thres=conf_thres, max_det=max_det,
                         amp=amp, verbose=main,
                     )
@@ -1208,7 +1412,7 @@ def train(
                     )
                 else:
                     metrics = evaluate(
-                        eval_model, val_ds, device=dev, batch_size=batch,
+                        eval_model, val_ds, device=dev, batch_size=cur_batch,
                         num_workers=workers, conf_thres=conf_thres, max_det=max_det,
                         amp=amp, verbose=main,
                     )
@@ -1219,7 +1423,7 @@ def train(
                     )
                 if val_seg_ds is not None:  # held-out matched-query accuracy per head
                     val_aux, epoch_aux_pc = aux_evaluate(
-                        eval_model, val_seg_ds, device=dev, batch_size=batch,
+                        eval_model, val_seg_ds, device=dev, batch_size=cur_batch,
                         num_workers=workers, amp=amp, verbose=main,
                         iou_gate=aux_iou_gate, class_gate=aux_class_gate,
                     )
@@ -1245,15 +1449,23 @@ def train(
             best_key = "bbox/mAP" if is_detect else "segm/mAP"
             cur = metrics.get(best_key, None)
             improved = deployable and cur is not None and cur > best_metric
+            # with a high-resolution phase, each phase also keeps its own best (best_<imgsz>.pt)
+            phase_improved = bool(hires_epochs) and deployable and cur is not None and cur > phase_best
             if improved:
                 best_metric = cur
+            if phase_improved:
+                phase_best = cur
             _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True)
             if improved:
-                _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False)
+                _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False, at_imgsz=cur_imgsz)
                 print(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
+            if phase_improved:
+                _save(weights_dir / f"best_{cur_imgsz}.pt", state_dict=eval_model.state_dict(), with_trainer_state=False,
+                      at_imgsz=cur_imgsz)
+                print(f"[epoch {epoch}] new best {best_key} at {cur_imgsz} px {phase_best:.4f} -> best_{cur_imgsz}.pt")
 
             # --- per-epoch metrics row (missing values -> nan) ---
-            row = {"epoch": epoch, "train/loss": epoch_loss}
+            row = {"epoch": epoch, "train/loss": epoch_loss, "imgsz": cur_imgsz}
             row.update({f"train/{metric_of[n]}/{n}": aux_acc[n] for n in aux_acc})
             row.update({f"train/aux_grad/{n}": g for n, g in aux_pull.items()})
             row.update({f"val/{k}": v for k, v in metrics.items()})
