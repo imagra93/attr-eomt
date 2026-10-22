@@ -125,7 +125,7 @@ def match(
         guard / guard_factor: merge guard against transitive chaining
             (:func:`eomt.reid.cluster`).
         keep_masks: retain full-resolution masks in the returned per-photo dicts.
-            Off by default — 30 photos of 20 instances at 4000x3000 is over 7 GB.
+            Off by default: full-resolution masks of every photo add up fast.
             The masks are released as each photo is processed, not at the end, so
             leaving this off caps peak memory rather than only trimming the result.
         sim_thres: cosine floor for "same instance"; also the low end of the link

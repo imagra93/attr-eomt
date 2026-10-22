@@ -495,9 +495,9 @@ def train(
     **Architecture options** (instance family). ``box_head=True`` adds an auxiliary box head trained with L1 +
     GIoU (``l1_weight`` / ``giou_weight``) whose boxes also enter the matching cost. ``deep_supervision=False``
     stops supervising a query block's prediction once that block's masked attention is annealed away; while the
-    block masks, its prediction builds the attention mask and stays supervised (unsupervised, it made noise masks).
-    With the default windows the blocks drop out at 2/6, 3/6, 4/6 and 5/6 of training (~40 % fewer intermediate
-    predictions overall) and only the last sixth runs final-only (~25 % faster steps); the reference recipe
+    block masks, its prediction builds the attention mask and stays supervised.
+    With the default windows the blocks drop out at 2/6, 3/6, 4/6 and 5/6 of training and only the
+    last sixth runs final-only; the reference recipe
     supervises every block throughout. Resuming keeps the checkpoint's ``box_head``; warm starts honor the argument.
 
     **Attribute heads.** A dataset attribute is categorical (cross-entropy) or ``"type": "regression"`` (a real
@@ -523,7 +523,7 @@ def train(
     **Several GPUs.** ``device="0,1"`` (GPU indices) runs one process per GPU with DistributedDataParallel;
     ``"auto"`` is GPU 0 alone. ``batch`` is per GPU and ``nominal_batch`` stays the global effective batch, so the
     accumulation shrinks (``nominal_batch / (batch x GPUs)``) and the optimizer steps, LR schedule and mask annealing
-    are those of one GPU (an epoch 1.9x faster on two RTX 5090s). Gradients are averaged over the GPUs on the last micro-step of
+    are those of one GPU. Gradients are averaged over the GPUs on the last micro-step of
     each accumulation window. Each GPU draws its own share of the images and augmentations (seed + rank); validation
     splits the val images between the GPUs and the main process scores them all; it alone logs and writes
     checkpoints and plots. ``workers`` is per GPU. Every argument must be picklable (the processes are spawned).
@@ -555,12 +555,11 @@ def train(
 
     **Validation** (every ``val_interval`` epochs and after the last one) runs the model in the regime it is trained in,
     as the official EoMT does: masked attention at the annealing probabilities of the epoch's end. A model that still
-    masks is far worse without its masks (part damage, ViT-L at epoch 11 of 50: 0.034 segm mAP mask-free against 0.114
-    masked), so a mask-free curve before the last sixth follows the annealing, not the model. ``best.pt`` must be
-    deployable mask-free, so it is only chosen once every block's annealing is over (a run stopped earlier has
-    ``last.pt`` alone); every checkpoint is saved mask-free. ``amp_dtype`` selects the autocast dtype:
-    ``"auto"`` uses bf16 on hardware that supports it (no GradScaler, more stable),
-    else fp16; force with ``"bf16"`` / ``"fp16"``.
+    masks is far worse without its masks, so a mask-free curve before the last sixth follows the annealing, not the
+    model. ``best.pt`` must be deployable mask-free, so it is only chosen once every block's annealing is over (a run
+    stopped earlier has ``last.pt`` alone); every checkpoint is saved mask-free.
+    ``amp_dtype`` selects the autocast dtype: ``"auto"`` uses bf16 on hardware that supports it (no GradScaler, more
+    stable), else fp16; force with ``"bf16"`` / ``"fp16"``.
     """
     if len(warmup_steps) != 2:
         raise ValueError("warmup_steps must be (head_steps, vit_steps)")

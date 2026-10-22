@@ -4,8 +4,7 @@ Quantizes the weights of the ViT transformer blocks — the bulk of the paramete
 to int8, while keeping the precision-sensitive prediction heads (class/mask/box),
 the patch embedding and all ``LayerNorm``s in full precision. This is **data-free**:
 int8 weight-only quant just re-rounds the existing weights, so there is no
-calibration step and accuracy is preserved in practice (≈3.4× smaller state dict on
-ViT-L with no measurable mAP loss).
+calibration step (≈3.4× smaller state dict on ViT-L).
 
 The recipe applied is recorded in the checkpoint so :func:`eomt.serialization.load_model`
 can re-create the quantized layout before loading the (subclassed) weight tensors.

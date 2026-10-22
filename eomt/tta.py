@@ -3,7 +3,7 @@
 Both run the model on several *views* of one image and merge the instances the views find:
 
 * ``augment=True``: the whole image at ``imgsz`` and zoomed to 1.5x ``imgsz`` (the zoom is what helps small and thin
-  objects; on the windscreen damages it gave +5 % mask mAP and +23 % small-object AP, where the mirror gave ~0).
+  objects).
   ``augment={...}`` overrides ``scales`` (whole-image input sizes as multiples of ``imgsz``, default ``[1.0, 1.5]``)
   and ``flip`` (also run every view mirrored, default False). A categorical head marked ``flip_aware`` (stored in the
   checkpoint) is swapped back in a mirrored view's prediction before the merge; regression heads are taken as flip-
@@ -30,9 +30,8 @@ A cluster's mask is the mean of its members' mask *logits*, each pixel averaged 
 decoded as a single prediction is (thresholded at ``logit(mask_thresh)``): averaging probabilities instead moves the
 boundary of a sharp mask by a fraction of a cell, which reshapes thin ones. Its score is ``"mean"``: the members'
 summed scores over the number of views that fully contain the object, so a view that saw it and missed it votes 0 (as
-in weighted boxes fusion); or ``"max"``, the best member's, which keeps every single-view detection at its own score
-(with tiles on the windscreen damages it lost 4 % mask mAP to ``"mean"``, its single-tile false positives flooding the
-repair / replace rules). Attribute probabilities and embeddings are score-weighted means. Instance family only.
+in weighted boxes fusion); or ``"max"``, the best member's, which keeps every single-view detection at its own score,
+false positives included. Attribute probabilities and embeddings are score-weighted means. Instance family only.
 """
 
 from __future__ import annotations

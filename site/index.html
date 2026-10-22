@@ -406,7 +406,7 @@ matched  = gather_matched(out, indices)                          <span class="c"
       <tr><td><code>ema</code> / <code>ema_decay</code> / <code>ema_tau</code></td><td><code>True</code> / <code>0.9999</code> / <code>2000</code></td><td>validate &amp; export <code>best.pt</code> from an EMA of the weights</td></tr>
       <tr><td><code>llrd</code> / <code>backbone_lr_mult</code></td><td><code>0.8</code> / <code>1.0</code></td><td>layer-wise LR decay on the DINOv2 encoder, top block at <code>lr0 &times; backbone_lr_mult</code> (<code>llrd=1.0</code> = flat)</td></tr>
       <tr><td><code>box_head</code></td><td><code>False</code></td><td>auxiliary box head: L1 + GIoU loss and a box term in the Hungarian matching cost</td></tr>
-      <tr><td><code>deep_supervision</code></td><td><code>True</code></td><td><code>False</code> stops supervising a query block once its masked attention is annealed away (~26% faster steps in the mask-free last sixth)</td></tr>
+      <tr><td><code>deep_supervision</code></td><td><code>True</code></td><td><code>False</code> stops supervising a query block once its masked attention is annealed away</td></tr>
       <tr><td><code>poly_power</code> / <code>warmup_steps</code></td><td><code>0.9</code> / <code>(500, 1000)</code></td><td>polynomial LR decay to 0; two-stage warmup in optimizer steps (head, then ViT with its LR held at 0 during the head warmup)</td></tr>
       <tr><td><code>aug</code></td><td>strong recipe</td><td>every augmentation knob (<code>AugConfig</code>): flip, Large-Scale Jitter, rotate / shear / perspective, gamma, grayscale, blur, noise, JPEG, glare, safe erasing; mosaic / mixup / copy-paste and the instance-aware crop are off. A mapping, or a <code>train_aug</code> block in the dataset YAML; <code>{"preset": "legacy"}</code> restores the original recipe</td></tr>
       <tr><td><code>min_scale</code> / <code>max_scale</code></td><td><code>0.1</code> / <code>2.0</code></td><td>Large-Scale Jitter range (explicit values beat <code>aug</code>)</td></tr>
@@ -428,7 +428,7 @@ matched  = gather_matched(out, indices)                          <span class="c"
 <section>
   <div class="tag">Deployment</div>
   <h2>Compress to int8</h2>
-  <p><code>compress()</code> applies <strong>int8 weight-only quantization</strong> (via <a href="https://github.com/pytorch/ao">torchao</a>) to the ViT transformer blocks — the bulk of the parameters — while keeping the prediction heads in full precision. It's <strong>data-free</strong> (no calibration) and shrinks the checkpoint <strong>≈3.4×</strong> on <code>l</code> with no measurable mAP loss.</p>
+  <p><code>compress()</code> applies <strong>int8 weight-only quantization</strong> (via <a href="https://github.com/pytorch/ao">torchao</a>) to the ViT transformer blocks — the bulk of the parameters — while keeping the prediction heads in full precision. It's <strong>data-free</strong> (no calibration) and shrinks the checkpoint <strong>≈3.4×</strong> on <code>l</code>; pass <code>data=</code> to measure the mAP before and after.</p>
 <pre>m = EoMT(<span class="s">"runs/train/eomt-l"</span>)
 m.<span class="f">compress</span>(<span class="s">"int8"</span>, data=<span class="s">"coco"</span>, save=<span class="s">"runs/train/eomt-int8/weights/best.pt"</span>)
 <span class="c"># deltas returned + written to compression_metrics.json; omit `data` to skip validation</span>

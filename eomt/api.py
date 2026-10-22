@@ -327,9 +327,9 @@ class EoMT:
         """Quantize the ViT transformer blocks to int8 with ``torchao`` and report the impact.
 
         Int8 weight-only quantization is **data-free** (it just re-rounds the existing
-        weights) and keeps the prediction heads in full precision, so accuracy is
-        preserved in practice while the state dict shrinks ≈3.4× on ViT-L. With
-        ``data`` set and ``validate=True``, mAP is measured before and after. ``save``
+        weights) and keeps the prediction heads in full precision; the state dict shrinks
+        ≈3.4× on ViT-L. With ``data`` set and ``validate=True``, mAP is measured before
+        and after. ``save``
         writes a self-describing compressed checkpoint reloadable with ``EoMT(path)``,
         plus a ``compression_metrics.json`` sidecar in the run folder recording these
         size / mAP / latency deltas. Returns the same metrics as a dict.

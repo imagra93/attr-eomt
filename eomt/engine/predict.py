@@ -71,8 +71,7 @@ def predict_image(
     dict (with masks).
 
     ``amp`` runs the network under autocast (``True`` / ``"auto"`` = bf16 where supported, or
-    ``"bf16"`` / ``"fp16"``): ~2.5x faster at 644 px on an RTX 5090 with the same accuracy (AP
-    within 0.002 in every size bucket on a trained ViT-L model). Off by default.
+    ``"bf16"`` / ``"fp16"``). Off by default.
 
     With ``embed``, the result also carries ``"embed"`` ``(N, hidden)``: the per-query
     embedding of each kept detection, sliced out of the same forward pass. It is the

@@ -71,8 +71,8 @@ def track(
         with_attr: treat the attribute(s) as part of the class — the tracked identity
             becomes the compound class ``cls-attr1-attr2…``. Since ByteTrack is
             class-agnostic, this runs one ByteTrack **per compound class** (per-class
-            association), so a ``front_door-left`` detection can never match a
-            ``front_door-right`` track. Labels/summary report the compound name. A part
+            association), so a ``shoe-left`` detection can never match a
+            ``shoe-right`` track. Labels/summary report the compound name. An object
             whose attribute flickers briefly spawns a short competing track (suppressed
             by ``min_hits``). Default ``False`` keeps class + box association with the
             attribute smoothed by its running mean.
@@ -398,7 +398,7 @@ def _labels(m, tids, res, names, aux_head_names, aux_label_names, show_scores,
     """Build per-detection label strings: ``#id class [score] [smoothed attrs]``.
 
     When ``compound_names`` is given (with_attr), the compound class name is shown
-    (e.g. ``front_door-right``) instead of the base class plus trailing attributes.
+    (e.g. ``shoe-right``) instead of the base class plus trailing attributes.
     """
     classes = res["classes"].tolist()
     scores = res["scores"].tolist()
@@ -422,7 +422,7 @@ def _labels(m, tids, res, names, aux_head_names, aux_label_names, show_scores,
 
 
 def _compound_name(key, names, aux_head_names, aux_label_names) -> str:
-    """``(base_cls, attr1_id, …)`` -> ``base_name-attr1_name-…`` (e.g. front_door-right)."""
+    """``(base_cls, attr1_id, …)`` -> ``base_name-attr1_name-…`` (e.g. shoe-right)."""
     base = int(key[0])
     parts = [names.get(base, str(base)) if names else str(base)]
     for name, aid in zip(aux_head_names, key[1:]):

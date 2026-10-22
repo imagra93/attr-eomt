@@ -20,7 +20,7 @@ Pipeline order (per training sample)::
     ImageNet normalise
 
 Why masks stay *soft*: nearest-neighbour resizing keeps the area of a thin mask but breaks it into dots (a 5 px
-crack shrunk 3x becomes a dashed 1-px line). The EoMT loss already reads targets through bilinear ``grid_sample``,
+wide line shrunk 3x becomes a dashed 1-px line). The EoMT loss already reads targets through bilinear ``grid_sample``,
 so area-averaged float targets in [0, 1] are the faithful ground truth. ``mask_resize="nearest"`` restores the old
 hard masks.
 
@@ -93,7 +93,7 @@ class AugConfig:
       photo exactly like real defocus/motion would).
     * ``noise_*`` — additive Gaussian noise, ``std`` in [0, 1] intensity units.
     * ``jpeg_*`` — JPEG recompression at the source resolution, ``quality`` in [1, 100].
-    * ``glare_*`` — soft additive highlights / streaks (reflections on glass, flash).
+    * ``glare_*`` — soft additive highlights / streaks (reflections, flash).
     * ``erasing_*`` — random rectangles filled with a flat colour; with ``erasing_avoid_instances`` they never touch
       an instance (so thin objects are never erased while keeping their label).
 
@@ -116,8 +116,9 @@ class AugConfig:
     * ``zoom_prob`` / ``zoom_scale`` / ``zoom_attr`` — a close-up now and then: with probability ``zoom_prob`` a sample
       is scaled by ``s ~ U(zoom_scale)`` instead of the LSJ range (``(4, 5)``: 4-5x the whole-image view, past the
       photo's own resolution) and the window is placed on a focus instance, kept whole when it fits, else a window
-      inside it. ``zoom_attr`` restricts the focus to instances with a value of that attribute (e.g. ``"area"``) and
-      the zoom to samples that have one. A crop-aware value follows the kept share as in any crop.
+      inside it. ``zoom_attr`` restricts the focus to instances with a value of that attribute (e.g.
+      ``"surface_cm2"``) and the zoom to samples that have one. A crop-aware value follows the kept share as in any
+      crop.
 
     **Masks**
 

@@ -169,9 +169,7 @@ def similarity_matrix(embed: torch.Tensor, *, center: bool = False) -> torch.Ten
     normalizing. That removes the common-mode component shared by every query and
     slightly widens the gap between matches and non-matches, but it is *transductive*
     — the similarities, and therefore the meaning of ``sim_thres``, then depend on
-    which photos happen to be in the set. Measured on real data the gain was small
-    (gap +0.44 -> +0.55 on one case) while the whole scale shifted down, so it is off
-    by default.
+    which photos happen to be in the set, so it is off by default.
     """
     if embed.numel() == 0:
         return torch.zeros((embed.shape[0], embed.shape[0]))

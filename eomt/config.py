@@ -48,15 +48,16 @@ class AuxHeadSpec:
     ``value_range`` (optional) bounds the valid values and clips the predictions.
 
     ``crop`` makes a regression value follow the fraction of the instance the training augmentation keeps in view
-    (crop, warp, copy-paste occlusion): ``"scale"`` multiplies it by that fraction (an extensive quantity such as an
-    area), ``"ignore"`` drops it when less than ``min_visible`` is kept (a property of the whole instance). ``None``
-    (the default) ⇒ the value does not change under augmentation. Training only; not stored in checkpoints.
+    (crop, warp, copy-paste occlusion): ``"scale"`` multiplies it by that fraction (an extensive quantity such as a
+    surface in cm²), ``"ignore"`` drops it when less than ``min_visible`` is kept (a property of the whole
+    instance). ``None`` (the default) ⇒ the value does not change under augmentation. Training only; not stored in
+    checkpoints.
 
     ``flip_aware`` (categorical heads) maps a contiguous id to the one it becomes when the training augmentation flips
-    the instance horizontally (``{left: right, right: left}``), so a laterality survives ``flip_prob > 0``. Ids it
-    does not list stay as they are. Stored in checkpoints: the horizontal-flip test-time augmentation (:mod:`eomt.tta`)
-    swaps it back in a mirrored view's prediction. A regression head is flip-invariant (an area does not change when
-    the photo is mirrored), so the merge averages it as it is.
+    the instance horizontally (``{left: right, right: left}``), so a left / right attribute survives ``flip_prob > 0``.
+    Ids it does not list stay as they are. Stored in checkpoints: the horizontal-flip test-time augmentation
+    (:mod:`eomt.tta`) swaps it back in a mirrored view's prediction. A regression head is flip-invariant (a length
+    does not change when the photo is mirrored), so the merge averages it as it is.
     """
 
     name: str
