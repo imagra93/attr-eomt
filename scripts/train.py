@@ -22,6 +22,10 @@ Fine-tune or resume (use one, not both):
     python scripts/train.py --data my/data.yaml --weights runs/train/eomt-l/weights/best.pt \
         --name eomt-l-ft --epochs 3 --lr 2e-5 --warmup 100,200 --ema-decay 0.999 --mask-free  # a short, gentle warm start
 
+Post-train a checkpoint so that 1-4 photos of one subject are predicted together (cross-view):
+scripts/train_multiview.py runs this script with that recipe. ``--multiview`` takes a YAML of
+``eomt.engine.train.DEFAULT_MULTIVIEW`` keys (configs/xview.yaml), and ``--batch`` then counts sets of photos.
+
 A flag left out keeps the run config's value (the ``train`` section of the --data YAML, see eomt.data.config), else
 ``EoMT.train()``'s default (see the README, "Optimisation recipe"). A run defined in its YAML needs only that:
 
@@ -49,7 +53,7 @@ def _parse_aug(items: list[str], preset: str | None) -> dict | None:
     return aug or None
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", default="coco", help="Dataset YAML path or alias ('coco' auto-downloads).")
     p.add_argument("--size", default="l", choices=["s", "b", "l"], help="Model size.")
@@ -96,7 +100,10 @@ def main() -> None:
     g.add_argument("--val-interval", type=int, default=None, help="Validate every N epochs and after the last (2).")
     g.add_argument("--workers", type=int, default=None, help="Data-loader workers per GPU (8).")
     g.add_argument("--seed", type=int, default=None, help="Seed (ignored when resuming, so the epoch's shuffle is not replayed).")
-    args = p.parse_args()
+    p.add_argument("--multiview", default=None, metavar="YAML",
+                   help="Post-train --weights for several photos predicted together: a YAML of "
+                        "eomt.engine.train.DEFAULT_MULTIVIEW keys (e.g. configs/xview.yaml).")
+    args = p.parse_args(argv)
 
     if args.weights and args.resume:
         raise SystemExit("pass --resume (continue a run) or --weights (warm-start a fresh run), not both.")
@@ -110,6 +117,9 @@ def main() -> None:
     if args.mask_free:
         zeros = (0.0,) * len(EOMT_MASK_ANNEAL_START)
         overrides.update(mask_anneal_start=zeros, mask_anneal_end=zeros)
+    if args.multiview:
+        with open(args.multiview) as f:
+            overrides["multiview"] = yaml.safe_load(f) or {}
     overrides = {k: v for k, v in overrides.items() if v is not None}
 
     if args.fpn_scales is not None:

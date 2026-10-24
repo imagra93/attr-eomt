@@ -396,6 +396,53 @@ python scripts/match.py weights/best.pt photos/ --each-subdir   # one folder per
 
 Every option is documented in [`eomt/engine/match.py`](eomt/engine/match.py) and `python scripts/match.py --help`.
 
+### Predicting the photos together (cross-view)
+
+Re-identification links what each photo found on its own. A **cross-view** model predicts
+the photos of one subject (1–4) in **one** forward pass: after each of the four query
+blocks, the queries of every photo attend to the patches and queries of the *other*
+photos (plus a null token to abstain). An instance that is tiny or covered in one photo
+can be found because another shows it clearly, and an ambiguous close-up can take its
+class and attributes from the wide shot. Each photo's masks still cover only what that
+photo shows, and a photo alone is predicted bit for bit as before. A small matching head
+embeds every instance for the cross-photo links.
+
+It is a post-training of an existing checkpoint, and it needs no multi-photo annotations:
+each set is made from one annotated photo — a hard view (shrunken, degraded, occluded or a
+close-up), a view that clears it up, and optionally a distractor photo and a mirrored copy
+— and every instance keeps its annotation id across the views:
+
+```bash
+# post-train a trained model -> runs/train/multiview/weights/best.pt
+python scripts/train_multiview.py --data my/data.yaml --weights runs/train/eomt-l/weights/best.pt --device 0,1
+
+# predict the photos of each subject together: photos/ holds one subject's photos, or a subfolder per subject
+python scripts/predict.py runs/train/multiview photos/ --subject
+```
+
+`scripts/train_multiview.py` is `scripts/train.py` with the recipe as defaults (`--multiview configs/xview.yaml
+--batch 1 --epochs 2 --val-interval 1 --name multiview`); any other flag of `scripts/train.py` can be added and wins.
+In Python, `EoMT(path).predict("photos/", subject=True)`.
+
+The default config is stage A: only the new modules train (about 18 M parameters on `l`),
+the checkpoint stays frozen; stage B adds `query_blocks: 0.1` to `trainable`. `best.pt` is
+chosen on fixed synthetic validation sets: the hard photo's segm mAP predicted with its set
+(`val/sets/segm/mAP_set`, next to `_alone`), its attributes, and the link F1 of the
+matching head against plain re-ID (`val/sets/match/*` vs `val/sets/reid/*`). Synthetic sets
+show neither real viewpoint changes nor real reflections: measure on real multi-photo sets
+before trusting a gain. `infer_match()` and `scripts/match.py` predict a cross-view
+checkpoint jointly (`joint=False` for one pass per photo), with its calibrated threshold
+and no class gate; `eomt.engine.predict.predict_set` returns the per-photo results alone.
+
+For a subject with more photos than a set holds, `eomt.engine.predict.predict_subject` groups
+them (`subject_sets`) and returns one result per photo: `mode="order"` (the default) predicts
+them `max_views` at a time in the given order, every photo once (about the cost of predicting
+them one by one); `"partition"` groups similar photos (mean patch token of a small pass);
+`"anchor"` predicts each photo with its `k` most similar others. On real multi-photo sets
+(close-ups plus overviews of each subject) the three gave the same gain: what helps is seeing
+other photos of the subject, not a particular one. `scripts/predict.py --subject [MODE]` and
+`predict(subject=MODE)` take the mode (`--subject` alone is `"order"`).
+
 ---
 
 ## Install

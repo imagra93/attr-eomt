@@ -1,0 +1,26 @@
+# Post-training for 1-4 photos of one subject predicted together — stage A, the config that
+#
+#   python scripts/train_multiview.py --data <dataset>/data.yaml --weights best.pt --device 0,1
+#
+# runs (it is scripts/train.py with this file, --batch 1 --epochs 2 --val-interval 1 --name multiview).
+#
+# Keys: eomt.engine.train.DEFAULT_MULTIVIEW. --batch counts sets of photos (a set of 4 photos at 644 px takes
+# ~15 GB on an RTX 3090 with this config).
+xview:
+  mode: blocks          # blocks: a cross-view sublayer after each query block (level 2); refiner: the level-1 baseline
+  max_views: 4
+match_dim: 128          # cross-photo matching head (0 = none)
+match_w: 1.0            # its contrastive loss weight
+match_tau: 0.1          # and temperature
+trainable:              # parameter group -> multiplier of --lr; everything else in the checkpoint stays frozen
+  xview: 1.0
+  match_head: 1.0
+  # stage B, only if stage A falls short: --weights <stage A best.pt> and add
+  # query_blocks: 0.1
+sets:                   # eomt.data.sets.SetConfig
+  max_views: 4
+  p_single: 0.3
+  cases: {small: 1.0, degraded: 1.0, closeup: 1.0, occluded: 1.0}
+  p_elsewhere: 0.2
+  p_distractor: 0.5
+  p_flipped_copy: 0.25
