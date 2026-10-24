@@ -21,6 +21,12 @@ Fine-tune or resume (use one, not both):
     python scripts/train.py --data my/data.yaml --weights runs/train/eomt-l/weights/best.pt \
         --name eomt-l-ft --epochs 3 --lr 2e-5 --warmup 100,200 --ema-decay 0.999 --mask-free  # a short, gentle warm start
 
+Post-train a checkpoint so that 1-4 photos of one subject are predicted together (cross-view); the
+YAML holds ``eomt.engine.train.DEFAULT_MULTIVIEW`` keys and ``--batch`` counts sets of photos:
+
+    python scripts/train.py --data my/data.yaml --weights best.pt --multiview configs/xview.yaml \
+        --name xview-a --batch 1 --epochs 6 --device 0,1
+
 A flag left out keeps ``EoMT.train()``'s default (see the README, "Optimisation recipe").
 """
 
@@ -92,6 +98,9 @@ def main() -> None:
     g.add_argument("--val-interval", type=int, default=None, help="Validate every N epochs and after the last (2).")
     g.add_argument("--workers", type=int, default=None, help="Data-loader workers per GPU (8).")
     g.add_argument("--seed", type=int, default=None, help="Seed (ignored when resuming, so the epoch's shuffle is not replayed).")
+    p.add_argument("--multiview", default=None, metavar="YAML",
+                   help="Post-train --weights for several photos predicted together: a YAML of "
+                        "eomt.engine.train.DEFAULT_MULTIVIEW keys (e.g. configs/xview.yaml).")
     args = p.parse_args()
 
     if args.weights and args.resume:
@@ -106,6 +115,9 @@ def main() -> None:
     if args.mask_free:
         zeros = (0.0,) * len(EOMT_MASK_ANNEAL_START)
         overrides.update(mask_anneal_start=zeros, mask_anneal_end=zeros)
+    if args.multiview:
+        with open(args.multiview) as f:
+            overrides["multiview"] = yaml.safe_load(f) or {}
     overrides = {k: v for k, v in overrides.items() if v is not None}
 
     if args.fpn_scales.strip().lower() in ("", "none", "off", "0"):

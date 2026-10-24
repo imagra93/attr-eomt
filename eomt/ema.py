@@ -48,7 +48,8 @@ class ModelEMA:
         d = self.decay * (1.0 - math.exp(-self.updates / self.tau)) if self.tau > 0 else self.decay
         src = _unwrap(model)
         for ema_p, p in zip(self.module.parameters(), src.parameters()):
-            ema_p.mul_(d).add_(p.detach().to(ema_p.dtype), alpha=1.0 - d)
+            if p.requires_grad:  # a frozen parameter never moves: averaging it would only add rounding drift
+                ema_p.mul_(d).add_(p.detach().to(ema_p.dtype), alpha=1.0 - d)
         for ema_b, b in zip(self.module.buffers(), src.buffers()):
             ema_b.copy_(b)
 

@@ -444,8 +444,8 @@ class EoMT:
                     save: str | None = "runs/match", conf_thres: float = 0.3,
                     max_det: int = 30, mask_thresh: float = 0.5,
                     imgsz: int | None = None,
-                    group_by: tuple[str, ...] | None = ("class",),
-                    sim_thres: float = 0.7, **kw) -> dict:
+                    group_by: tuple[str, ...] | str | None = "auto",
+                    sim_thres: float | None = None, **kw) -> dict:
         """Re-identify instances across a set of photos of the *same subject*.
 
         Given several photos of one subject from different viewpoints, decides which
@@ -468,6 +468,12 @@ class EoMT:
         gating, which needs a higher ``sim_thres``. ``sim_thres`` is the cosine floor
         for "same instance" — Hungarian always returns a full assignment, so the
         threshold is what turns "best available partner" into "new instance".
+
+        A cross-view model (post-trained with ``train(multiview=...)``) predicts the photos
+        **jointly** — one forward pass in which each photo's queries take what the others
+        show, at most 4 photos — and matches on its matching head with its calibrated
+        threshold and no class gate (``group_by="auto"``, ``sim_thres=None``); pass
+        ``joint=False`` for one pass per photo.
         """
         return _match(
             self.model, str(source), plot=plot, save=save, conf_thres=conf_thres,
@@ -495,6 +501,8 @@ class EoMT:
             norm_mean=getattr(m, "pixel_mean", None), norm_std=getattr(m, "pixel_std", None),
             patch_size=getattr(m, "patch_size", None),
             compression=self._compression,
+            xview=getattr(m, "xview_cfg", None), match_dim=getattr(m, "match_dim", 0) or None,
+            match_thres=getattr(m, "match_thres", None),
         )
         save_checkpoint(ckpt, path)
 

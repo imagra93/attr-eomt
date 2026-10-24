@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..postprocess import postprocess_detection, postprocess_instance
+from ..postprocess import postprocess_detection, postprocess_instance, slice_batch
 from ..preprocess import preprocess_numpy
 from ..serialization import load_model
 from ..tta import TTAConfig, predict_views
@@ -137,6 +137,53 @@ def predict_image(
             else torch.zeros((result["num_detections"], 0))
         )
     return result
+
+
+@torch.no_grad()
+def predict_set(
+    model,
+    images: list[Image.Image],
+    *,
+    device,
+    imgsz: int,
+    conf_thres: float = 0.3,
+    max_det: int = 100,
+    mask_thresh: float = 0.5,
+    letterbox: bool = True,
+    amp: bool | str = False,
+) -> list[dict]:
+    """Predict the photos of ONE subject together, in one forward pass: with a cross-view model (``xview``) the
+    queries of each photo take what the others show; any other model predicts each photo as :func:`predict_image`.
+
+    Returns one :func:`~eomt.postprocess.postprocess_instance` dict per photo, each with ``"embed"`` ``(N, d)``: the
+    matching head's embedding of each kept detection when the model has one (``match_embed``, L2-normalized), else the
+    per-query embedding (re-identification's fingerprint, :mod:`eomt.reid`). At most the model's ``max_views`` photos.
+    """
+    max_views = int((getattr(model, "xview_cfg", None) or {}).get("max_views", len(images)))
+    if not 1 <= len(images) <= max_views:
+        raise ValueError(f"predict_set takes 1 to {max_views} photos of one subject, got {len(images)}.")
+    aux_scopes = {s.name: s.applies_to for s in getattr(model, "aux_specs", []) if s.applies_to is not None}
+    chws, metas = zip(*(
+        preprocess_numpy(np.array(im.convert("RGB")), imgsz, letterbox=letterbox,
+                         mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None))
+        for im in images
+    ))
+    x = torch.from_numpy(np.stack(chws)).to(device)
+    set_ids = torch.zeros(len(images), dtype=torch.long)
+    dtype = _amp_dtype(device, amp)
+    if dtype is None:
+        out = model(x, set_ids=set_ids)
+    else:
+        with torch.autocast("cuda", dtype=dtype):
+            out = model(x, set_ids=set_ids)
+    embed = out.get("match_embed", out["query_embed"])
+    results = []
+    for b, (im, meta) in enumerate(zip(images, metas)):
+        res = postprocess_instance(slice_batch(out, b), conf_thres, im.size, max_det=max_det, mask_thresh=mask_thresh,
+                                   preprocess_meta=meta, aux_scopes=aux_scopes)
+        res["embed"] = embed[b, res["query_idx"]].float().cpu()
+        results.append(res)
+    return results
 
 
 def predict(

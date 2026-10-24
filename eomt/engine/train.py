@@ -31,10 +31,11 @@ from ..aux_cls import (
     aux_accuracy_by_primary,
     aux_loss,
     gate_indices,
+    match_loss,
     match_queries,
 )
-from ..config import normalize_loss_weights
-from ..data import CocoDetection, CocoInstanceSeg, CocoValImages, collate_train
+from ..config import aux_specs_from_meta, normalize_loss_weights
+from ..data import CocoDetection, CocoInstanceSeg, CocoValImages, CocoViewSets, collate_sets, collate_train
 from ..data.coco import _attr_label
 from ..data.transforms import AugConfig, build_val_transform
 from ..ema import ModelEMA, _unwrap
@@ -43,7 +44,7 @@ from ..plotting import plot_aux_per_class, plot_metrics_csv
 from ..device import gpu_ids, resolve_device
 from ..serialization import load_raw, resolve_checkpoint, save_checkpoint, wrap_checkpoint
 from .distributed import is_main, launch, rank, sum_over_processes, world_size
-from .validate import _SEGM_KEYS, aux_evaluate, evaluate, evaluate_detection
+from .validate import _SEGM_KEYS, aux_evaluate, evaluate, evaluate_detection, evaluate_sets
 
 _ENCODER_PREFIXES = ("eomt.embeddings", "eomt.layers", "eomt.layernorm")
 # Parameters excluded from weight decay regardless of group: all 1-D tensors
@@ -125,6 +126,77 @@ def build_optimizer(
     for g in opt.param_groups:
         g["initial_lr"] = g["lr"]
     return opt
+
+
+#: Multi-photo post-training (``train(multiview=...)``): the cross-view modules (``xview``, see
+#: :data:`eomt.model.DEFAULT_XVIEW`), the matching head's width (0 = none), its contrastive loss weight and
+#: temperature, the LR multiplier (of ``lr0``) of each parameter group that trains — every other parameter of the
+#: checkpoint stays frozen — and how the synthetic sets are drawn (:class:`~eomt.data.sets.SetConfig`).
+DEFAULT_MULTIVIEW: dict = {
+    "xview": {"mode": "blocks"},
+    "match_dim": 128,
+    "match_w": 1.0,
+    "match_tau": 0.1,
+    "trainable": {"xview": 1.0, "match_head": 1.0},
+    "sets": {},
+}
+#: Parameter groups of the multi-photo post-training -> name prefixes (the query blocks are added per model).
+_MULTIVIEW_GROUPS = {
+    "xview": ("eomt.xview.", "eomt.refiner."),
+    "match_head": ("match_head.",),
+    "query_blocks": ("eomt.cross_blocks.", "eomt.query."),
+    "heads": ("eomt.class_predictor.", "eomt.mask_head.", "eomt.upscale_block.", "eomt.quality_head.",
+              "eomt.layernorm.", "aux_heads."),
+}
+
+
+def build_multiview_optimizer(model, lr: float, weight_decay: float, trainable: dict[str, float]):
+    """Freeze every parameter outside the ``trainable`` groups (:data:`_MULTIVIEW_GROUPS`; the embeddings, the layers
+    before the queries and the FPN always stay frozen) and give each group ``lr`` times its multiplier (AdamW, no decay
+    on 1-D tensors). The query blocks warm up with the ViT (``is_backbone``), the others with the head."""
+    unknown = set(trainable) - set(_MULTIVIEW_GROUPS)
+    if unknown:
+        raise ValueError(f"multiview trainable groups {sorted(unknown)}: choose from {sorted(_MULTIVIEW_GROUPS)}")
+    n, nb = model.config.num_hidden_layers, model.config.num_blocks
+    prefixes = {**_MULTIVIEW_GROUPS, "query_blocks": _MULTIVIEW_GROUPS["query_blocks"]
+                + tuple(f"eomt.layers.{i}." for i in range(n - nb, n))}
+    groups: dict[tuple, dict] = {}
+    for name, p in model.named_parameters():
+        g = next((g for g, pre in prefixes.items() if name.startswith(pre)), None)
+        p.requires_grad_(g in trainable)
+        if g not in trainable:
+            continue
+        wd = 0.0 if p.ndim <= 1 else weight_decay
+        groups.setdefault((g, wd), {"params": [], "lr": lr * float(trainable[g]), "weight_decay": wd,
+                                    "is_backbone": g == "query_blocks"})["params"].append(p)
+    opt = torch.optim.AdamW(list(groups.values()), lr=lr, weight_decay=weight_decay)
+    for g in opt.param_groups:
+        g["initial_lr"] = g["lr"]
+    return opt
+
+
+def _adopt_checkpoint_aux(ds, ckpt: dict) -> None:
+    """Keep a post-trained checkpoint's attribute heads as they were trained: its standardization of the regression
+    values and its flip-aware swaps (the dataset JSON may lack them, or yield other statistics), over the dataset's
+    vocabularies (which must be the same) and training-only settings (``crop``)."""
+    saved = {s.name: s for s in aux_specs_from_meta(ckpt.get("aux_heads"))}
+    missing = set(saved) - {s.name for s in ds.aux_specs}
+    if missing:  # the post-trained checkpoint would silently lose them
+        raise ValueError(f"the dataset does not define the checkpoint's attribute heads {sorted(missing)}")
+    for s in ds.aux_specs:
+        ck = saved[s.name]
+        if not s.regression and s.names != ck.names:
+            raise ValueError(f"attribute {s.name!r}: the dataset's categories {s.names} differ from the checkpoint's {ck.names}")
+        s.mean, s.std, s.value_range, s.flip_aware = ck.mean, ck.std, ck.value_range, ck.flip_aware
+
+
+def _sets_fields(cases, aux_specs) -> list[str]:
+    """The ``metrics.csv`` columns of :func:`~eomt.engine.validate.evaluate_sets`."""
+    keys = [f"segm/{k}_{m}" for k in ("mAP", "mAP50", "mAP_small", "AR100") for m in ("alone", "set")]
+    keys += [f"{c}/mAP_{m}" for c in cases for m in ("alone", "set")]
+    keys += [f"{_aux_metric(s)}/{s.name}_{m}" for s in aux_specs for m in ("alone", "set")]
+    keys += [f"{k}/{n}" for k in ("match", "reid") for n in ("f1", "precision", "recall", "thres")]
+    return [f"val/sets/{k}" for k in keys]
 
 
 def _poly_two_stage_factors(opt_step, total_steps, warmup_steps, power):
@@ -476,6 +548,7 @@ def train(
     logger: str = "none",
     resume: str | None = None,
     init_weights: str | None = None,
+    multiview: dict | None = None,
 ) -> dict:
     """Fine-tune an EoMT instance-segmentation model on a COCO-format dataset.
 
@@ -561,6 +634,16 @@ def train(
     ``last.pt`` alone); every checkpoint is saved mask-free. ``amp_dtype`` selects the autocast dtype:
     ``"auto"`` uses bf16 on hardware that supports it (no GradScaler, more stable),
     else fp16; force with ``"bf16"`` / ``"fp16"``.
+
+    **Several photos predicted together.** ``multiview`` (see :data:`DEFAULT_MULTIVIEW`) post-trains the
+    checkpoint given as ``init_weights`` so that the photos of one subject are predicted in one pass, each photo's
+    queries taking what the others show: it adds the cross-view modules and a matching head and trains them on
+    synthetic sets made from single annotated photos (:class:`~eomt.data.sets.CocoViewSets`; ``batch`` counts sets).
+    Only the groups listed in ``trainable`` learn (stage A: the new modules, so a single photo is predicted exactly as
+    before; stage B adds ``query_blocks`` at a low multiplier). The checkpoint's architecture, loss weights and
+    attribute-head definitions are kept, masked attention stays off, and ``best.pt`` is chosen on the hard photos of
+    fixed validation sets predicted together with their set (``sets/segm/mAP_set``, see
+    :func:`~eomt.engine.validate.evaluate_sets`).
     """
     if len(warmup_steps) != 2:
         raise ValueError("warmup_steps must be (head_steps, vit_steps)")
@@ -706,6 +789,22 @@ def train(
     # the new FPN/cross-attn modules init random (shape-mismatched/missing tensors are
     # skipped by the warm-start loader below) while the ViT + heads load 1:1.
 
+    # Multi-photo post-training: the architecture of the checkpoint it starts from, kept as trained.
+    mv = src_ckpt = None
+    if multiview is not None:
+        mv = {**DEFAULT_MULTIVIEW, **multiview}
+        src_ckpt = resume_ckpt if resume_ckpt is not None else init_ckpt
+        if src_ckpt is None or is_detect:
+            raise ValueError("multiview post-trains an instance-segmentation checkpoint: pass init_weights (or resume).")
+        fpn_scales = src_ckpt.get("fpn_scales")
+        box_head = bool(src_ckpt.get("aux_box_head"))
+        loss_weights = normalize_loss_weights(src_ckpt.get("loss_weights"), family=family)
+        if src_ckpt.get("xview"):  # post-training a post-trained checkpoint (stage B): its modules load 1:1
+            mv["xview"], mv["match_dim"] = src_ckpt["xview"], int(src_ckpt.get("match_dim") or 0)
+        if mask_anneal:
+            print("[xview] masked attention stays off: the checkpoint runs mask-free")
+            mask_anneal = False
+
     # --- data ---
     aug_cfg = AugConfig.resolve(aug, flip_prob=flip_prob, min_scale=min_scale, max_scale=max_scale)
     active = aug_cfg.active()
@@ -721,14 +820,20 @@ def train(
     Dataset = CocoDetection if is_detect else CocoInstanceSeg
     if keep_empty and is_detect:
         raise ValueError("keep_empty=True is only supported for family='instance'.")
-    train_ds = Dataset(
-        train_images,
-        train_json,
-        imgsz=imgsz,
-        transform=train_transform,
-        aug=aug_cfg,
-        **({"keep_empty": True} if keep_empty else {}),
-    )
+    if mv is not None:  # sets of photos made from single photos, with the checkpoint's attribute heads only
+        train_ds = CocoViewSets(train_images, train_json, imgsz=imgsz, aug=aug_cfg, sets=mv["sets"],
+                                attributes=[h["name"] for h in src_ckpt.get("aux_heads") or []])
+        _adopt_checkpoint_aux(train_ds, src_ckpt)
+        print(f"[data] sets of up to {train_ds.sets.max_views} photos from single photos: {train_ds.sets}")
+    else:
+        train_ds = Dataset(
+            train_images,
+            train_json,
+            imgsz=imgsz,
+            transform=train_transform,
+            aug=aug_cfg,
+            **({"keep_empty": True} if keep_empty else {}),
+        )
     nc, names = train_ds.num_classes, train_ds.names
     aux_specs = train_ds.aux_specs
     n_neg = sum(1 for i in train_ds.ids if not train_ds.coco.getAnnIds(imgIds=i, iscrowd=False)) if keep_empty else 0
@@ -751,7 +856,7 @@ def train(
         shuffle=sampler is None,
         sampler=sampler,
         num_workers=workers,
-        collate_fn=collate_train,
+        collate_fn=collate_sets if mv is not None else collate_train,
         pin_memory=True,
         drop_last=True,
         persistent_workers=workers > 0,
@@ -760,6 +865,7 @@ def train(
 
     val_ds = None
     val_seg_ds = None
+    val_sets_ds = None
     val_size = val_imgsz or imgsz
     if val_images and val_json:
         val_ds = CocoValImages(val_images, val_json, imgsz=val_size, letterbox=letterbox)
@@ -774,6 +880,11 @@ def train(
                 transform=build_val_transform(val_size, letterbox=letterbox),
                 shared_aux=(aux_specs, train_ds._attr_id_maps),
             )
+        if mv is not None:  # the same sets at every validation, none of a single photo
+            val_sets_ds = CocoViewSets(val_images, val_json, imgsz=val_size, aug=aug_cfg,
+                                       sets={**mv["sets"], "p_single": 0.0}, seed=0,
+                                       shared_aux=(aux_specs, train_ds._attr_id_maps))
+            print(f"[data] val sets: {len(val_sets_ds)} fixed sets (one per val image)")
 
     # Optional per-class CE weights for imbalanced attributes (computed once).
     aux_class_weight = _compute_aux_class_weights(train_ds) if (aux_specs and aux_class_weights) else None
@@ -837,6 +948,7 @@ def train(
             "fpn_scales": list(fpn_scales) if fpn_scales else None,
             "box_head": box_head,
             "deep_supervision": deep_supervision,
+            "multiview": mv,
         },
     )
 
@@ -853,6 +965,8 @@ def train(
         num_upscale_blocks=num_upscale_blocks,
         fpn_scales=fpn_scales,
         aux_box_head=box_head,
+        xview=mv["xview"] if mv is not None else None,
+        match_dim=mv["match_dim"] if mv is not None else 0,
     ).to(dev)
     model.eomt.deep_supervision = bool(deep_supervision)
     print(f"[model] loss weights: {loss_weights}; upscale blocks: {model.num_upscale_blocks}")
@@ -869,7 +983,13 @@ def train(
     if aux_specs:
         print(f"[model] aux head arch: {model.aux_head_arch}")
     start_epoch, best_metric = 0, -1.0
-    optimizer = build_optimizer(model, lr0, weight_decay, backbone_lr_mult, llrd)
+    if mv is not None:
+        optimizer = build_multiview_optimizer(model, lr0, weight_decay, mv["trainable"])
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+        print(f"[xview] {model.xview_cfg['mode']} cross-view modules, match head {model.match_dim}-d; training "
+              f"{mv['trainable']} ({n_train:.1f} M parameters), the rest of the checkpoint is frozen")
+    else:
+        optimizer = build_optimizer(model, lr0, weight_decay, backbone_lr_mult, llrd)
     # Uncertainty weighting: one learned log-variance per attribute head, outside the model so that inference
     # checkpoints stay as they are (saved with the trainer state in last.pt). Its own group: head LR, no decay.
     aux_log_vars = None
@@ -908,6 +1028,8 @@ def train(
             f"[finetune] loaded warm-start weights ({len(missing)} missing / "
             f"{len(unexpected)} unexpected keys); training from epoch 0."
         )
+        if mv is not None and not any(k.startswith("eomt.xview.") for k in ckpt_sd):
+            model.init_xview()  # each cross-view sublayer starts as a copy of its query block's attention
     elif pretrained:
         load_dinov2_backbone(model)
         model.to(dev)
@@ -916,12 +1038,14 @@ def train(
     # cxcywh boxes (detect family); route it to the matching forward kwarg.
     geom_key = "box_labels" if is_detect else "mask_labels"
 
-    def micro_step(m, pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe=False):
-        """One micro-batch's loss: the segmentation loss computed in the model plus the attribute heads' loss. With
-        ``probe``, also each head's pull on the shared queries (see :func:`_aux_grad_ratios`)."""
-        out = m(pixel_values, class_labels=class_labels, **{geom_key: geom_labels})
+    def micro_step(m, pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe=False, set_ids=None,
+                   inst_ids=None):
+        """One micro-batch's loss: the segmentation loss computed in the model plus the attribute heads' loss (and,
+        for sets of photos, the matching head's, kept in ``out["match_loss"]``). With ``probe``, also each head's pull
+        on the shared queries (see :func:`_aux_grad_ratios`)."""
+        out = m(pixel_values, class_labels=class_labels, set_ids=set_ids, **{geom_key: geom_labels})
         loss, aux_indices, aux_gated, grads = out["loss"], None, None, None
-        if aux_specs:
+        if aux_specs or "match_embed" in out:
             # Match once per step, then gate to well-localized (IoU) and
             # correctly-classified queries so the attribute trains only on
             # instances the detector actually got right. Reuse for accuracy.
@@ -930,14 +1054,21 @@ def train(
                 out, aux_indices, geom_labels, class_labels,
                 iou_thr=aux_iou_gate, require_class=aux_class_gate,
             )
+        if "match_embed" in out and set_ids is not None:
+            out["match_loss"] = match_loss(out, aux_gated, inst_ids, set_ids, mv["match_tau"])
+            loss = loss + mv["match_w"] * out["match_loss"]
+        if aux_specs:
             a_loss, per_head = aux_loss(
                 m, out, geom_labels, class_labels, aux_labels,
                 weights=aux_w_per_head, indices=aux_gated,
                 class_weights=aux_class_weight, log_vars=aux_log_vars,
             )
-            if probe:
+            if probe and out["last_hidden_state"].requires_grad:  # frozen queries (a photo alone, stage A): no pull
                 grads = _aux_grad_ratios(out, per_head, aux_w_eff, aux_w_per_head, aux_log_vars)
             loss = loss + aux_w_eff * a_loss
+        if not loss.requires_grad:  # nothing that trains took part (a photo alone, stage A): a zero step, so the
+            # backward (and on several GPUs its gradient averaging) still runs
+            loss = loss + sum(p.sum() * 0.0 for p in m.parameters() if p.requires_grad)
         return loss, out, aux_indices, aux_gated, grads
 
     # Several GPUs: DDP copies process 0's weights to the others here and averages the gradients in backward. The
@@ -1041,9 +1172,15 @@ def train(
             norm_mean=getattr(core, "pixel_mean", None),
             norm_std=getattr(core, "pixel_std", None),
             patch_size=getattr(core, "patch_size", None),
+            xview=core.xview_cfg,
+            match_dim=core.match_dim or None,
+            match_thres=match_thres,
             **extra,
         )
         save_checkpoint(ckpt, path)
+
+    # The matching head's similarity threshold for "same instance": the best-F1 one of the last validation sets.
+    match_thres = None
 
     # Per-epoch metrics CSV (segmentation always; per aux head if present: its matched-query accuracy or MAE, and its
     # pull on the shared queries).
@@ -1056,6 +1193,10 @@ def train(
             csv_fields += [f"val/segm/{k}" for k in _SEGM_KEYS]
         csv_fields += [f"val/bbox/{k}" for k in _SEGM_KEYS]
         csv_fields += [f"val/{metric_of[s.name]}/{s.name}" for s in aux_specs]
+    if mv is not None:
+        csv_fields.insert(2, "train/match_loss")
+        if val_sets_ds is not None:
+            csv_fields += _sets_fields(val_sets_ds.sets.cases, aux_specs)
     csv_log = _CsvLogger(run_dir / "metrics.csv", csv_fields) if main else None
 
     # Per-primary aux accuracy is computed held-out in aux_evaluate when a val split
@@ -1067,7 +1208,7 @@ def train(
         step_model.train()
         if sampler is not None:
             sampler.set_epoch(epoch)
-        running = 0.0
+        running = running_match = 0.0
         # matched-query accuracy per aux head, accumulated over the epoch
         aux_hits = {s.name: 0 for s in aux_specs}
         aux_tot = {s.name: 0 for s in aux_specs}
@@ -1075,7 +1216,10 @@ def train(
         aux_pc: dict[str, dict[int, list[int]]] = {s.name: {} for s in aux_specs}
         aux_grad: dict[str, list[float]] = {s.name: [] for s in aux_specs}  # the heads' pull, measured on the main process
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{epochs - 1}", unit="batch", disable=not main)
-        for step, (pixel_values, geom_labels, class_labels, aux_labels) in enumerate(pbar):
+        for step, batch_data in enumerate(pbar):
+            # sets of photos also carry the set of each photo and the instance ids of its targets
+            pixel_values, geom_labels, class_labels, aux_labels = batch_data[:4]
+            set_ids, inst_ids = batch_data[4:] if mv is not None else (None, None)
             it = epoch * iters_per_epoch + step
             head_factor, vit_factor = lr_factors(it)
             for g in optimizer.param_groups:
@@ -1103,11 +1247,13 @@ def train(
                 with torch.amp.autocast("cuda", enabled=amp_on, dtype=autocast_dtype):
                     probe = bool(aux_specs) and main and it % AUX_GRAD_EVERY == 0
                     loss, out, aux_indices, aux_gated, grads = step_model(
-                        pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe
+                        pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe, set_ids, inst_ids
                     )
                 for n, r in (grads or {}).items():
                     aux_grad[n].append(r)
                 loss_item = float(loss.detach())  # unscaled, for logging
+                if "match_loss" in out:
+                    running_match += float(out["match_loss"].detach())
                 scaler.scale(loss / accum_steps).backward()
             if boundary:
                 scaler.unscale_(optimizer)
@@ -1147,6 +1293,8 @@ def train(
                 postfix["aux"] = " ".join(
                     f"{n}={_safe_acc(aux_hits[n], aux_tot[n]):.2f}" for n in aux_hits
                 )
+            if mv is not None:
+                postfix["match"] = f"{running_match / (step + 1):.3f}"
             pbar.set_postfix(postfix)
             if tb is not None and step % 20 == 0:
                 scalars = {"train/loss": loss_item, "lr/head": head_group["lr"]}
@@ -1155,11 +1303,13 @@ def train(
                 tb.log(scalars, it)
 
         # Several GPUs: the epoch's loss and accuracy counts summed over all of them, on the main process.
-        totals = sum_over_processes((running, aux_hits, aux_tot, aux_pc))
+        totals = sum_over_processes((running, running_match, aux_hits, aux_tot, aux_pc))
         if main:
-            running, aux_hits, aux_tot, aux_pc = totals
+            running, running_match, aux_hits, aux_tot, aux_pc = totals
             epoch_loss = running / (iters_per_epoch * world)
-            print(f"[epoch {epoch}] mean loss {epoch_loss:.4f}")
+            epoch_match = running_match / (iters_per_epoch * world)
+            print(f"[epoch {epoch}] mean loss {epoch_loss:.4f}"
+                  + (f" (matching head {epoch_match:.4f})" if mv is not None else ""))
             aux_acc = {n: _safe_acc(aux_hits[n], aux_tot[n]) for n in aux_hits}
             aux_pull = {n: sum(v) / len(v) if v else float("nan") for n, v in aux_grad.items()}
             if aux_specs:
@@ -1229,6 +1379,18 @@ def train(
                         f"[epoch {epoch}] val aux: "
                         + "  ".join(f"{n} {metric_of[n][4:]}={v:.3f}" for n, v in val_aux.items())
                     )
+                if val_sets_ds is not None:  # the hard photo of each fixed set, alone and with its set
+                    metrics.update(evaluate_sets(eval_model, val_sets_ds, device=dev, num_workers=workers, amp=amp,
+                                                 verbose=main))
+                    if main:
+                        print(
+                            f"[epoch {epoch}] val sets: hard photo segm mAP {metrics['sets/segm/mAP_alone']:.4f} alone"
+                            f" -> {metrics['sets/segm/mAP_set']:.4f} with its set; links F1 "
+                            f"{metrics['sets/match/f1']:.3f} at {metrics['sets/match/thres']:.2f} "
+                            f"(re-ID of the photos alone {metrics['sets/reid/f1']:.3f})"
+                        )
+                        if math.isfinite(metrics["sets/match/thres"]):
+                            match_thres = metrics["sets/match/thres"]
                 if tb is not None:
                     tb.log({f"val/{k}": v for k, v in metrics.items()}, epoch)
 
@@ -1243,7 +1405,7 @@ def train(
             # best.pt holds the eval weights (EMA when enabled) for inference.
             # The best metric is updated BEFORE last.pt is written, so a resumed run starts from the right value
             # (it used to lag one epoch and could overwrite a better best.pt).
-            best_key = "bbox/mAP" if is_detect else "segm/mAP"
+            best_key = "sets/segm/mAP_set" if val_sets_ds is not None else "bbox/mAP" if is_detect else "segm/mAP"
             cur = metrics.get(best_key, None)
             improved = deployable and cur is not None and cur > best_metric
             if improved:
@@ -1254,7 +1416,7 @@ def train(
                 print(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
 
             # --- per-epoch metrics row (missing values -> nan) ---
-            row = {"epoch": epoch, "train/loss": epoch_loss}
+            row = {"epoch": epoch, "train/loss": epoch_loss, "train/match_loss": epoch_match}
             row.update({f"train/{metric_of[n]}/{n}": aux_acc[n] for n in aux_acc})
             row.update({f"train/aux_grad/{n}": g for n, g in aux_pull.items()})
             row.update({f"val/{k}": v for k, v in metrics.items()})

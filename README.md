@@ -391,7 +391,7 @@ be named; unknown names raise before the first forward pass. `group_by=None` dis
 gating entirely and needs a much higher `sim_thres`, since far more pairs then compete
 with no structural prior ruling any of them out.
 
-`sim_thres` (default `0.7`) is the cosine floor for "same instance". Hungarian always
+`sim_thres` (default `0.7`; a cross-view model uses its calibrated threshold, see below) is the cosine floor for "same instance". Hungarian always
 returns a full assignment, so the threshold is what turns *best available partner* into
 *no partner — this is a new instance*. Measured on one checkpoint across four real
 photo sets, with the gate on:
@@ -421,6 +421,37 @@ save the run.
   a matching one.
 - **Letterboxing shifts scale with orientation**, so a landscape and a portrait shot of
   the same subject are not on quite equal footing.
+
+### Predicting the photos together (cross-view)
+
+Re-identification links what each photo found on its own. A **cross-view** model predicts
+the photos of one subject (1–4) in **one** forward pass: after each of the four query
+blocks, the queries of every photo attend to the patches and queries of the *other*
+photos (plus a null token to abstain). An instance that is tiny or covered in one photo
+can be found because another shows it clearly, and an ambiguous close-up can take its
+class and attributes from the wide shot. Each photo's masks still cover only what that
+photo shows, and a photo alone is predicted bit for bit as before. A small matching head
+embeds every instance for the cross-photo links.
+
+It is a post-training of an existing checkpoint, and it needs no multi-photo annotations:
+each set is made from one annotated photo — a hard view (shrunken, degraded, occluded or a
+close-up), a view that clears it up, and optionally a distractor photo and a mirrored copy
+— and every instance keeps its annotation id across the views:
+
+```bash
+python scripts/train.py --data my/data.yaml --weights best.pt --multiview configs/xview.yaml \
+    --name xview-a --batch 1 --epochs 6 --device 0,1
+```
+
+The default config is stage A: only the new modules train (about 18 M parameters on `l`),
+the checkpoint stays frozen; stage B adds `query_blocks: 0.1` to `trainable`. `best.pt` is
+chosen on fixed synthetic validation sets: the hard photo's segm mAP predicted with its set
+(`val/sets/segm/mAP_set`, next to `_alone`), its attributes, and the link F1 of the
+matching head against plain re-ID (`val/sets/match/*` vs `val/sets/reid/*`). Synthetic sets
+show neither real viewpoint changes nor real reflections: measure on real multi-photo sets
+before trusting a gain. `infer_match()` and `scripts/match.py` predict a cross-view
+checkpoint jointly (`joint=False` for one pass per photo), with its calibrated threshold
+and no class gate; `eomt.engine.predict.predict_set` returns the per-photo results alone.
 
 ---
 

@@ -36,7 +36,7 @@ from ..reid import (
 )
 from ..serialization import load_model
 from ..visualize import draw_identity_grid
-from .predict import _IMAGE_EXTS, _iter_sources, predict_image
+from .predict import _IMAGE_EXTS, _iter_sources, predict_image, predict_set
 
 
 def _panelize(image: Image.Image, result: dict, panel_size: int) -> tuple[Image.Image, dict]:
@@ -94,8 +94,9 @@ def match(
     mask_thresh: float = 0.5,
     device: str = "auto",
     imgsz: int | None = None,
-    group_by: tuple[str, ...] | None = ("class",),
-    sim_thres: float = 0.7,
+    group_by: tuple[str, ...] | str | None = "auto",
+    sim_thres: float | None = None,
+    joint: bool | None = None,
     center: bool = False,
     guard: str = "mean",
     guard_factor: float = 1.0,
@@ -119,7 +120,13 @@ def match(
             about (e.g. ``("class", "position")`` so instances at different places on
             the subject never match, however alike they look). ``None`` disables
             gating, which needs a stricter ``sim_thres`` since far more pairs then
-            compete.
+            compete. ``"auto"``: ``None`` for a model with a matching head (its
+            embedding was trained to tell instances apart across photos, and a
+            close-up's class is what the other photos may correct), else ``("class",)``.
+        joint: predict all the photos in ONE forward pass, so that a cross-view model's
+            queries of each photo take what the others show (at most the model's
+            ``max_views`` photos), and match on its matching head's embedding.
+            ``None`` = joint for a cross-view model, one pass per photo otherwise.
         center: mean-center embeddings before normalizing (transductive; see
             :func:`eomt.reid.similarity_matrix`).
         guard / guard_factor: merge guard against transitive chaining
@@ -129,7 +136,9 @@ def match(
             The masks are released as each photo is processed, not at the end, so
             leaving this off caps peak memory rather than only trimming the result.
         sim_thres: cosine floor for "same instance"; also the low end of the link
-            width scale, so it changes what a hairline link means.
+            width scale, so it changes what a hairline link means. ``None``: the
+            matching head's calibrated threshold (``model.match_thres``) when joint
+            and available, else 0.7.
         link_mode: ``"chain"`` draws one link between panel-consecutive members of
             each identity (same connectivity, far fewer lines), ``"all"`` draws every
             accepted pair, ``"none"`` draws none. Links are plain lines — the "same
@@ -148,6 +157,12 @@ def match(
     if isinstance(model, (str, Path)):
         model = load_model(model, device=device)
 
+    joint = bool(getattr(model, "xview_cfg", None)) if joint is None else joint
+    learned = joint and getattr(model, "match_head", None) is not None
+    if group_by == "auto":
+        group_by = None if learned else ("class",)
+    if sim_thres is None:
+        sim_thres = float(model.match_thres) if learned and model.match_thres is not None else 0.7
     # Validate the gate before the first forward: a typo should cost milliseconds,
     # not N ViT passes.
     group_by = validate_group_by(group_by, getattr(model, "aux_specs", []))
@@ -174,27 +189,42 @@ def match(
     print(
         f"[match] eomt-{getattr(model, 'size', '?')} "
         f"({getattr(model, 'family', 'instance')}, nc={getattr(model, 'nc', '?')}, "
-        f"imgsz={imgsz}) on {dev} — {len(paths)} photo(s), "
+        f"imgsz={imgsz}) on {dev} — {len(paths)} photo(s){' predicted jointly' if joint else ''}, "
         f"group_by={group_by or '(off)'}, sim_thres={sim_thres}"
     )
 
-    # --- 1. one forward per photo ----------------------------------------
+    def _predictions():
+        """``(index, path, photo, result, ms)`` per photo: one forward each, or one for all of them (``joint``)."""
+        if joint:
+            photos = [Image.open(p).convert("RGB") for p in paths]
+            it0 = time.perf_counter()
+            joint_res = predict_set(model, photos, device=dev, imgsz=imgsz, conf_thres=conf_thres,
+                                    max_det=max_det, mask_thresh=mask_thresh, letterbox=letterbox)
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            ms = (time.perf_counter() - it0) * 1e3 / len(paths)
+            yield from ((i, p, im, r, ms) for i, (p, im, r) in enumerate(zip(paths, photos, joint_res)))
+            return
+        for i, path in enumerate(paths):
+            image = Image.open(path).convert("RGB")
+            it0 = time.perf_counter()
+            res = predict_image(
+                model, image, device=dev, imgsz=imgsz, conf_thres=conf_thres,
+                max_det=max_det, mask_thresh=mask_thresh, letterbox=letterbox, embed=True,
+            )
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            yield i, path, image, res, (time.perf_counter() - it0) * 1e3
+
+    # --- 1. one forward per photo (or one for all: joint) -------------------
     # Each photo is reduced to panel scale and released within its own iteration:
     # nothing full-resolution outlives the loop body. Holding all N photos and all N
     # mask stacks to the end instead would peak at several GB on a 30-photo set of
     # 4000x3000 shots — the panel is all the renderer ever needs, and ``keep_masks``
     # is what asks for the full-resolution masks to survive.
     results, panels, t0 = [], [], time.perf_counter()
-    for i, path in enumerate(paths):
-        image = Image.open(path).convert("RGB")
-        it0 = time.perf_counter()
-        res = predict_image(
-            model, image, device=dev, imgsz=imgsz, conf_thres=conf_thres,
-            max_det=max_det, mask_thresh=mask_thresh, letterbox=letterbox, embed=True,
-        )
-        if dev.type == "cuda":
-            torch.cuda.synchronize(dev)
-        res["elapsed_ms"] = (time.perf_counter() - it0) * 1e3
+    for i, path, image, res, ms in _predictions():
+        res["elapsed_ms"] = ms
         res["path"] = str(path)
         res["image_index"] = i
         results.append(res)
@@ -256,7 +286,7 @@ def match(
         "imgsz": imgsz,
         "letterbox": letterbox,
         "conf_thres": conf_thres, "max_det": max_det, "mask_thresh": mask_thresh,
-        "group_by": list(group_by), "sim_thres": sim_thres, "center": center,
+        "group_by": list(group_by), "sim_thres": sim_thres, "joint": joint, "center": center,
         "guard": guard, "guard_factor": guard_factor,
     }
 
