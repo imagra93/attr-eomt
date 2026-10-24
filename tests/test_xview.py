@@ -137,6 +137,25 @@ def test_sets_keep_instance_ids_and_flip_once_per_set(tmp_path):
     assert a["case"] == b["case"] and all(torch.equal(x[0], y[0]) for x, y in zip(a["views"], b["views"]))
 
 
+def test_locate_sets_zoom_on_the_focus_instance(tmp_path):
+    img_dir, jf = _mini_coco(tmp_path)
+    ds = CocoViewSets(img_dir, jf, imgsz=112, seed=0,
+                      sets={"p_single": 0.0, "p_focus": 1.0, "focus": {"class": "line", "side": "center"},
+                            "p_distractor": 0.0, "p_flipped_copy": 0.0})
+    line = 1  # the line is annotation 1 of every photo
+    for idx in range(len(ds)):
+        item = ds[idx]
+        assert item["case"] == "locate"
+        (_, a_masks, _, a_attrs, a_ids), (_, b_masks, _, b_attrs, b_ids) = item["views"]
+        assert set(a_attrs) == set(b_attrs) == {"side", "area"}  # the temporary focus mark never leaves the view
+        assert line in b_ids.tolist()  # the close-up is of the focus instance
+        if line in a_ids.tolist():
+            share = lambda masks, ids: float(masks[ids.tolist().index(line)].sum()) / masks[0].numel()  # noqa: E731
+            assert share(b_masks, b_ids) > share(a_masks, a_ids)
+    with pytest.raises(ValueError, match="not one of"):
+        CocoViewSets(img_dir, jf, imgsz=112, sets={"p_focus": 1.0, "focus": {"class": "wheel"}})
+
+
 def test_collate_flattens_sets_into_photos(tmp_path):
     img_dir, jf = _mini_coco(tmp_path)
     ds = CocoViewSets(img_dir, jf, imgsz=112, sets={"p_single": 0.5}, seed=1)
@@ -185,6 +204,69 @@ def test_stage_a_post_training_runs_and_leaves_the_checkpoint_untouched(tmp_path
     before, after = start.state_dict(), post.state_dict()
     assert all(torch.equal(before[k], after[k]) for k in before)  # stage A: a photo alone is predicted as before
     assert any(k.startswith("eomt.xview.") for k in after) and any(k.startswith("match_head.") for k in after)
+
+
+def test_stage_b_continues_a_cross_view_checkpoint_with_locate_sets(tmp_path):
+    import csv
+
+    from eomt.data import CocoInstanceSeg
+    from eomt.engine.train import train
+    from eomt.serialization import load_model, save_checkpoint, wrap_checkpoint
+
+    img_dir, jf = _mini_coco(tmp_path)
+    specs = CocoInstanceSeg(img_dir, jf, imgsz=112).aux_specs
+    torch.manual_seed(0)
+    start = build_model("s", nc=2, imgsz=112, aux_heads=specs, fpn_scales=(2.0, 1.0, 0.5))
+    init = tmp_path / "init.pt"
+    save_checkpoint(wrap_checkpoint(start.state_dict(), size="s", nc=2, imgsz=112, aux_heads=specs,
+                                    aux_head_arch=start.aux_head_arch, fpn_scales=start.fpn_scales), init)
+    common = dict(train_images=str(img_dir), train_json=str(jf), val_images=str(img_dir), val_json=str(jf), size="s",
+                  imgsz=112, epochs=1, batch=1, accum=1, workers=0, device="cpu", amp=False, ema=False, seed=0,
+                  project=str(tmp_path / "runs"))
+    a = train(**common, name="a", init_weights=str(init), multiview={"match_dim": 16, "sets": {"p_single": 0.5}})
+    b = train(**common, name="b", init_weights=a["best"], warmup_steps=(0, 0),  # the query blocks train from step 0
+              multiview={"trainable": {"xview": 1.0, "query_blocks": 0.1},
+                         "sets": {"p_single": 0.0, "p_focus": 0.5, "focus": {"class": "line"}}})
+    post_a, post_b = load_model(a["best"], device="cpu"), load_model(b["best"], device="cpu")
+    assert post_b.xview_cfg == post_a.xview_cfg and post_b.match_dim == 16  # the cross-view modules carry over
+    sa, sb = post_a.state_dict(), post_b.state_dict()
+    last = post_a.config.num_hidden_layers - 1
+    assert not torch.equal(sa[f"eomt.layers.{last}.mlp.fc1.weight"], sb[f"eomt.layers.{last}.mlp.fc1.weight"])  # trained
+    assert torch.equal(sa["eomt.layers.0.mlp.fc1.weight"], sb["eomt.layers.0.mlp.fc1.weight"])  # frozen
+    header = next(csv.reader(open(tmp_path / "runs" / "b" / "metrics.csv")))
+    assert "val/sets/locate/mAP_set" in header
+    # the query blocks alone, single photos only (a plain fine-tune of the last blocks) also run
+    c = train(**common, name="c", init_weights=a["best"], warmup_steps=(0, 0),
+              multiview={"trainable": {"query_blocks": 0.1}, "sets": {"p_single": 1.0}})
+    sc = load_model(c["best"], device="cpu").state_dict()
+    assert not torch.equal(sa[f"eomt.layers.{last}.mlp.fc1.weight"], sc[f"eomt.layers.{last}.mlp.fc1.weight"])
+
+
+def test_subject_sets_place_every_photo():
+    from eomt.engine.predict import subject_sets
+
+    feats = torch.randn(7, 8)
+    assert subject_sets(feats, 4, mode="order") == [[0, 1, 2, 3], [4, 5, 6]]
+    sets = subject_sets(feats, 4)
+    assert sorted(i for s in sets for i in s) == list(range(7)) and all(len(s) <= 4 for s in sets)
+    anchors = subject_sets(feats, 4, mode="anchor", k=2)
+    assert [s[0] for s in anchors] == list(range(7)) and all(len(s) == 3 and len(set(s)) == 3 for s in anchors)
+
+
+def test_predict_subject_returns_one_result_per_photo():
+    from eomt.engine.predict import predict_subject, predict_set
+
+    base, xv = _pair("blocks")
+    photos = [Image.fromarray(np.random.default_rng(i).integers(0, 255, (90 + 10 * i, 120, 3), dtype=np.uint8))
+              for i in range(5)]
+    for mode in ("order", "partition", "anchor"):
+        res = predict_subject(xv, photos, device="cpu", imgsz=IMGSZ, mode=mode, conf_thres=0.0, max_det=5,
+                            feature_size=70)
+        assert len(res) == 5 and all(r["masks"].shape[1:] == (90 + 10 * i, 120) for i, r in enumerate(res))
+    # a model without cross-view modules predicts each photo alone
+    alone = predict_subject(base, photos, device="cpu", imgsz=IMGSZ, conf_thres=0.0, max_det=5)
+    single = [predict_set(base, [p], device="cpu", imgsz=IMGSZ, conf_thres=0.0, max_det=5)[0] for p in photos]
+    assert all(torch.equal(a["scores"], s["scores"]) for a, s in zip(alone, single))
 
 
 def test_predict_set_returns_one_result_per_photo_with_match_embeddings():

@@ -453,6 +453,14 @@ before trusting a gain. `infer_match()` and `scripts/match.py` predict a cross-v
 checkpoint jointly (`joint=False` for one pass per photo), with its calibrated threshold
 and no class gate; `eomt.engine.predict.predict_set` returns the per-photo results alone.
 
+For a subject with more photos than a set holds, `eomt.engine.predict.predict_subject` groups
+them (`subject_sets`) and returns one result per photo: `mode="order"` (the default) predicts
+them `max_views` at a time in the given order, every photo once (about the cost of predicting
+them one by one); `"partition"` groups similar photos (mean patch token of a small pass);
+`"anchor"` predicts each photo with its `k` most similar others. On real multi-photo sets
+(close-ups plus overviews of each subject) the three gave the same gain: what helps is seeing
+other photos of the subject, not a particular one.
+
 ---
 
 ## Install

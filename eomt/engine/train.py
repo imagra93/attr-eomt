@@ -1135,7 +1135,8 @@ def train(
         if stop_after_epochs is not None and stop_after_epochs < mask_free_epoch:
             print(f"[val] stop_after_epochs={stop_after_epochs} ends before the annealing: no best.pt, use last.pt")
 
-    head_group = next(g for g in reversed(optimizer.param_groups) if not g.get("is_backbone"))  # shown in the log
+    # shown in the log; a multi-photo post-training of the query blocks alone has no head group
+    head_group = next((g for g in reversed(optimizer.param_groups) if not g.get("is_backbone")), optimizer.param_groups[-1])
 
     def lr_factors(it: int) -> tuple[float, float]:
         """(head, backbone) multiplier of each group's ``initial_lr`` at micro-iteration ``it``."""
@@ -1196,7 +1197,8 @@ def train(
     if mv is not None:
         csv_fields.insert(2, "train/match_loss")
         if val_sets_ds is not None:
-            csv_fields += _sets_fields(val_sets_ds.sets.cases, aux_specs)
+            csv_fields += _sets_fields(list(val_sets_ds.sets.cases) + (["locate"] if val_sets_ds.sets.p_focus > 0 else []),
+                                       aux_specs)
     csv_log = _CsvLogger(run_dir / "metrics.csv", csv_fields) if main else None
 
     # Per-primary aux accuracy is computed held-out in aux_evaluate when a val split

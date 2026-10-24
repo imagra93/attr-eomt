@@ -186,6 +186,103 @@ def predict_set(
     return results
 
 
+def subject_sets(feats: torch.Tensor, max_views: int, *, mode: str = "partition", k: int = 3) -> list[list[int]]:
+    """The sets in which the photos of one subject are predicted together, from one feature row per photo.
+
+    ``"order"``: consecutive photos, ``max_views`` at a time (``feats`` is only counted). ``"partition"``: each photo in
+    exactly one set, of up to ``max_views`` photos — the first photo not yet placed and the most similar photos (cosine
+    of ``feats``) not yet placed. Both predict every photo once. ``"anchor"``: one set per photo, the photo first with
+    its ``k`` most similar others (``k`` capped at ``max_views - 1``); only the first photo's result of each set is its
+    own. On real multi-photo sets (close-ups plus overviews of each subject) the three gave about the same gain.
+    """
+    if mode not in ("order", "partition", "anchor"):
+        raise ValueError(f"subject_sets: mode {mode!r} is 'order', 'partition' or 'anchor'")
+    if mode == "order":
+        return [list(range(s, min(s + max_views, len(feats)))) for s in range(0, len(feats), max_views)]
+    f = torch.nn.functional.normalize(feats.float(), dim=-1)
+    order = (f @ f.T).argsort(dim=1, descending=True).tolist()
+    if mode == "anchor":
+        return [[t] + [j for j in order[t] if j != t][: min(k, max_views - 1)] for t in range(len(f))]
+    placed, sets = set(), []
+    for t in range(len(f)):
+        if t in placed:
+            continue
+        group = [t] + [j for j in order[t] if j != t and j not in placed][: max_views - 1]
+        placed.update(group)
+        sets.append(group)
+    return sets
+
+
+@torch.no_grad()
+def predict_subject(
+    model,
+    images: list[Image.Image],
+    *,
+    device,
+    imgsz: int,
+    mode: str = "order",
+    k: int = 3,
+    feature_size: int = 322,
+    conf_thres: float = 0.3,
+    max_det: int = 100,
+    mask_thresh: float = 0.5,
+    letterbox: bool = True,
+    amp: bool | str = False,
+) -> list[dict]:
+    """Predict every photo of one subject together with other photos of it: one result per photo, in
+    input order, as :func:`predict_set` gives them.
+
+    The photos are grouped by :func:`subject_sets`: ``mode="order"`` takes them ``max_views`` at a time in the given
+    order; ``"partition"`` and ``"anchor"`` group them on the mean patch token of a pass at ``feature_size`` (a small
+    input, about a quarter of the cost of a prediction at 644 px). ``"order"`` and ``"partition"`` predict every photo
+    once, ``"anchor"`` once per photo with its ``k`` most similar others. A model without cross-view modules predicts
+    each photo alone either way.
+    """
+    if not images:
+        return []
+    kw = dict(device=device, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
+              letterbox=letterbox, amp=amp)
+    max_views = int((getattr(model, "xview_cfg", None) or {}).get("max_views", 1))
+    if max_views < 2 or len(images) == 1:
+        return [predict_set(model, [im], **kw)[0] for im in images]
+    feats = torch.zeros(len(images), 1) if mode == "order" else _mean_patch_tokens(model, images, feature_size, **kw)
+    return _predict_groups(model, images, subject_sets(feats, max_views, mode=mode, k=k), mode, **kw)
+
+
+@torch.no_grad()
+def _mean_patch_tokens(model, images, size, *, device, letterbox, amp, **_) -> torch.Tensor:
+    """``(N, hidden)``: the mean patch token of each photo predicted alone at ``size``."""
+    grab = {}
+    hook = model.eomt.layernorm.register_forward_hook(lambda m, i, o: grab.__setitem__("x", o))
+    pre = model.config.num_queries + model.eomt.embeddings.num_prefix_tokens
+    dtype = _amp_dtype(device, amp)
+    feats = []
+    try:
+        for im in images:
+            chw, _ = preprocess_numpy(np.array(im.convert("RGB")), size, letterbox=letterbox,
+                                      mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None))
+            x = torch.from_numpy(chw)[None].to(device)
+            if dtype is None:
+                model(x)
+            else:
+                with torch.autocast("cuda", dtype=dtype):
+                    model(x)
+            feats.append(grab["x"][0, pre:].float().mean(0))
+    finally:
+        hook.remove()
+    return torch.stack(feats)
+
+
+def _predict_groups(model, images, groups, mode, **kw) -> list[dict]:
+    """One :func:`predict_set` per group; every photo keeps its own result (the first photo only, for ``"anchor"``)."""
+    results: list[dict | None] = [None] * len(images)
+    for group in groups:
+        res = predict_set(model, [images[i] for i in group], **kw)
+        for i, r in zip(group if mode != "anchor" else group[:1], res):
+            results[i] = r
+    return results
+
+
 def predict(
     model,
     source: str,

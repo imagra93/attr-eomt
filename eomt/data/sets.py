@@ -16,6 +16,10 @@ occluded   a patch of another photo across part of an  the photo as usual
            instance: its mask keeps what is visible
 =========  ==========================================  =================================================
 
+With ``SetConfig.focus`` a **locate** case joins them: the set is drawn from a photo holding a focus instance (e.g. a
+small object that only a close-up shows clearly), A is the photo shrunk as in ``small`` and B a 3-6x close-up of that
+instance, so that A has to find and place what only B shows clearly.
+
 Each view is drawn independently, so A and B never share exact pixels. On top of that, with some probability, B shows
 another part of the photo without A's instances (they have no partner and A must keep its own prediction), a
 **distractor** photo of another subject joins the set and a **mirrored copy** of the photo joins it: their instances
@@ -27,13 +31,14 @@ single-photo training. A share of the sets are single photos, so the single-phot
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 from PIL import Image
 
-from .coco import CocoInstanceSeg, _follow_aug
+from .coco import CocoInstanceSeg, _attr_label, _follow_aug
 from .transforms import _MEAN, _STD, AugConfig, TrainAugment, _coin, _fraction, _mass, _rand, _randint, _uniform
 
 #: Instance-id offsets of the views that do not show the set's photo: their instances are other instances.
@@ -50,6 +55,8 @@ ROLES: dict[str, dict] = {
                  "noise_std": (0.03, 0.08), "jpeg_prob": 0.8, "jpeg_quality": (10, 35), "gamma_prob": 0.7,
                  "gamma_range": (1.6, 2.6)},
     "elsewhere": {"instance_crop_empty_prob": 1.0, "min_scale": 1.2, "max_scale": 2.0},
+    # a close-up of a focus instance (SetConfig.focus), whatever else the photo shows
+    "zoom_focus": {"zoom_prob": 1.0, "zoom_scale": (3.0, 6.0), "zoom_attr": "_focus"},
     # last resort of a hard view whose instances were all cropped away: the whole photo, unwarped
     "whole": {"min_scale": 1.0, "max_scale": 1.0, "rotate_prob": 0.0, "shear_prob": 0.0, "perspective_prob": 0.0},
 }
@@ -66,7 +73,12 @@ CASES: dict[str, tuple[str, str]] = {
 class SetConfig:
     """How the sets are drawn: at most ``max_views`` photos; ``p_single`` single photos; the cases' relative weights;
     the probabilities of B showing another part of the photo (``p_elsewhere``), of a distractor and of a mirrored
-    copy; the share of an instance's box the occluder covers."""
+    copy; the share of an instance's box the occluder covers.
+
+    ``focus`` names the instances of a **locate** case (a class and attribute categories, e.g. ``{"class": "bird",
+    "pose": "flying"}``): with probability ``p_focus`` a set of
+    several photos is drawn from a photo with such an instance, A being the photo shrunk (the instance small) and B a
+    close-up of that instance, so that A learns to find and place what only B shows clearly."""
 
     max_views: int = 4
     p_single: float = 0.3
@@ -75,11 +87,15 @@ class SetConfig:
     p_distractor: float = 0.5
     p_flipped_copy: float = 0.25
     occluder_cover: tuple[float, float] = (0.3, 0.7)
+    focus: dict | None = None
+    p_focus: float = 0.0
 
     def __post_init__(self) -> None:
         unknown = set(self.cases) - set(CASES)
         if unknown or not 2 <= self.max_views:
             raise ValueError(f"SetConfig: cases {sorted(unknown)} not in {sorted(CASES)}, or max_views < 2")
+        if self.p_focus > 0 and not (self.focus and "class" in self.focus):
+            raise ValueError("SetConfig: p_focus > 0 needs focus with a 'class'")
         self.occluder_cover = tuple(self.occluder_cover)
 
 
@@ -102,6 +118,41 @@ class CocoViewSets(CocoInstanceSeg):
                     for role, over in ROLES.items() for flip in (0, 1)}
         self._mean = torch.tensor(_MEAN).view(3, 1, 1)
         self._std = torch.tensor(_STD).view(3, 1, 1)
+        self._focus, self._focus_idx = None, []
+        if self.sets.p_focus > 0:
+            self._focus = self._focus_rule(self.sets.focus)
+            self._focus_idx = [i for i, img_id in enumerate(self.ids) if self._has_focus(img_id)]
+            if not self._focus_idx:
+                raise ValueError(f"SetConfig.focus {self.sets.focus}: no photo has such an instance")
+
+    def _focus_rule(self, focus: dict) -> tuple[int, dict[str, int]]:
+        """``focus`` as (contiguous class, {attribute: contiguous category})."""
+        names = self.names if isinstance(self.names, dict) else dict(enumerate(self.names))
+        inv = {n: i for i, n in names.items()}
+        if focus["class"] not in inv:
+            raise ValueError(f"SetConfig.focus class {focus['class']!r} is not one of {sorted(inv)}")
+        attrs = {}
+        for a, cat in focus.items():
+            if a == "class":
+                continue
+            spec = next((s for s in self.aux_specs if s.name == a and not s.regression), None)
+            cats = dict(enumerate(spec.names)) if spec is not None and not isinstance(spec.names, dict) else \
+                (spec.names if spec is not None else {})
+            ids = [i for i, n in cats.items() if n == cat]
+            if not ids:
+                raise ValueError(f"SetConfig.focus: {a}={cat!r} is not an attribute category of this dataset")
+            attrs[a] = ids[0]
+        return inv[focus["class"]], attrs
+
+    def _has_focus(self, img_id) -> bool:
+        cls_id, attrs = self._focus
+        specs = {s.name: s for s in self.aux_specs}
+        for ann in self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id, iscrowd=False)):
+            cls = self.cat2contig[ann["category_id"]]
+            if cls == cls_id and all(_attr_label(specs[a], self._attr_id_maps, ann.get("attributes") or {}, cls) == v
+                                     for a, v in attrs.items()):
+                return True
+        return False
 
     def __getitem__(self, idx: int) -> dict:
         if self.seed is None:
@@ -112,18 +163,24 @@ class CocoViewSets(CocoInstanceSeg):
 
     def _make_set(self, idx: int) -> dict:
         c = self.sets
-        raw = self._load_raw(idx)
         flip = _coin(self.aug.flip_prob)
-        if _coin(c.p_single) or not c.cases:
-            return {"views": [self._view(raw, "context", flip, need=True)], "case": "single"}
-        names = list(c.cases)
-        cdf = np.cumsum([c.cases[n] for n in names]) / sum(c.cases.values())
-        case = names[min(int(np.searchsorted(cdf, _rand())), len(names) - 1)]
-        role_a, role_b = CASES[case]
-        views = [
-            self._view(raw, role_a, flip, need=True, occlude=case == "occluded"),
-            self._view(raw, "elsewhere" if _coin(c.p_elsewhere) else role_b, flip),
-        ]
+        if _coin(c.p_single) or not (c.cases or self._focus_idx):
+            return {"views": [self._view(self._load_raw(idx), "context", flip, need=True)], "case": "single"}
+        if self._focus_idx and (not c.cases or _coin(c.p_focus)):  # locate: B a close-up of a focus instance
+            idx = self._focus_idx[_randint(0, len(self._focus_idx) - 1)]
+            raw = self._load_raw(idx)
+            case = "locate"
+            views = [self._view(raw, "small", flip, need=True), self._view(raw, "zoom_focus", flip, focus=True)]
+        else:
+            raw = self._load_raw(idx)
+            names = list(c.cases)
+            cdf = np.cumsum([c.cases[n] for n in names]) / sum(c.cases.values())
+            case = names[min(int(np.searchsorted(cdf, _rand())), len(names) - 1)]
+            role_a, role_b = CASES[case]
+            views = [
+                self._view(raw, role_a, flip, need=True, occlude=case == "occluded"),
+                self._view(raw, "elsewhere" if _coin(c.p_elsewhere) else role_b, flip),
+            ]
         if len(views) < c.max_views and len(self.ids) > 1 and _coin(c.p_distractor):
             views.append(self._view(self._load_raw(self._other(idx)), "context", _coin(self.aug.flip_prob), DISTRACTOR_IDS))
         if len(views) < c.max_views and _coin(c.p_flipped_copy):
@@ -134,10 +191,18 @@ class CocoViewSets(CocoInstanceSeg):
         j = _randint(0, len(self.ids) - 2)
         return j + (j >= idx)
 
-    def _view(self, raw, role: str, flip: bool, offset: int = 0, *, need: bool = False, occlude: bool = False):
+    def _view(self, raw, role: str, flip: bool, offset: int = 0, *, need: bool = False, occlude: bool = False,
+              focus: bool = False):
         """One view of a raw sample: ``(image, masks, classes, attrs, inst_ids)`` of the instances it shows. ``need``
-        retries a view that lost every instance, the whole photo last."""
+        retries a view that lost every instance, the whole photo last; ``focus`` lets the close-up of the role pick
+        only a focus instance (marked for the augmentation by a temporary ``_focus`` attribute)."""
         image_tv, masks_tv, class_t, attr_t = raw[:4]
+        if focus:
+            cls_id, attrs = self._focus
+            hit = class_t == cls_id
+            for a, v in attrs.items():
+                hit &= attr_t[a] == v
+            attr_t = {**attr_t, "_focus": torch.where(hit, 1.0, math.nan)}
         ids = torch.arange(class_t.numel()) + offset
         for r in (role, role, role, "whole") if need else (role,):
             tf = self._tf[(r, int(flip))]
@@ -148,6 +213,7 @@ class CocoViewSets(CocoInstanceSeg):
             if keep.any():
                 break
         attrs = _follow_aug(self.aux_specs, attrs, tf.last_info)
+        attrs.pop("_focus", None)
         return img, masks[keep], cls[keep], {k: v[keep] for k, v in attrs.items()}, ids[keep]
 
     def _occlude(self, img: torch.Tensor, masks: torch.Tensor, tf: TrainAugment):
