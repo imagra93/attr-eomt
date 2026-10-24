@@ -26,6 +26,13 @@ def _iter_sources(source: str | Path):
         yield source
 
 
+def _subjects(source: str | Path) -> list[list[Path]]:
+    """The photos of each subject: those of ``source`` (a photo or a folder), then those of each of its subfolders."""
+    source = Path(source)
+    folders = [source, *sorted(p for p in source.iterdir() if p.is_dir())] if source.is_dir() else [source]
+    return [photos for photos in (list(_iter_sources(f)) for f in folders) if photos]
+
+
 def _amp_dtype(device, amp):
     """The autocast dtype for ``amp`` on ``device`` (``None`` = run in the model's own precision).
 
@@ -303,6 +310,7 @@ def predict(
     amp: bool | str = False,
     augment: bool | dict = False,
     tiles: bool | int | dict = False,
+    subject: bool | str = False,
 ) -> list[dict]:
     """Run inference on an image or a directory of images.
 
@@ -318,7 +326,14 @@ def predict(
     per-instance appearance fingerprint (see :func:`predict_image`). ``amp`` runs the
     network under autocast; ``augment`` / ``tiles`` run test-time augmentation / tiled
     inference (see :func:`predict_image`).
+
+    ``subject`` predicts the photos of each subject together, for a model post-trained with
+    ``multiview`` (:func:`predict_subject`; ``True`` or its ``mode``): the photos of ``source``
+    are one subject and each of its subfolders is another, whose annotated images keep the
+    subfolder under ``save``. Each result then carries ``"embed"``; no ``augment`` / ``tiles``.
     """
+    if subject and (augment or tiles):
+        raise ValueError("predict(subject=...) predicts the photos together, without augment / tiles.")
     if isinstance(model, (str, Path)):
         model = load_model(model, device=device)
 
@@ -333,45 +348,56 @@ def predict(
         f"[predict] eomt-{getattr(model, 'size', '?')} ({family}, "
         f"nc={getattr(model, 'nc', '?')}, imgsz={imgsz}) on {dev}"
     )
+    if subject and getattr(model, "xview_cfg", None) is None:
+        print("[predict] the model has no cross-view modules: each photo is predicted alone")
 
     out_root = Path(save) if (plot and save) else None
     if out_root is not None:
         out_root.mkdir(parents=True, exist_ok=True)
 
+    root = Path(source) if Path(source).is_dir() else Path(source).parent
     results: list[dict] = []
     total_t0 = time.perf_counter()
-    for path in _iter_sources(source):
-        image = Image.open(path).convert("RGB")
+    for paths in _subjects(source) if subject else ([p] for p in _iter_sources(source)):
+        images = [Image.open(p).convert("RGB") for p in paths]
         t0 = time.perf_counter()
-        result = predict_image(
-            model, image, device=dev, imgsz=imgsz,
-            conf_thres=conf_thres, max_det=max_det,
-            mask_thresh=mask_thresh, letterbox=letterbox, embed=embed, amp=amp,
-            augment=augment, tiles=tiles,
-        )
+        if subject:
+            batch = predict_subject(
+                model, images, device=dev, imgsz=imgsz, mode="order" if subject is True else subject,
+                conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh, letterbox=letterbox, amp=amp,
+            )
+        else:
+            batch = [predict_image(
+                model, images[0], device=dev, imgsz=imgsz,
+                conf_thres=conf_thres, max_det=max_det,
+                mask_thresh=mask_thresh, letterbox=letterbox, embed=embed, amp=amp,
+                augment=augment, tiles=tiles,
+            )]
         if dev.type == "cuda":
             torch.cuda.synchronize(dev)
-        elapsed_ms = (time.perf_counter() - t0) * 1e3
-        result["elapsed_ms"] = elapsed_ms
-        result["path"] = str(path)
-        dst = None
-        if plot:
-            rendered = draw_instances(
-                image, result, names=names, aux_names=aux_names or None,
-                alpha=alpha, draw_boxes=draw_boxes, aux_multiline=aux_multiline,
-                show_scores=show_scores, color_by=color_by,
+        elapsed_ms = (time.perf_counter() - t0) * 1e3 / len(paths)
+        for path, image, result in zip(paths, images, batch):
+            result["elapsed_ms"] = elapsed_ms
+            result["path"] = str(path)
+            dst = None
+            if plot:
+                rendered = draw_instances(
+                    image, result, names=names, aux_names=aux_names or None,
+                    alpha=alpha, draw_boxes=draw_boxes, aux_multiline=aux_multiline,
+                    show_scores=show_scores, color_by=color_by,
+                )
+                if out_root is not None:
+                    dst = out_root / path.relative_to(root)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    rendered.save(dst)
+                    result["plot_path"] = str(dst)
+                result["plot"] = rendered
+            saved = f" -> {dst}" if dst is not None else ""
+            print(
+                f"[predict] {path.name}: {result['num_detections']} instances "
+                f"({elapsed_ms:.1f} ms){saved}"
             )
-            if out_root is not None:
-                dst = out_root / path.name
-                rendered.save(dst)
-                result["plot_path"] = str(dst)
-            result["plot"] = rendered
-        saved = f" -> {dst}" if dst is not None else ""
-        print(
-            f"[predict] {path.name}: {result['num_detections']} instances "
-            f"({elapsed_ms:.1f} ms){saved}"
-        )
-        results.append(result)
+            results.append(result)
 
     n = len(results)
     if n:

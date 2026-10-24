@@ -1,7 +1,8 @@
-# Post-training for 1-4 photos of one subject predicted together — stage A:
+# Post-training for 1-4 photos of one subject predicted together — stage A, the config that
 #
-#   python scripts/train.py --data <dataset>/data.yaml --weights best.pt --multiview configs/xview.yaml \
-#       --name xview-a --batch 1 --epochs 6 --val-interval 1 --device 0,1
+#   python scripts/train_multiview.py --data <dataset>/data.yaml --weights best.pt --device 0,1
+#
+# runs (it is scripts/train.py with this file, --batch 1 --epochs 2 --val-interval 1 --name multiview).
 #
 # Keys: eomt.engine.train.DEFAULT_MULTIVIEW. --batch counts sets of photos (a set of 4 photos at 644 px takes
 # ~15 GB on an RTX 3090 with this config).

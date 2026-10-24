@@ -399,6 +399,9 @@ class EoMT:
         ``masks`` and, for models with secondary heads, ``aux``). With ``plot=True``
         each image is rendered with masks/boxes/labels and saved under ``save``.
         ``imgsz`` overrides the inference image size (defaults to the trained size).
+        ``subject=True`` predicts the photos of each subject together (a model post-trained
+        with ``train(multiview=...)``): ``source`` holds one subject's photos, or a subfolder
+        per subject; see :func:`eomt.engine.predict.predict`.
         """
         return _predict(
             self.model, str(source), plot=plot, save=save,

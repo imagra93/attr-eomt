@@ -269,6 +269,33 @@ def test_predict_subject_returns_one_result_per_photo():
     assert all(torch.equal(a["scores"], s["scores"]) for a, s in zip(alone, single))
 
 
+def test_predict_takes_a_subfolder_per_subject(tmp_path, monkeypatch):
+    import importlib
+
+    P = importlib.import_module("eomt.engine.predict")  # the module, not the predict() that eomt.engine re-exports
+
+    _, xv = _pair("blocks")
+    subjects = {"a": 2, "b": 5}
+    for name, n in subjects.items():
+        (tmp_path / "in" / name).mkdir(parents=True)
+        for i in range(n):
+            photo = np.random.default_rng(i).integers(0, 255, (90, 120, 3), dtype=np.uint8)
+            Image.fromarray(photo).save(tmp_path / "in" / name / f"{i}.png")
+    sizes, predict_set = [], P.predict_set
+
+    def spy(model, images, **kw):
+        sizes.append(len(images))
+        return predict_set(model, images, **kw)
+
+    monkeypatch.setattr(P, "predict_set", spy)
+    res = P.predict(xv, tmp_path / "in", subject=True, plot=True, save=tmp_path / "out", conf_thres=0.0, max_det=5)
+    assert sizes == [2, 4, 1]  # each subject apart, at most max_views photos at a time
+    assert [r["plot_path"] for r in res] == [str(tmp_path / "out" / name / f"{i}.png")
+                                             for name, n in subjects.items() for i in range(n)]
+    with pytest.raises(ValueError, match="augment"):
+        P.predict(xv, tmp_path / "in", subject=True, augment=True)
+
+
 def test_predict_set_returns_one_result_per_photo_with_match_embeddings():
     from eomt.engine.predict import predict_set
 

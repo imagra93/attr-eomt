@@ -21,11 +21,9 @@ Fine-tune or resume (use one, not both):
     python scripts/train.py --data my/data.yaml --weights runs/train/eomt-l/weights/best.pt \
         --name eomt-l-ft --epochs 3 --lr 2e-5 --warmup 100,200 --ema-decay 0.999 --mask-free  # a short, gentle warm start
 
-Post-train a checkpoint so that 1-4 photos of one subject are predicted together (cross-view); the
-YAML holds ``eomt.engine.train.DEFAULT_MULTIVIEW`` keys and ``--batch`` counts sets of photos:
-
-    python scripts/train.py --data my/data.yaml --weights best.pt --multiview configs/xview.yaml \
-        --name xview-a --batch 1 --epochs 6 --device 0,1
+Post-train a checkpoint so that 1-4 photos of one subject are predicted together (cross-view):
+scripts/train_multiview.py runs this script with that recipe. ``--multiview`` takes a YAML of
+``eomt.engine.train.DEFAULT_MULTIVIEW`` keys (configs/xview.yaml), and ``--batch`` then counts sets of photos.
 
 A flag left out keeps ``EoMT.train()``'s default (see the README, "Optimisation recipe").
 """
@@ -51,7 +49,7 @@ def _parse_aug(items: list[str], preset: str | None) -> dict | None:
     return aug or None
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", default="coco", help="Dataset YAML path or alias ('coco' auto-downloads).")
     p.add_argument("--size", default="l", choices=["s", "b", "l"], help="Model size.")
@@ -101,7 +99,7 @@ def main() -> None:
     p.add_argument("--multiview", default=None, metavar="YAML",
                    help="Post-train --weights for several photos predicted together: a YAML of "
                         "eomt.engine.train.DEFAULT_MULTIVIEW keys (e.g. configs/xview.yaml).")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     if args.weights and args.resume:
         raise SystemExit("pass --resume (continue a run) or --weights (warm-start a fresh run), not both.")

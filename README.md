@@ -439,9 +439,16 @@ close-up), a view that clears it up, and optionally a distractor photo and a mir
 — and every instance keeps its annotation id across the views:
 
 ```bash
-python scripts/train.py --data my/data.yaml --weights best.pt --multiview configs/xview.yaml \
-    --name xview-a --batch 1 --epochs 6 --device 0,1
+# post-train a trained model -> runs/train/multiview/weights/best.pt
+python scripts/train_multiview.py --data my/data.yaml --weights runs/train/eomt-l/weights/best.pt --device 0,1
+
+# predict the photos of each subject together: photos/ holds one subject's photos, or a subfolder per subject
+python scripts/predict.py runs/train/multiview photos/ --subject
 ```
+
+`scripts/train_multiview.py` is `scripts/train.py` with the recipe as defaults (`--multiview configs/xview.yaml
+--batch 1 --epochs 2 --val-interval 1 --name multiview`); any other flag of `scripts/train.py` can be added and wins.
+In Python, `EoMT(path).predict("photos/", subject=True)`.
 
 The default config is stage A: only the new modules train (about 18 M parameters on `l`),
 the checkpoint stays frozen; stage B adds `query_blocks: 0.1` to `trainable`. `best.pt` is
@@ -459,7 +466,8 @@ them `max_views` at a time in the given order, every photo once (about the cost 
 them one by one); `"partition"` groups similar photos (mean patch token of a small pass);
 `"anchor"` predicts each photo with its `k` most similar others. On real multi-photo sets
 (close-ups plus overviews of each subject) the three gave the same gain: what helps is seeing
-other photos of the subject, not a particular one.
+other photos of the subject, not a particular one. `scripts/predict.py --subject [MODE]` and
+`predict(subject=MODE)` take the mode (`--subject` alone is `"order"`).
 
 ---
 
