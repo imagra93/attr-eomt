@@ -188,6 +188,36 @@ def aux_loss(
     return total, per_head
 
 
+def match_loss(out: dict, indices, inst_ids: list[torch.Tensor], set_ids: torch.Tensor, tau: float = 0.1):
+    """Contrastive loss of the matching head (``out["match_embed"]``) over the matched queries of each set of photos.
+
+    Two matched queries are positives when their targets carry the same instance id in two different photos of a set;
+    every other matched query of the set (in any of its photos) is a negative. Each query with a positive is an anchor:
+    ``-log`` of the softmax mass (temperature ``tau``) its positives take among all its candidates (supervised InfoNCE).
+    ``indices`` is the query->target matching (gated as for the attribute heads); returns 0 when nothing pairs up.
+    """
+    emb = out["match_embed"]
+    feats, ids, photo, sets = [], [], [], []
+    for b, (src, tgt) in enumerate(indices):
+        if src.numel():
+            feats.append(emb[b, src])
+            ids.append(inst_ids[b].to(emb.device)[tgt])
+            photo.append(torch.full_like(src, b, device=emb.device))
+            sets.append(torch.full_like(src, int(set_ids[b]), device=emb.device))
+    if not feats:
+        return emb.sum() * 0.0
+    f, ids, photo, sets = torch.cat(feats), torch.cat(ids), torch.cat(photo), torch.cat(sets)
+    sim = (f @ f.T) / tau
+    cand = (sets[:, None] == sets[None]) & ~torch.eye(len(f), dtype=torch.bool, device=f.device)
+    pos = cand & (ids[:, None] == ids[None]) & (photo[:, None] != photo[None])
+    anchors = pos.any(1)
+    if not anchors.any():
+        return emb.sum() * 0.0
+    sim, cand, pos = sim[anchors], cand[anchors], pos[anchors]
+    neg_inf = torch.finfo(sim.dtype).min
+    return (sim.masked_fill(~cand, neg_inf).logsumexp(1) - sim.masked_fill(~pos, neg_inf).logsumexp(1)).mean()
+
+
 @torch.no_grad()
 def aux_accuracy(
     model,

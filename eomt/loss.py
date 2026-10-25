@@ -10,8 +10,7 @@ A reimplementation of ``transformers.models.eomt.modeling_eomt``'s loss stack (`
   from one draw to the next. The mask loss of the matched queries has two parts with different jobs: dice on every GT
   pixel against the logits bilinearly upsampled to the GT resolution (:func:`upsample_logits`, as inference reads
   them), so every instance is supervised however small; and the reference's BCE on 12,544 points, three quarters of
-  them where the prediction is least certain (:func:`uncertain_points`), which concentrates it on the boundaries. A
-  dense BCE spread that weight over every pixel and gave coarser masks (AP75 halved on thin structures).
+  them where the prediction is least certain (:func:`uncertain_points`), which concentrates it on the boundaries.
 * ``get_num_masks`` drops the ``accelerate`` all-reduce branch — training here is single-process (no
   ``PartialState`` is initialised). Re-add a reduce if DDP is introduced.
 

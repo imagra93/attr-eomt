@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..data import collate_val
-from ..postprocess import postprocess_detection, postprocess_instance
+from ..postprocess import postprocess_detection, postprocess_instance, slice_batch
 from ..tta import TTAConfig, predict_views
 from .distributed import gather, shard, sum_over_processes
 
@@ -83,6 +83,22 @@ def _adopt_flip_aware(model, val_ds) -> None:
             s.flip_aware = dict(d.flip_aware)
 
 
+def _greedy_pairs(iou: np.ndarray, gate: float) -> list[tuple[int, int]]:
+    """One-to-one ``(row, col)`` pairs of an IoU matrix, highest IoU first, down to ``gate``."""
+    pairs: list[tuple[int, int]] = []
+    taken_r: set[int] = set()
+    taken_c: set[int] = set()
+    for flat in np.argsort(-iou, axis=None):
+        r, c = divmod(int(flat), iou.shape[1])
+        if iou[r, c] < gate:
+            break
+        if r not in taken_r and c not in taken_c:
+            taken_r.add(r)
+            taken_c.add(c)
+            pairs.append((r, c))
+    return pairs
+
+
 def _count_attrs(res, rles, val_ds, img_id, specs, iou_gate, hits, tot) -> None:
     """Add one image's attribute hits to ``hits`` / ``tot``: each GT instance is matched to the kept detection of its
     class with the highest mask IoU (one to one, IoU >= ``iou_gate``) and every head is scored on it (accuracy; for a
@@ -98,16 +114,7 @@ def _count_attrs(res, rles, val_ds, img_id, specs, iou_gate, hits, tot) -> None:
     iou = np.asarray(mask_utils.iou(rles, [val_ds.coco.annToRLE(a) for a in gts], [0] * len(gts)))
     gt_cls = np.array([val_ds.cat2contig[a["category_id"]] for a in gts])
     iou[res["classes"].cpu().numpy()[:, None] != gt_cls[None, :]] = 0.0
-    taken_d: set[int] = set()
-    taken_g: set[int] = set()
-    for flat in np.argsort(-iou, axis=None):
-        d, g = divmod(int(flat), len(gts))
-        if iou[d, g] < iou_gate:
-            break
-        if d in taken_d or g in taken_g:
-            continue
-        taken_d.add(d)
-        taken_g.add(g)
+    for d, g in _greedy_pairs(iou, iou_gate):
         for s in specs:
             label = _attr_label(s, val_ds._attr_id_maps, gts[g].get("attributes") or {}, int(gt_cls[g]))
             if s.regression:
@@ -530,3 +537,192 @@ def aux_evaluate(
     scalar = {n: (hits[n] / tot[n] if tot[n] else float("nan")) for n in hits}
     pc = {n: {c: (v[0], v[1]) for c, v in buckets.items()} for n, buckets in per_class.items()}
     return scalar, pc
+
+
+class _Indexed(torch.utils.data.Dataset):
+    """``(i, ds[i])``: keeps each set's index (its image id) through the sharding over several GPUs."""
+
+    def __init__(self, ds):
+        self.ds = ds
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, i: int):
+        return i, self.ds[i]
+
+
+def _only(batch):
+    return batch[0]
+
+
+def _mask_iou(a: torch.Tensor, b: torch.Tensor) -> np.ndarray:
+    """IoU of two stacks of boolean masks ``(n, H, W)`` x ``(m, H, W)`` -> ``(n, m)``."""
+    if not len(a) or not len(b):
+        return np.zeros((len(a), len(b)))
+    a, b = a.flatten(1).float(), b.flatten(1).float()
+    inter = a @ b.T
+    return (inter / (a.sum(1)[:, None] + b.sum(1)[None] - inter).clamp_min(1)).cpu().numpy()
+
+
+def _set_links(results, embeds, gt_masks, gt_ids, conf: float, gate: float) -> list[tuple[float, bool]]:
+    """The links a set's photos get: between every two photos, the detections (score >= ``conf``) matched by the
+    Hungarian algorithm on the cosine similarity of ``embeds``, as ``(similarity, same instance)``; a detection is an
+    instance when its mask overlaps that instance's (IoU >= ``gate``, one to one)."""
+    from scipy.optimize import linear_sum_assignment
+
+    ids, feats = [], []
+    for r, e, gm, gi in zip(results, embeds, gt_masks, gt_ids):
+        sel = (r["scores"] >= conf).nonzero().flatten()
+        d_ids = np.full(len(sel), -1)
+        for d, g in _greedy_pairs(_mask_iou(r["masks"][sel.to(r["masks"].device)], gm), gate):
+            d_ids[d] = int(gi[g])
+        ids.append(d_ids)
+        feats.append(torch.nn.functional.normalize(e[r["query_idx"][sel]].float(), dim=-1))
+    pairs = []
+    for a in range(len(results)):
+        for b in range(a + 1, len(results)):
+            if len(ids[a]) and len(ids[b]):
+                sim = (feats[a] @ feats[b].T).cpu().numpy()
+                for i, j in zip(*linear_sum_assignment(-sim)):
+                    pairs.append((float(sim[i, j]), bool(ids[a][i] >= 0 and ids[a][i] == ids[b][j])))
+    return pairs
+
+
+def _link_f1(pairs: list[tuple[float, bool]], n_true: int) -> dict[str, float]:
+    """Precision / recall / F1 of the links at the similarity threshold of the best F1 (``thres``): a link is kept
+    when its similarity reaches the threshold; ``n_true`` counts the instances shown by two photos (the links to find)."""
+    best = {"f1": 0.0, "precision": 0.0, "recall": 0.0, "thres": float("nan")}
+    if not pairs or not n_true:
+        return best
+    sim = np.array([p[0] for p in pairs])
+    ok = np.array([p[1] for p in pairs])
+    for t in np.linspace(-1.0, 1.0, 201):
+        sel = sim >= t
+        tp, n = int((sel & ok).sum()), int(sel.sum())
+        p, r = (tp / n if n else 0.0), tp / n_true
+        f = 2 * p * r / (p + r) if p + r else 0.0
+        if f > best["f1"]:
+            best = {"f1": f, "precision": p, "recall": r, "thres": float(t)}
+    return best
+
+
+@torch.no_grad()
+def evaluate_sets(
+    model,
+    sets_ds,
+    *,
+    device,
+    num_workers: int = 4,
+    amp: bool = False,
+    max_det: int = 100,
+    link_conf: float = 0.3,
+    iou_gate: float = 0.5,
+    verbose: bool = True,
+) -> dict[str, float]:
+    """Score a cross-view model on fixed synthetic sets (:class:`~eomt.data.sets.CocoViewSets` with a ``seed``): there
+    are no real multi-photo annotations, so this measures what the sets were built to teach, not real viewpoints.
+
+    * ``sets/segm/<metric>_{alone,set}`` and ``sets/<case>/mAP_{alone,set}``: COCO segm of each set's hard view (the
+      first photo), predicted alone and together with the rest of its set, over all sets and per case; the GT is the
+      view's own masks at the input resolution (so the size buckets are those of 644 px images).
+    * ``sets/aux_acc/<head>_{alone,set}`` (``aux_mae`` for a regression head): the hard view's attributes on its GT
+      instances matched to a same-class detection (mask IoU >= ``iou_gate``).
+    * ``sets/match/{f1,precision,recall,thres}``: links between the photos of each set from the matching head (the
+      model's ``match_embed``, else ``query_embed``, in the joint forward), against ``sets/reid/*``: the same from the
+      per-query embedding of the photos predicted alone (:mod:`eomt.reid`'s fingerprint). Detections scoring at least
+      ``link_conf`` are linked; ``thres`` is the similarity threshold of the best F1.
+    """
+    from pycocotools import mask as mask_utils
+    from pycocotools.coco import COCO
+
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    model.eval()
+    use_amp = amp and device.type == "cuda"
+    size = sets_ds.imgsz
+    specs = _check_attr_vocab(model, sets_ds)
+    loader = DataLoader(shard(_Indexed(sets_ds)), batch_size=1, shuffle=False, num_workers=num_workers,
+                        collate_fn=_only)
+    images, anns, cases = [], [], {}
+    dets: dict[str, list] = {"alone": [], "set": []}
+    hits = {m: {s.name: 0.0 for s in specs} for m in dets}
+    tot = {m: {s.name: 0 for s in specs} for m in dets}
+    links: dict[str, list] = {"match": [], "reid": []}
+    n_true = 0
+    for idx, item in tqdm(loader, desc="val-sets", unit="set", leave=False, disable=not verbose):
+        views = item["views"]
+        pv = torch.stack([v[0] for v in views]).to(device)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            outs = {"alone": model(pv), "set": model(pv, set_ids=torch.zeros(len(views), dtype=torch.long))}
+        res = {m: [postprocess_instance(slice_batch(o, b), 0.0, (size, size), max_det=max_det)
+                   for b in range(len(views))] for m, o in outs.items()}
+        gt_masks = [v[1].to(device) > 0.5 for v in views]
+        gt_ids = [v[4] for v in views]
+
+        # the hard view: COCO results and attributes, alone and with its set
+        keep = gt_masks[0].flatten(1).any(1).cpu()
+        a_masks, a_cls = gt_masks[0][keep.to(device)], views[0][2][keep]
+        a_attrs = {k: t[keep] for k, t in views[0][3].items()}
+        images.append({"id": idx, "width": size, "height": size})
+        cases.setdefault(item["case"], []).append(idx)
+        for g in range(len(a_masks)):
+            rle = _encode_mask(a_masks[g].cpu().numpy())
+            anns.append({"image_id": idx, "category_id": int(a_cls[g]) + 1, "segmentation": rle,
+                         "area": float(mask_utils.area(rle)), "bbox": [float(x) for x in mask_utils.toBbox(rle)],
+                         "iscrowd": 0})
+        for m in dets:
+            r = res[m][0]
+            for i in range(r["num_detections"]):
+                dets[m].append({"image_id": idx, "category_id": int(r["classes"][i]) + 1, "score": float(r["scores"][i]),
+                                "segmentation": _encode_mask(r["masks"][i].cpu().numpy())})
+            iou = _mask_iou(r["masks"], a_masks)
+            iou[r["classes"].cpu().numpy()[:, None] != a_cls.numpy()[None]] = 0.0
+            for d, g in _greedy_pairs(iou, iou_gate):
+                for s in specs:
+                    label = a_attrs[s.name][g]
+                    if s.regression and not torch.isnan(label):
+                        hits[m][s.name] += abs(float(r["aux_values"][s.name][d]) - float(label))
+                        tot[m][s.name] += 1
+                    elif not s.regression and int(label) != -100:
+                        hits[m][s.name] += int(r["aux"][s.name]["ids"][d]) == int(label)
+                        tot[m][s.name] += 1
+
+        # cross-photo links over every photo of the set
+        shown = [set(i.tolist()) for i in gt_ids]
+        n_true += sum(len(shown[a] & shown[b]) for a in range(len(views)) for b in range(a + 1, len(views)))
+        set_embed = outs["set"].get("match_embed", outs["set"]["query_embed"])
+        links["match"] += _set_links(res["set"], set_embed, gt_masks, gt_ids, link_conf, iou_gate)
+        links["reid"] += _set_links(res["alone"], outs["alone"]["query_embed"], gt_masks, gt_ids, link_conf, iou_gate)
+
+    parts = gather((images, anns, cases, dets, hits, tot, links, n_true))
+    if parts is None:  # several GPUs: the main process scores the sets of all
+        return {}
+    images = [x for p in parts for x in p[0]]
+    anns = [{**a, "id": i + 1} for i, a in enumerate(x for p in parts for x in p[1])]
+    cases = {c: [i for p in parts for i in p[2].get(c, [])] for c in {c for p in parts for c in p[2]}}
+    dets = {m: [x for p in parts for x in p[3][m]] for m in dets}
+    hits = {m: {n: sum(p[4][m][n] for p in parts) for n in hits[m]} for m in hits}
+    tot = {m: {n: sum(p[5][m][n] for p in parts) for n in tot[m]} for m in tot}
+    links = {k: [x for p in parts for x in p[6][k]] for k in links}
+    n_true = sum(p[7] for p in parts)
+
+    coco = COCO()
+    coco.dataset = {"images": images, "annotations": anns,
+                    "categories": [{"id": c + 1, "name": n} for c, n in sets_ds.names.items()]}
+    with contextlib.redirect_stdout(io.StringIO()):
+        coco.createIndex()
+    ids = [i["id"] for i in images]
+    metrics: dict[str, float] = {}
+    for m in dets:
+        # copies: ``loadRes`` writes ``bbox`` / ``area`` into the result dicts, which breaks a second evaluation of them
+        ev = _cocoeval(coco, [dict(d) for d in dets[m]], ids, "segm", False)
+        metrics.update({f"sets/segm/{k}_{m}": ev[f"segm/{k}"] for k in ("mAP", "mAP50", "mAP_small", "AR100")})
+        for case, case_ids in sorted(cases.items()):
+            wanted = set(case_ids)
+            case_dets = [dict(d) for d in dets[m] if d["image_id"] in wanted]
+            metrics[f"sets/{case}/mAP_{m}"] = _cocoeval(coco, case_dets, case_ids, "segm", False)["segm/mAP"]
+        for s in specs:
+            metrics[f"sets/{_attr_metric(s)}/{s.name}_{m}"] = hits[m][s.name] / tot[m][s.name] if tot[m][s.name] else float("nan")
+    for k, pairs in links.items():
+        metrics.update({f"sets/{k}/{n}": v for n, v in _link_f1(pairs, n_true).items()})
+    return metrics

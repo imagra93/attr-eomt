@@ -26,10 +26,14 @@ def main() -> None:
     p.add_argument("--out", default="runs/match", help="Output directory.")
     p.add_argument("--conf", type=float, default=0.3, help="Detection confidence threshold.")
     p.add_argument("--max-det", type=int, default=30, help="Max detections per photo.")
-    p.add_argument("--sim-thres", type=float, default=0.7,
-                   help="Cosine-similarity floor for 'same instance'.")
-    p.add_argument("--group-by", default="class",
-                   help="Comma-separated gate keys, e.g. class,position.")
+    p.add_argument("--sim-thres", type=float, default=None,
+                   help="Cosine-similarity floor for 'same instance' (default: a cross-view model's calibrated "
+                        "threshold, else 0.7).")
+    p.add_argument("--group-by", default="auto",
+                   help="Comma-separated gate keys, e.g. class,position (default: none for a model with a "
+                        "matching head, else class).")
+    p.add_argument("--per-photo", action="store_true",
+                   help="One forward per photo even for a cross-view model (default: one joint forward).")
     p.add_argument("--no-group-by", action="store_true",
                    help="Disable gating entirely (use a higher --sim-thres).")
     p.add_argument("--guard", default="mean", choices=("mean", "min", "off"),
@@ -49,7 +53,7 @@ def main() -> None:
     p.add_argument("--device", default="auto")
     args = p.parse_args()
 
-    group_by = None if args.no_group_by else tuple(
+    group_by = None if args.no_group_by else "auto" if args.group_by == "auto" else tuple(
         k.strip() for k in args.group_by.split(",") if k.strip()
     )
     root = Path(args.source)
@@ -69,7 +73,7 @@ def main() -> None:
             max_det=args.max_det, group_by=group_by, sim_thres=args.sim_thres,
             guard=args.guard, guard_factor=args.guard_factor, center=args.center,
             link_mode=args.links, panel_size=args.panel_size,
-            legend_attr=args.legend_attr,
+            legend_attr=args.legend_attr, joint=False if args.per_photo else None,
         )
         total += result["num_identities"]
     print(f"[done] {total} identities across {len(sources)} subject(s) -> {args.out}")

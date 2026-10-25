@@ -213,6 +213,15 @@ def postprocess_detection(
     return result
 
 
+def slice_batch(output: dict, b: int) -> dict:
+    """Photo ``b`` of a batched model output, in the batch-of-one layout :func:`postprocess_instance` reads."""
+    return {
+        k: v[b:b + 1] if torch.is_tensor(v) else {n: t[b:b + 1] for n, t in v.items()}
+        for k, v in output.items()
+        if torch.is_tensor(v) or isinstance(v, dict)
+    }
+
+
 def query_scores(class_logits, mask_logits, quality_logits, mask_thresh: float = 0.5):
     """Per-query ``(scores, classes)`` ``(Q,)`` of one image: the best non-background class probability times the mask
     score, from ``class_logits`` ``(Q, C+1)``, ``mask_logits`` ``(Q, h, w)`` and ``quality_logits`` ``(Q,)`` or None."""

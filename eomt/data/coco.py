@@ -12,6 +12,7 @@ to convert predictions back to original ids for ``COCOeval``.
 
 from __future__ import annotations
 
+import copy
 import math
 import warnings
 from collections import Counter
@@ -266,8 +267,16 @@ def _regression_spec(d: dict, anns: list, cat2contig: dict, applies_to) -> AuxHe
     return spec
 
 
-def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=None, contig_names=None):
+#: How a head trains on an attribute: set by the run config (``attributes:`` of the training YAML), not the data.
+BEHAVIOR_KEYS = ("flip_aware", "crop", "min_visible", "log", "range", "applies_to")
+
+
+def _build_attribute_maps(coco, only: list[str] | dict | None = None, *, cat2contig=None, contig_names=None):
     """Discover secondary attributes from a COCO handle.
+
+    ``only`` restricts the heads to those attributes; as a mapping ``{name: behavior}`` (the ``attributes`` section
+    of a run config) it also sets how each one trains (:data:`BEHAVIOR_KEYS`), over whatever the data declares: the
+    data holds the attributes' names, types and categories, the run config how they are learned.
 
     Reads the (non-standard but valid) top-level ``attributes`` list::
 
@@ -292,6 +301,15 @@ def _build_attribute_maps(coco, only: list[str] | None = None, *, cat2contig=Non
     defs = dataset.get("attributes") or []
     if only is not None:
         defs = [d for d in defs if d.get("name") in only]
+    if isinstance(only, dict):
+        missing = set(only) - {d.get("name") for d in defs}
+        if missing:
+            raise ValueError(f"attributes {sorted(missing)} are configured but not defined in the data")
+        for name, behavior in only.items():
+            unknown = set(behavior or {}) - set(BEHAVIOR_KEYS)
+            if unknown:
+                raise ValueError(f"attribute {name!r}: unknown keys {sorted(unknown)} (allowed: {', '.join(BEHAVIOR_KEYS)})")
+        defs = [{**d, **(only[d["name"]] or {})} for d in defs]
     if not defs:
         return [], {}
 
@@ -415,7 +433,7 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
         max_scale: float | None = None,
         aug: AugConfig | dict | None = None,
         keep_empty: bool = False,
-        attributes: list[str] | bool = True,
+        attributes: list[str] | dict | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
     ):
         from pycocotools.coco import COCO
@@ -459,6 +477,19 @@ class CocoInstanceSeg(_InstanceWeights, Dataset):
 
     def __len__(self) -> int:
         return len(self.ids)
+
+    def at_imgsz(self, imgsz: int, aug: AugConfig | None = None) -> CocoInstanceSeg:
+        """This dataset at another input size: the same images and annotations, sharing the loaded COCO index (a large
+        train JSON is not read again), with the same augmentation settings or ``aug`` (the instance weights stay those of
+        this dataset's). Built-in augmentation only: a custom ``transform`` cannot be resized."""
+        if not getattr(self.transform, "is_train_augment", False):
+            raise ValueError("at_imgsz needs the built-in augmentation: a custom transform cannot be resized")
+        view = copy.copy(self)
+        view.imgsz = imgsz
+        view.aug = aug or self.aug
+        view.transform = TrainAugment(imgsz, view.aug)
+        view._fallback_transform = build_val_transform(imgsz)
+        return view
 
     def _load_raw(self, idx: int):
         """Decode one sample *before* augmentation: ``(image_tv, masks_tv, class_t, attr_t, rarity_keys)``."""
@@ -587,7 +618,7 @@ class CocoDetection(_InstanceWeights, Dataset):
         min_scale: float | None = None,
         max_scale: float | None = None,
         aug: AugConfig | dict | None = None,
-        attributes: list[str] | bool = True,
+        attributes: list[str] | dict | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
     ):
         from pycocotools.coco import COCO
@@ -724,7 +755,7 @@ class CocoValImages(Dataset):
         letterbox: bool = True,
         mean=None,
         std=None,
-        attributes: list[str] | bool = True,
+        attributes: list[str] | dict | bool = True,
         shared_aux: tuple[list[AuxHeadSpec], dict] | None = None,
         raw: bool = False,
     ):

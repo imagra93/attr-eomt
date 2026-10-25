@@ -20,10 +20,13 @@ weights/
 *.pt
 *.pth
 
-# Datasets (auto-downloaded)
+# Datasets (auto-downloaded) and their local converters
 datasets/
 /data/coco/
 scripts/sample_images/
+
+# Local training: per-dataset train_*.py, their configs/ and converter tests
+local_training_scripts/
 
 # Editor / OS
 .idea/

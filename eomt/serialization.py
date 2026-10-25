@@ -247,7 +247,10 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
         num_upscale_blocks=num_upscale_blocks,
         fpn_scales=fpn_scales,
         aux_box_head=aux_box_head,
+        xview=ckpt.get("xview"),
+        match_dim=int(ckpt.get("match_dim") or 0),
     )
+    model.match_thres = ckpt.get("match_thres")
     # Compressed checkpoints carry int8 tensor subclasses (torchao). Re-create the
     # quantized layout, then load with ``assign=True`` so the saved subclassed
     # tensors *replace* the module weights directly — copying into freshly built
@@ -277,6 +280,8 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
     # Restore normalization (legacy checkpoints predate it → keep the ImageNet default).
     model.pixel_mean = tuple(float(x) for x in ckpt.get("norm_mean", model.pixel_mean))
     model.pixel_std = tuple(float(x) for x in ckpt.get("norm_std", model.pixel_std))
+    # How the model is meant to be run (the run config's `inference`: conf_thres, ...): predict / track's defaults.
+    model.inference = dict(ckpt.get("inference") or {})
     # Stash the compression recipe so a re-save round-trips it (see EoMT.save).
     model._compression_meta = dict(compression) if compression else None
     if compression:
@@ -429,6 +434,9 @@ def summarize_checkpoint(path: str | Path) -> dict[str, Any]:
         "num_upscale_blocks": ckpt.get("num_upscale_blocks"),
         "fpn_scales": ckpt.get("fpn_scales") or _try(lambda: _infer_fpn_scales(state)),
         "aux_box_head": bool(ckpt.get("aux_box_head")) or bool(_try(lambda: _infer_aux_box_head(state))),
+        "xview": ckpt.get("xview"),
+        "match_dim": ckpt.get("match_dim"),
+        "match_thres": ckpt.get("match_thres"),
         # Training state (only present in last.pt).
         "epoch": ckpt.get("epoch"),
         "best_metric": ckpt.get("best_metric"),
@@ -482,6 +490,12 @@ def format_summary(summary: dict[str, Any]) -> str:
         arch.append(f"FPN{tuple(summary['fpn_scales'])}")
     if summary.get("aux_box_head"):
         arch.append("box head")
+    if summary.get("xview"):
+        xv = summary["xview"]
+        arch.append(f"cross-view {xv.get('mode')} (<= {xv.get('max_views')} photos)")
+    if summary.get("match_dim"):
+        thr = summary.get("match_thres")
+        arch.append(f"match head {summary['match_dim']}-d" + (f" (thres {thr:.2f})" if thr is not None else ""))
     if arch:
         lines.insert(5, "  extras   : " + ", ".join(arch))
     if summary.get("epoch") is not None or summary.get("has_optimizer"):
