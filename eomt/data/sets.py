@@ -27,6 +27,16 @@ are other instances (ids offset by :data:`DISTRACTOR_IDS` / :data:`FLIPPED_IDS`)
 on the other side are not the same instance. The horizontal flip is drawn once per set and applied to every view of
 the photo (the mirrored copy takes the other one), with the flip-aware attributes (e.g. left/right) swapped as in
 single-photo training. A share of the sets are single photos, so the single-photo behaviour is kept in training.
+
+With ``SetConfig.sizes`` a set's size is drawn instead, and the views after A and B **fill** it (``SetConfig.fill``):
+another view of the photo's instances (**positive**), another part of the photo without them (**elsewhere**), another
+annotated photo of the same **subject** (the images' ``subject_id``, :mod:`eomt.data.subjects`: in a product every
+photo of a set shows the same subject, often other parts of it), the mirrored copy or a distractor. The instances of
+another photo of the subject are each annotated in that photo, but which of them are A's is not known here: their ids
+are negative (:data:`UNKNOWN_IDS`), so they train every head but stay out of the matching head's loss and links.
+``p_subject`` draws the set's photo among those whose subject has other annotated photos. Real sets, several photos of
+a subject each predicted with the others and with the instances linked across them, are
+:class:`eomt.data.subjects.CocoSubjectSets`.
 """
 
 from __future__ import annotations
@@ -43,6 +53,11 @@ from .transforms import _MEAN, _STD, AugConfig, TrainAugment, _coin, _fraction, 
 
 #: Instance-id offsets of the views that do not show the set's photo: their instances are other instances.
 DISTRACTOR_IDS, FLIPPED_IDS = 10_000, 20_000
+#: Instance-id offset of a view whose instances are not linked to the set's others (another photo of the subject):
+#: its ids are negative and the matching head leaves them out (each such view takes its own block of ids below it).
+UNKNOWN_IDS = -100_000
+#: The views that can fill a set beyond A and B (``SetConfig.fill``).
+FILLS = ("positive", "elsewhere", "subject", "flipped", "distractor")
 
 #: View role -> :class:`~eomt.data.transforms.AugConfig` overrides of the base recipe. The scales are relative to the
 #: photo fitted to the input, i.e. 1.0 is what inference sees.
@@ -69,6 +84,13 @@ CASES: dict[str, tuple[str, str]] = {
 }
 
 
+def _draw(weights: dict):
+    """A key of ``weights`` drawn in proportion to its weight."""
+    keys = list(weights)
+    cdf = np.cumsum([weights[k] for k in keys]) / sum(weights.values())
+    return keys[min(int(np.searchsorted(cdf, _rand())), len(keys) - 1)]
+
+
 @dataclass
 class SetConfig:
     """How the sets are drawn: at most ``max_views`` photos; ``p_single`` single photos; the cases' relative weights;
@@ -78,7 +100,13 @@ class SetConfig:
     ``focus`` names the instances of a **locate** case (a class and attribute categories, e.g. ``{"class": "bird",
     "pose": "flying"}``): with probability ``p_focus`` a set of
     several photos is drawn from a photo with such an instance, A being the photo shrunk (the instance small) and B a
-    close-up of that instance, so that A learns to find and place what only B shows clearly."""
+    close-up of that instance, so that A learns to find and place what only B shows clearly.
+
+    ``sizes`` (``{photos: weight}``, 2 to ``max_views``) draws the size of each set of several photos, filled beyond A
+    and B by the views of ``fill`` (``{kind: weight}``, kinds :data:`FILLS`; a ``subject`` view falls back to
+    ``elsewhere`` when the subject has no other photo); ``p_distractor`` and ``p_flipped_copy`` then play no part.
+    Without ``sizes`` the sets grow by those two coins as before. ``p_subject`` draws the photo of a set of several
+    among those whose subject (the images' ``subject_id``) has other annotated photos."""
 
     max_views: int = 4
     p_single: float = 0.3
@@ -89,6 +117,9 @@ class SetConfig:
     occluder_cover: tuple[float, float] = (0.3, 0.7)
     focus: dict | None = None
     p_focus: float = 0.0
+    sizes: dict | None = None
+    fill: dict[str, float] = field(default_factory=lambda: {"positive": 1.0, "elsewhere": 1.0, "subject": 1.0})
+    p_subject: float = 0.0
 
     def __post_init__(self) -> None:
         unknown = set(self.cases) - set(CASES)
@@ -97,6 +128,15 @@ class SetConfig:
         if self.p_focus > 0 and not (self.focus and "class" in self.focus):
             raise ValueError("SetConfig: p_focus > 0 needs focus with a 'class'")
         self.occluder_cover = tuple(self.occluder_cover)
+        if self.sizes is not None:
+            self.sizes = {int(n): float(w) for n, w in self.sizes.items()}
+            if not self.sizes or any(not 2 <= n <= self.max_views for n in self.sizes) or sum(self.sizes.values()) <= 0:
+                raise ValueError(f"SetConfig: sizes {self.sizes} must weigh set sizes from 2 to max_views")
+        bad = set(self.fill) - set(FILLS)
+        if bad or sum(self.fill.values()) <= 0:
+            raise ValueError(f"SetConfig: fill kinds {sorted(bad)} not in {FILLS}, or no positive weight"
+                             + (" (the 'case' fill is now 'subject', read from the images' subject_id)"
+                                if "case" in bad else ""))
 
 
 class CocoViewSets(CocoInstanceSeg):
@@ -124,6 +164,16 @@ class CocoViewSets(CocoInstanceSeg):
             self._focus_idx = [i for i, img_id in enumerate(self.ids) if self._has_focus(img_id)]
             if not self._focus_idx:
                 raise ValueError(f"SetConfig.focus {self.sets.focus}: no photo has such an instance")
+        # The photos of each subject (the images' subject_id), for the `subject` views and p_subject
+        self._subject_of: dict[int, list[int]] = {}
+        if self.sets.p_subject > 0 or (self.sets.sizes and self.sets.fill.get("subject")):
+            members: dict = {}
+            for i, img_id in enumerate(self.ids):
+                subject = self.coco.loadImgs(img_id)[0].get("subject_id")
+                if subject is not None:
+                    members.setdefault(subject, []).append(i)
+            self._subject_of = {i: m for m in members.values() if len(m) > 1 for i in m}
+        self._subject_idx = sorted(self._subject_of)
 
     def _focus_rule(self, focus: dict) -> tuple[int, dict[str, int]]:
         """``focus`` as (contiguous class, {attribute: contiguous category})."""
@@ -172,15 +222,20 @@ class CocoViewSets(CocoInstanceSeg):
             case = "locate"
             views = [self._view(raw, "small", flip, need=True), self._view(raw, "zoom_focus", flip, focus=True)]
         else:
+            if self._subject_idx and _coin(c.p_subject):
+                idx = self._subject_idx[_randint(0, len(self._subject_idx) - 1)]
             raw = self._load_raw(idx)
-            names = list(c.cases)
-            cdf = np.cumsum([c.cases[n] for n in names]) / sum(c.cases.values())
-            case = names[min(int(np.searchsorted(cdf, _rand())), len(names) - 1)]
+            case = _draw(c.cases)
             role_a, role_b = CASES[case]
             views = [
                 self._view(raw, role_a, flip, need=True, occlude=case == "occluded"),
                 self._view(raw, "elsewhere" if _coin(c.p_elsewhere) else role_b, flip),
             ]
+        if c.sizes:
+            size = _draw(c.sizes)
+            while len(views) < size:
+                views.append(self._fill(raw, idx, flip, len(views)))
+            return {"views": views, "case": case}
         if len(views) < c.max_views and len(self.ids) > 1 and _coin(c.p_distractor):
             views.append(self._view(self._load_raw(self._other(idx)), "context", _coin(self.aug.flip_prob), DISTRACTOR_IDS))
         if len(views) < c.max_views and _coin(c.p_flipped_copy):
@@ -190,6 +245,27 @@ class CocoViewSets(CocoInstanceSeg):
     def _other(self, idx: int) -> int:
         j = _randint(0, len(self.ids) - 2)
         return j + (j >= idx)
+
+    def _fill(self, raw, idx: int, flip: bool, slot: int):
+        """The view in position ``slot`` of a set filled to its drawn size (``SetConfig.fill``): another view of the
+        photo's instances, another part of the photo without them, another photo of its subject (flipped with the set:
+        left and right of one subject never mix), the mirrored copy or a distractor (each distractor its own block of
+        ids: two distractors are two other subjects)."""
+        kind = _draw(self.sets.fill)
+        if kind == "subject":
+            others = [j for j in self._subject_of.get(idx, ()) if j != idx]
+            if others:
+                j = others[_randint(0, len(others) - 1)]
+                return self._view(self._load_raw(j), "context", flip, UNKNOWN_IDS * slot)
+            kind = "elsewhere"
+        if kind == "positive":
+            return self._view(raw, "zoom" if _coin(0.5) else "context", flip)
+        if kind == "elsewhere":
+            return self._view(raw, "elsewhere", flip)
+        if kind == "flipped":
+            return self._view(raw, "context", not flip, FLIPPED_IDS)
+        return self._view(self._load_raw(self._other(idx)), "context", _coin(self.aug.flip_prob),
+                          DISTRACTOR_IDS + 1000 * slot)
 
     def _view(self, raw, role: str, flip: bool, offset: int = 0, *, need: bool = False, occlude: bool = False,
               focus: bool = False):
@@ -258,8 +334,11 @@ class CocoViewSets(CocoInstanceSeg):
 
 def collate_sets(batch: list[dict]):
     """Flatten a batch of sets into one batch of photos: ``(pixel_values, mask_labels, class_labels, aux_labels,
-    set_ids, inst_ids)``, where ``set_ids[b]`` is the set of photo ``b`` and ``inst_ids[b]`` the instance ids of its
-    targets."""
+    set_ids, inst_ids, extras)``, where ``set_ids[b]`` is the set of photo ``b``, ``inst_ids[b]`` the instance ids of
+    its targets and ``extras`` the partial-label inputs of the real sets (:func:`eomt.data.subjects.collate_extras`:
+    ignore maps and "no object" weights), None when no set of the batch has any."""
+    from .subjects import collate_extras
+
     views = [(s, v) for s, item in enumerate(batch) for v in item["views"]]
     names = list(views[0][1][3])
     return (
@@ -269,4 +348,5 @@ def collate_sets(batch: list[dict]):
         {n: [v[3][n] for _, v in views] for n in names},
         torch.tensor([s for s, _ in views]),
         [v[4] for _, v in views],
+        collate_extras(batch),
     )

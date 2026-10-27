@@ -10,9 +10,9 @@ import torch
 from PIL import Image
 
 from eomt import build_model
-from eomt.aux_cls import match_loss
+from eomt.aux_cls import harm_loss, match_loss
 from eomt.data import CocoViewSets, collate_sets
-from eomt.data.sets import DISTRACTOR_IDS, FLIPPED_IDS
+from eomt.data.sets import DISTRACTOR_IDS, FLIPPED_IDS, UNKNOWN_IDS
 
 IMGSZ = 140
 KEYS = ("masks_queries_logits", "class_queries_logits", "query_embed")
@@ -84,15 +84,19 @@ def test_match_loss_pulls_the_same_instance_together_across_photos():
     assert match_loss({"match_embed": aligned}, indices, inst_ids, torch.tensor([0, 1])) == 0
 
 
-def _mini_coco(tmp_path, n_images=4):
-    """Tiny photos with a left blob and a centre line each; ``side`` is flip-aware, ``area`` a crop-scaled value."""
+def _mini_coco(tmp_path, n_images=4, subjects=None):
+    """Tiny photos with a left blob and a centre line each; ``side`` is flip-aware, ``area`` a crop-scaled value.
+    ``subjects``: each photo's ``subject_id`` (None: no subject)."""
     img_dir = tmp_path / "images"
     img_dir.mkdir()
     rng = np.random.default_rng(0)
     imgs, anns = [], []
-    for i in range(1, n_images + 1):
-        Image.fromarray(rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)).save(img_dir / f"im{i}.png")
-        imgs.append({"id": i, "file_name": f"im{i}.png", "width": 160, "height": 120})
+    subjects = subjects or [None] * n_images
+    for i, subject in enumerate(subjects, start=1):
+        name = f"im{i}.png"
+        Image.fromarray(rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)).save(img_dir / name)
+        imgs.append({"id": i, "file_name": name, "width": 160, "height": 120,
+                     **({"subject_id": subject} if subject is not None else {})})
         for cat, side, (x0, y0, x1, y1) in ((1, 0, (10, 10, 70, 60)), (2, 1, (60, 80, 150, 92))):
             anns.append({"id": len(anns) + 1, "image_id": i, "category_id": cat, "iscrowd": 0,
                          "bbox": [x0, y0, x1 - x0, y1 - y0], "area": (x1 - x0) * (y1 - y0),
@@ -160,7 +164,8 @@ def test_collate_flattens_sets_into_photos(tmp_path):
     img_dir, jf = _mini_coco(tmp_path)
     ds = CocoViewSets(img_dir, jf, imgsz=112, sets={"p_single": 0.5}, seed=1)
     batch = [ds[0], ds[1], ds[2]]
-    pixel_values, masks, classes, attrs, set_ids, inst_ids = collate_sets(batch)
+    pixel_values, masks, classes, attrs, set_ids, inst_ids, extras = collate_sets(batch)
+    assert extras is None  # synthetic sets carry no partial labels
     n = sum(len(item["views"]) for item in batch)
     assert pixel_values.shape == (n, 3, 112, 112) and len(masks) == len(classes) == len(inst_ids) == n
     assert set_ids.tolist() == [s for s, item in enumerate(batch) for _ in item["views"]]
@@ -181,6 +186,54 @@ def test_xview_checkpoint_round_trip(tmp_path):
     with torch.no_grad():
         a, b = xv(x, set_ids=torch.tensor([0, 0])), back(x, set_ids=torch.tensor([0, 0]))
     assert torch.allclose(a["match_embed"], b["match_embed"]) and torch.allclose(a["query_embed"], b["query_embed"])
+
+
+def test_sets_fill_to_their_drawn_size_with_photos_of_the_same_subject(tmp_path):
+    img_dir, jf = _mini_coco(tmp_path, subjects=["A", "A", "B", "B", None])
+    ds = CocoViewSets(img_dir, jf, imgsz=112, aug={"min_mask_mass": 0.0}, seed=0,
+                      sets={"p_single": 0.0, "sizes": {4: 1.0}, "fill": {"subject": 1.0}, "p_subject": 1.0})
+    assert ds._subject_idx == [0, 1, 2, 3]  # the photo with no subject is not one
+    for idx in range(len(ds)):
+        views = ds[idx]["views"]
+        assert len(views) == 4
+        assert all((v[4] >= 0).all() and (v[4] < DISTRACTOR_IDS).all() for v in views[:2])  # A and B: the photo
+        for slot, v in enumerate(views[2:], start=2):  # the subject's other photo: ids unknown, a block per slot
+            assert (v[4] < 0).all() and (v[4] >= UNKNOWN_IDS * slot).all() and (v[4] < UNKNOWN_IDS * (slot - 1)).all()
+    # sizes are drawn; a subject view without another photo of the subject falls back to another part of the photo
+    ds = CocoViewSets(img_dir, jf, imgsz=112, aug={"min_mask_mass": 0.0}, seed=0,
+                      sets={"p_single": 0.0, "sizes": {2: 1.0, 3: 1.0}, "fill": {"subject": 1.0}})
+    assert {len(ds[i]["views"]) for i in range(len(ds))} <= {2, 3}
+    assert all((v[4] >= 0).all() for v in ds[4]["views"][2:])  # no subject: no other photo of it
+    with pytest.raises(ValueError):
+        CocoViewSets(img_dir, jf, imgsz=112, sets={"sizes": {5: 1.0}})
+    with pytest.raises(ValueError, match="subject"):  # the old name says where it went
+        CocoViewSets(img_dir, jf, imgsz=112, sets={"sizes": {2: 1.0}, "fill": {"case": 1.0}})
+
+
+def test_match_loss_leaves_out_instances_of_unknown_correspondence():
+    q = torch.nn.functional.normalize(torch.randn(3, 6, 8), dim=-1)
+    two = [(torch.tensor([0, 1]), torch.tensor([0, 1])), (torch.tensor([2, 3]), torch.tensor([0, 1]))]
+    ids = [torch.tensor([5, 7]), torch.tensor([5, 7])]
+    base = match_loss({"match_embed": q[:2]}, two, ids, torch.tensor([0, 0]))
+    three = two + [(torch.tensor([0, 1]), torch.tensor([0, 1]))]
+    unknown = ids + [torch.tensor([UNKNOWN_IDS * 2, UNKNOWN_IDS * 2 + 1])]
+    assert torch.allclose(match_loss({"match_embed": q}, three, unknown, torch.tensor([0, 0, 0])), base)
+
+
+def test_harm_loss_holds_true_instances_to_their_score_alone():
+    alone = torch.zeros(3, 4, 3)
+    alone[:, 0, 1] = 3.0  # query 0 of every photo: confident in class 1, its target's class
+    lower, higher = alone.clone(), alone.clone()
+    lower[:, 0, 1], higher[:, 0, 1] = 1.0, 5.0
+    indices = [(torch.tensor([0]), torch.tensor([0]))] * 3
+    labels = [torch.tensor([1])] * 3
+    sets = torch.tensor([0, 0, 1])  # photos 0 and 1 together, photo 2 alone
+    hurt = harm_loss({"class_queries_logits": lower}, {"class_queries_logits": alone}, indices, labels, sets)
+    p_alone, p = alone[0, 0].softmax(-1)[1], lower[0, 0].softmax(-1)[1]
+    assert torch.isclose(hurt, p_alone - p)  # the photo alone (photo 2) takes no part
+    assert harm_loss({"class_queries_logits": higher}, {"class_queries_logits": alone}, indices, labels, sets) == 0
+    assert harm_loss({"class_queries_logits": lower}, {"class_queries_logits": alone}, indices, labels,
+                     torch.tensor([0, 1, 2])) == 0
 
 
 def test_stage_a_post_training_runs_and_leaves_the_checkpoint_untouched(tmp_path):
@@ -204,6 +257,31 @@ def test_stage_a_post_training_runs_and_leaves_the_checkpoint_untouched(tmp_path
     before, after = start.state_dict(), post.state_dict()
     assert all(torch.equal(before[k], after[k]) for k in before)  # stage A: a photo alone is predicted as before
     assert any(k.startswith("eomt.xview.") for k in after) and any(k.startswith("match_head.") for k in after)
+
+
+def test_stage_a_with_same_subject_sets_and_do_no_harm_leaves_the_checkpoint_untouched(tmp_path):
+    from eomt.data import CocoInstanceSeg
+    from eomt.engine.train import train
+    from eomt.serialization import load_model, save_checkpoint, wrap_checkpoint
+
+    img_dir, jf = _mini_coco(tmp_path, subjects=[1, 1, 2, 2])
+    specs = CocoInstanceSeg(img_dir, jf, imgsz=112).aux_specs
+    torch.manual_seed(0)
+    start = build_model("s", nc=2, imgsz=112, aux_heads=specs, fpn_scales=(2.0, 1.0, 0.5))
+    init = tmp_path / "init.pt"
+    save_checkpoint(wrap_checkpoint(start.state_dict(), size="s", nc=2, imgsz=112, aux_heads=specs,
+                                    aux_head_arch=start.aux_head_arch, fpn_scales=start.fpn_scales), init)
+    res = train(train_images=str(img_dir), train_json=str(jf), val_images=str(img_dir), val_json=str(jf), size="s",
+                imgsz=112, epochs=1, batch=1, accum=1, workers=0, device="cpu", amp=False, ema=False, seed=0,
+                project=str(tmp_path / "runs"), name="xv", init_weights=str(init),
+                multiview={"match_dim": 16, "harm_w": 1.0,
+                           "sets": {"p_single": 0.0, "sizes": {3: 1.0}, "p_subject": 1.0,
+                                    "fill": {"subject": 1.0, "positive": 1.0, "elsewhere": 1.0}}})
+    post = load_model(res["best"], device="cpu")
+    before, after = start.state_dict(), post.state_dict()
+    assert all(torch.equal(before[k], after[k]) for k in before)
+    rows = (tmp_path / "runs" / "xv" / "metrics.csv").read_text().splitlines()
+    assert "train/harm_loss" in rows[0].split(",")
 
 
 def test_stage_b_continues_a_cross_view_checkpoint_with_locate_sets(tmp_path):

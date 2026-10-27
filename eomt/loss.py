@@ -13,6 +13,10 @@ A reimplementation of ``transformers.models.eomt.modeling_eomt``'s loss stack (`
   them where the prediction is least certain (:func:`uncertain_points`), which concentrates it on the boundaries.
 * ``get_num_masks`` drops the ``accelerate`` all-reduce branch — training here is single-process (no
   ``PartialState`` is initialised). Re-add a reduce if DDP is introduced.
+* **Partial labels** (:mod:`eomt.data.subjects`). ``ignore_masks`` (one map per photo, 1 = leave out) spare the
+  unmatched queries whose mask lies mostly inside an ignore region the "no object" class loss, and ``neg_weight`` (one
+  value per photo) scales that loss for every unmatched query of the photo: 0 for a photo whose annotations list only
+  some of its instances, so nothing unannotated is taught as background. Matched queries are untouched.
 
 The matcher is exposed as ``EoMTLoss.matcher`` with the exact
 ``(masks_queries_logits, class_queries_logits, mask_labels, class_labels)`` -> list-of-(src, tgt) signature that
@@ -192,28 +196,60 @@ class EoMTLoss(nn.Module):
         # ranks masks by quality; above 0.5, so a matched query stays classified as its GT class (the attribute gate).
         self.iou_aware_cls = bool(getattr(config, "iou_aware_cls", False))
 
-    def loss_labels(self, class_queries_logits, class_labels, indices, quality: Tensor | None = None) -> dict[str, Tensor]:
+    def loss_labels(self, class_queries_logits, class_labels, indices, quality: Tensor | None = None,
+                    negatives: Tensor | None = None) -> dict[str, Tensor]:
         """Class CE. ``quality`` (IoU of each matched query, in permutation order) softens the matched targets to
         ``(1 + IoU) / 2`` for the GT class and the rest for "no object"; every query keeps its weight (1 matched,
-        ``no_object_weight`` unmatched), so hard targets give exactly the weighted CE."""
+        ``no_object_weight`` unmatched), so hard targets give exactly the weighted CE. ``negatives`` ``(B, Q)`` scales
+        the "no object" term of each unmatched query (:meth:`negative_weights`); the normalisation stays that of the
+        full loss, so a left-out query only removes its term."""
         pred_logits = class_queries_logits
         batch_size, num_queries, _ = pred_logits.shape
-        criterion = nn.CrossEntropyLoss(weight=self.empty_weight)
         idx = self._get_predictions_permutation_indices(indices)
         target_classes_o = torch.cat([target[j] for target, (_, j) in zip(class_labels, indices)])
         target_classes = torch.full(
             (batch_size, num_queries), fill_value=self.num_labels, dtype=torch.int64, device=pred_logits.device
         )
         target_classes[idx] = target_classes_o
-        if quality is None:
+        if quality is None and negatives is None:
+            criterion = nn.CrossEntropyLoss(weight=self.empty_weight)
             return {"loss_cross_entropy": criterion(pred_logits.transpose(1, 2), target_classes)}
-        q = 0.5 + 0.5 * quality.to(device=pred_logits.device, dtype=torch.float32)
         target = F.one_hot(target_classes, self.num_labels + 1).float()
-        target[idx] = target[idx] * q[:, None]
-        target[idx[0], idx[1], -1] = 1 - q
+        if quality is not None:
+            q = 0.5 + 0.5 * quality.to(device=pred_logits.device, dtype=torch.float32)
+            target[idx] = target[idx] * q[:, None]
+            target[idx[0], idx[1], -1] = 1 - q
         weight = self.empty_weight[target_classes]
+        kept = weight
+        if negatives is not None:
+            unmatched = torch.ones_like(weight, dtype=torch.bool)
+            unmatched[idx] = False
+            kept = torch.where(unmatched, weight * negatives.to(weight), weight)
         loss = -(target * F.log_softmax(pred_logits.float(), -1)).sum(-1)
-        return {"loss_cross_entropy": (weight * loss).sum() / weight.sum()}
+        return {"loss_cross_entropy": (kept * loss).sum() / weight.sum()}
+
+    @torch.no_grad()
+    def negative_weights(self, masks_queries_logits: Tensor, ignore_masks: list[Tensor | None] | None,
+                         neg_weight: Tensor | None, inside: float = 0.5) -> Tensor | None:
+        """``(B, Q)`` weights of the "no object" term of every query: ``neg_weight[b]`` for photo ``b`` (1 when
+        omitted), and 0 for a query whose predicted mask has at least ``inside`` of its (soft) mass in the photo's
+        ignore region. ``None`` when there is nothing to leave out (the plain class loss)."""
+        if ignore_masks is None and neg_weight is None:
+            return None
+        b, q = masks_queries_logits.shape[:2]
+        w = torch.ones((b, q), device=masks_queries_logits.device)
+        if neg_weight is not None:
+            w = w * neg_weight.to(w).view(-1, 1)
+        if ignore_masks is not None:
+            grid = masks_queries_logits.shape[-2:]
+            for i, ign in enumerate(ignore_masks):
+                if ign is None or not bool((ign > 0).any()):
+                    continue
+                cells = grid_targets(ign[None].to(masks_queries_logits.device), grid)[0]  # share of each cell ignored
+                prob = masks_queries_logits[i].float().sigmoid()
+                share = (prob * cells).flatten(1).sum(1) / prob.flatten(1).sum(1).clamp(min=1e-6)
+                w[i] = w[i] * (share < inside).to(w)
+        return w
 
     @torch.no_grad()
     def matched_iou(self, masks_queries_logits, mask_labels, indices) -> Tensor:
@@ -278,10 +314,14 @@ class EoMTLoss(nn.Module):
         pred_boxes: Tensor | None = None,
         box_labels: list[Tensor] | None = None,
         pred_quality: Tensor | None = None,
+        ignore_masks: list[Tensor | None] | None = None,
+        neg_weight: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """``pred_boxes`` (with the model built with ``aux_box_head``) adds the box terms to the matching and the loss.
         ``pred_quality`` ``(B, Q)`` (mask-quality logits) adds ``loss_quality``: BCE of the matched queries' predicted
-        against their measured mask IoU (Mask Scoring R-CNN); it does not enter the matching.
+        against their measured mask IoU (Mask Scoring R-CNN); it does not enter the matching. ``ignore_masks`` and
+        ``neg_weight`` leave unannotated regions and partly annotated photos out of the "no object" loss (see the
+        module docstring).
         """
         use_boxes = self.use_boxes and pred_boxes is not None
         if use_boxes and box_labels is None:
@@ -292,9 +332,10 @@ class EoMTLoss(nn.Module):
         )
         num_masks = self.get_num_masks(class_labels, device=class_labels[0].device)
         quality = self.matched_iou(masks_queries_logits, mask_labels, indices) if self.iou_aware_cls else None
+        negatives = self.negative_weights(masks_queries_logits, ignore_masks, neg_weight)
         losses: dict[str, Tensor] = {
             **self.loss_masks(masks_queries_logits, mask_labels, indices, num_masks),
-            **self.loss_labels(class_queries_logits, class_labels, indices, quality),
+            **self.loss_labels(class_queries_logits, class_labels, indices, quality, negatives),
         }
         if use_boxes:
             losses.update(self.loss_boxes(pred_boxes, box_labels, indices, num_masks))

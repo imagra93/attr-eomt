@@ -31,11 +31,13 @@ from ..aux_cls import (
     aux_accuracy_by_primary,
     aux_loss,
     gate_indices,
+    harm_loss,
     match_loss,
     match_queries,
 )
 from ..config import INFERENCE_DEFAULTS, aux_specs_from_meta, normalize_loss_weights
-from ..data import CocoDetection, CocoInstanceSeg, CocoValImages, CocoViewSets, collate_sets, collate_train
+from ..data import (CocoDetection, CocoInstanceSeg, CocoSubjectSets, CocoValImages, CocoViewSets, MixedSets, collate_sets,
+                    collate_train)
 from ..data.coco import _attr_label
 from ..data.transforms import AugConfig, build_val_transform
 from ..ema import ModelEMA, _unwrap
@@ -131,15 +133,28 @@ def build_optimizer(
 #: Multi-photo post-training (``train(multiview=...)``): the cross-view modules (``xview``, see
 #: :data:`eomt.model.DEFAULT_XVIEW`), the matching head's width (0 = none), its contrastive loss weight and
 #: temperature, the LR multiplier (of ``lr0``) of each parameter group that trains — every other parameter of the
-#: checkpoint stays frozen — and how the synthetic sets are drawn (:class:`~eomt.data.sets.SetConfig`).
+#: checkpoint stays frozen — and how the synthetic sets are drawn (:class:`~eomt.data.sets.SetConfig`). ``harm_w``
+#: weighs the do-no-harm loss (:func:`~eomt.aux_cls.harm_loss`: a true instance's class probability with its set never
+#: below the photo alone; 0 = off, and no forward of the photos alone).
+#:
+#: ``real`` adds real sets, several annotated photos of one subject (:mod:`eomt.data.subjects`): ``images`` / ``json``
+#: (default: the run's train data) and ``val_images`` (default: ``images``) / ``val_json`` (without ``json``, default:
+#: the run's val data, when it has subjects) locate them, ``p`` is their share of the training sets (the rest
+#: synthetic; 1 = real only) and ``sets`` how they are drawn (:class:`~eomt.data.subjects.SubjectSetConfig`). With
+#: real validation sets ``best.pt`` is chosen on them (``real/segm/mAP_set``: every fully annotated photo of each fixed
+#: set, unaugmented, predicted with its set).
 DEFAULT_MULTIVIEW: dict = {
     "xview": {"mode": "blocks"},
     "match_dim": 128,
     "match_w": 1.0,
     "match_tau": 0.1,
+    "harm_w": 0.0,
     "trainable": {"xview": 1.0, "match_head": 1.0},
     "sets": {},
+    "real": None,
 }
+#: Keys of ``multiview["real"]``.
+_REAL_KEYS = ("images", "json", "val_images", "val_json", "p", "sets")
 #: Parameter groups of the multi-photo post-training -> name prefixes (the query blocks are added per model).
 _MULTIVIEW_GROUPS = {
     "xview": ("eomt.xview.", "eomt.refiner."),
@@ -191,13 +206,22 @@ def _adopt_checkpoint_aux(ds, ckpt: dict) -> None:
         s.log, s.applies_to = ck.log, ck.applies_to  # a data-only dataset leaves these to the run config
 
 
-def _sets_fields(cases, aux_specs) -> list[str]:
-    """The ``metrics.csv`` columns of :func:`~eomt.engine.validate.evaluate_sets`."""
+def _sets_fields(cases, aux_specs, prefix: str = "sets") -> list[str]:
+    """The ``metrics.csv`` columns of :func:`~eomt.engine.validate.evaluate_sets` (``prefix`` "real" for real sets)."""
     keys = [f"segm/{k}_{m}" for k in ("mAP", "mAP50", "mAP_small", "AR100") for m in ("alone", "set")]
     keys += [f"{c}/mAP_{m}" for c in cases for m in ("alone", "set")]
     keys += [f"{_aux_metric(s)}/{s.name}_{m}" for s in aux_specs for m in ("alone", "set")]
     keys += [f"{k}/{n}" for k in ("match", "reid") for n in ("f1", "precision", "recall", "thres")]
-    return [f"val/sets/{k}" for k in keys]
+    return [f"val/{prefix}/{k}" for k in keys]
+
+
+def _same_categories(a, b, what: str) -> None:
+    """Raise unless datasets ``a`` and ``b`` name the same primary classes in the same order (their COCO category ids
+    map to the same contiguous classes)."""
+    na = a.names if isinstance(a.names, dict) else dict(enumerate(a.names))
+    nb = b.names if isinstance(b.names, dict) else dict(enumerate(b.names))
+    if na != nb or a.cat2contig != b.cat2contig:
+        raise ValueError(f"{what}: the categories differ from the train data's ({nb} vs {na})")
 
 
 def _poly_two_stage_factors(opt_step, total_steps, warmup_steps, power):
@@ -719,7 +743,9 @@ def train(
     before; stage B adds ``query_blocks`` at a low multiplier). The checkpoint's architecture, loss weights,
     attribute-head definitions and ``inference`` settings are kept, masked attention and the high-resolution phase
     stay off, and ``best.pt`` is chosen on the hard photos of fixed validation sets predicted together with their set
-    (``sets/segm/mAP_set``, see :func:`~eomt.engine.validate.evaluate_sets`).
+    (``sets/segm/mAP_set``, see :func:`~eomt.engine.validate.evaluate_sets`). ``multiview["real"]`` adds real sets of
+    several annotated photos of one subject, with partial labels (:mod:`eomt.data.subjects`); with real validation
+    sets ``best.pt`` is chosen on those (``real/segm/mAP_set``).
     """
     if len(warmup_steps) != 2:
         raise ValueError("warmup_steps must be (head_steps, vit_steps)")
@@ -913,6 +939,7 @@ def train(
     Dataset = CocoDetection if is_detect else CocoInstanceSeg
     if keep_empty and is_detect:
         raise ValueError("keep_empty=True is only supported for family='instance'.")
+    real_ds = real_cfg = None
     if mv is not None:  # sets of photos made from single photos, with the checkpoint's attribute heads only
         ck_heads = [h["name"] for h in src_ckpt.get("aux_heads") or []]
         # how each head learns (crop, ...): the run config's `attributes` where it sets it, else the data's
@@ -920,6 +947,17 @@ def train(
                                 attributes={n: attributes.get(n) for n in ck_heads} if attributes else ck_heads)
         _adopt_checkpoint_aux(train_ds, src_ckpt)
         print(f"[data] sets of up to {train_ds.sets.max_views} photos from single photos: {train_ds.sets}")
+        if mv.get("real"):
+            real_cfg = dict(mv["real"])
+            unknown = set(real_cfg) - set(_REAL_KEYS)
+            if unknown:
+                raise ValueError(f"multiview real keys {sorted(unknown)}: choose from {_REAL_KEYS}")
+            real_ds = CocoSubjectSets(real_cfg.get("images") or train_images, real_cfg.get("json") or train_json,
+                                      imgsz=imgsz, aug=aug_cfg, sets=real_cfg.get("sets"),
+                                      shared_aux=(train_ds.aux_specs, train_ds._attr_id_maps))
+            _same_categories(train_ds, real_ds, "multiview real")
+            print(f"[data] real sets: {len(real_ds)} photos of {real_ds.num_subjects} subjects, {real_ds.sets}; "
+                  f"{100 * float(real_cfg.get('p', 0.5)):.0f} % of the sets")
     else:
         train_ds = Dataset(
             train_images,
@@ -976,7 +1014,10 @@ def train(
         ) if aux_specs else None
         return vds, vseg
 
-    sampler, train_loader = make_loader(train_ds, batch)
+    loader_ds = train_ds
+    if mv is not None and real_ds is not None:  # real and synthetic sets in one epoch
+        loader_ds = MixedSets(real_ds, train_ds, float(real_cfg.get("p", 0.5)))
+    sampler, train_loader = make_loader(loader_ds, batch)
     val_size = val_imgsz or imgsz
     val_ds, val_seg_ds = make_val(val_size)
     val_sets_ds = None
@@ -985,6 +1026,23 @@ def train(
                                    sets={**mv["sets"], "p_single": 0.0}, seed=0,
                                    shared_aux=(aux_specs, train_ds._attr_id_maps))
         print(f"[data] val sets: {len(val_sets_ds)} fixed sets (one per val image)")
+    real_val_ds = None
+    if mv is not None and real_ds is not None:
+        explicit = bool(real_cfg.get("val_json"))
+        rv_json = real_cfg["val_json"] if explicit else val_json if real_cfg.get("json") is None else None
+        rv_images = real_cfg.get("val_images") or (real_cfg.get("images") if explicit else None) or val_images
+        if rv_json:
+            try:  # no augmentation: each photo only fitted to the input
+                real_val_ds = CocoSubjectSets(rv_images, rv_json, imgsz=val_size, aug=aug_cfg, seed=0, augment=False,
+                                              sets={**(real_cfg.get("sets") or {}), "p_single": 0.0},
+                                              shared_aux=(train_ds.aux_specs, train_ds._attr_id_maps))
+            except ValueError as e:
+                if explicit:  # a val_json that was asked for must load
+                    raise
+                print(f"[data] no real val sets ({e})")  # the run's val data has no subjects: no real validation
+        if real_val_ds is not None:
+            _same_categories(train_ds, real_val_ds, "multiview real val")
+            print(f"[data] real val sets: {len(real_val_ds)} fixed sets of {real_val_ds.num_subjects} subjects")
 
     # Optional per-class CE weights for imbalanced attributes (computed once).
     aux_class_weight = _compute_aux_class_weights(train_ds) if (aux_specs and aux_class_weights) else None
@@ -1153,11 +1211,13 @@ def train(
     geom_key = "box_labels" if is_detect else "mask_labels"
 
     def micro_step(m, pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe=False, set_ids=None,
-                   inst_ids=None):
+                   inst_ids=None, extras=None):
         """One micro-batch's loss: the segmentation loss computed in the model plus the attribute heads' loss (and,
         for sets of photos, the matching head's, kept in ``out["match_loss"]``). With ``probe``, also each head's pull
-        on the shared queries (see :func:`_aux_grad_ratios`)."""
-        out = m(pixel_values, class_labels=class_labels, set_ids=set_ids, **{geom_key: geom_labels})
+        on the shared queries (see :func:`_aux_grad_ratios`). ``extras`` (real sets) carries the photos' ignore maps
+        and "no object" weights (:mod:`eomt.data.subjects`)."""
+        partial = {} if extras is None else {"ignore_masks": extras["ignore"], "neg_weight": extras["neg_weight"]}
+        out = m(pixel_values, class_labels=class_labels, set_ids=set_ids, **{geom_key: geom_labels}, **partial)
         loss, aux_indices, aux_gated, grads = out["loss"], None, None, None
         if aux_specs or "match_embed" in out:
             # Match once per step, then gate to well-localized (IoU) and
@@ -1171,6 +1231,13 @@ def train(
         if "match_embed" in out and set_ids is not None:
             out["match_loss"] = match_loss(out, aux_gated, inst_ids, set_ids, mv["match_tau"])
             loss = loss + mv["match_w"] * out["match_loss"]
+        if set_ids is not None and mv["harm_w"] and len(set_ids.unique()) < len(set_ids):
+            if aux_indices is None:
+                aux_indices = match_queries(m, out, geom_labels, class_labels)
+            with torch.no_grad():  # every photo in its own set: the frozen checkpoint's own prediction
+                alone = m(pixel_values, set_ids=torch.arange(len(set_ids)))
+            out["harm_loss"] = harm_loss(out, alone, aux_indices, class_labels, set_ids)
+            loss = loss + mv["harm_w"] * out["harm_loss"]
         if aux_specs:
             a_loss, per_head = aux_loss(
                 m, out, geom_labels, class_labels, aux_labels,
@@ -1379,6 +1446,10 @@ def train(
         csv_fields.append("imgsz")
     if mv is not None:
         csv_fields.insert(2, "train/match_loss")
+        if mv["harm_w"]:
+            csv_fields.insert(3, "train/harm_loss")
+        if real_val_ds is not None:
+            csv_fields += _sets_fields([], aux_specs, prefix="real")
         if val_sets_ds is not None:
             csv_fields += _sets_fields(list(val_sets_ds.sets.cases) + (["locate"] if val_sets_ds.sets.p_focus > 0 else []),
                                        aux_specs)
@@ -1419,7 +1490,7 @@ def train(
         step_model.train()
         if sampler is not None:
             sampler.set_epoch(epoch)
-        running = running_match = 0.0
+        running = running_match = running_harm = 0.0
         # matched-query accuracy per aux head, accumulated over the epoch
         aux_hits = {s.name: 0 for s in aux_specs}
         aux_tot = {s.name: 0 for s in aux_specs}
@@ -1431,7 +1502,7 @@ def train(
         for step, batch_data in enumerate(pbar):
             # sets of photos also carry the set of each photo and the instance ids of its targets
             pixel_values, geom_labels, class_labels, aux_labels = batch_data[:4]
-            set_ids, inst_ids = batch_data[4:] if mv is not None else (None, None)
+            set_ids, inst_ids, extras = batch_data[4:7] if mv is not None else (None, None, None)
             it = phase_it0 + (epoch - phase_epoch0) * iters_per_epoch + step
             head_factor, vit_factor = lr_factors(it)
             for g in optimizer.param_groups:
@@ -1445,6 +1516,9 @@ def train(
             geom_labels = [g.to(dev) for g in geom_labels]
             class_labels = [c.to(dev) for c in class_labels]
             aux_labels = {k: [t.to(dev) for t in v] for k, v in aux_labels.items()}
+            if extras is not None:
+                extras = {"ignore": [None if t is None else t.to(dev) for t in extras["ignore"]],
+                          "neg_weight": extras["neg_weight"].to(dev)}
 
             # Gradient accumulation: zero grads at the start of each window, divide
             # the loss by ``accum_steps`` (so summed micro-batch grads average), and
@@ -1459,13 +1533,16 @@ def train(
                 with torch.amp.autocast("cuda", enabled=amp_on, dtype=autocast_dtype):
                     probe = bool(aux_specs) and main and it % AUX_GRAD_EVERY == 0
                     loss, out, aux_indices, aux_gated, grads = step_model(
-                        pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe, set_ids, inst_ids
+                        pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe, set_ids, inst_ids,
+                        extras,
                     )
                 for n, r in (grads or {}).items():
                     aux_grad[n].append(r)
                 loss_item = float(loss.detach())  # unscaled, for logging
                 if "match_loss" in out:
                     running_match += float(out["match_loss"].detach())
+                if "harm_loss" in out:
+                    running_harm += float(out["harm_loss"].detach())
                 scaler.scale(loss / accum_steps).backward()
             if boundary:
                 scaler.unscale_(optimizer)
@@ -1507,6 +1584,8 @@ def train(
                 )
             if mv is not None:
                 postfix["match"] = f"{running_match / (step + 1):.3f}"
+                if mv["harm_w"]:
+                    postfix["harm"] = f"{running_harm / (step + 1):.4f}"
             pbar.set_postfix(postfix)
             if tb is not None and step % 20 == 0:
                 scalars = {"train/loss": loss_item, "lr/head": head_group["lr"]}
@@ -1515,13 +1594,15 @@ def train(
                 tb.log(scalars, it)
 
         # Several GPUs: the epoch's loss and accuracy counts summed over all of them, on the main process.
-        totals = sum_over_processes((running, running_match, aux_hits, aux_tot, aux_pc))
+        totals = sum_over_processes((running, running_match, running_harm, aux_hits, aux_tot, aux_pc))
         if main:
-            running, running_match, aux_hits, aux_tot, aux_pc = totals
+            running, running_match, running_harm, aux_hits, aux_tot, aux_pc = totals
             epoch_loss = running / (iters_per_epoch * world)
             epoch_match = running_match / (iters_per_epoch * world)
+            epoch_harm = running_harm / (iters_per_epoch * world)
             print(f"[epoch {epoch}] mean loss {epoch_loss:.4f}"
-                  + (f" (matching head {epoch_match:.4f})" if mv is not None else ""))
+                  + (f" (matching head {epoch_match:.4f})" if mv is not None else "")
+                  + (f" (do-no-harm {epoch_harm:.4f})" if mv is not None and mv["harm_w"] else ""))
             aux_acc = {n: _safe_acc(aux_hits[n], aux_tot[n]) for n in aux_hits}
             aux_pull = {n: sum(v) / len(v) if v else float("nan") for n, v in aux_grad.items()}
             if aux_specs:
@@ -1593,6 +1674,17 @@ def train(
                         f"[epoch {epoch}] val aux: "
                         + "  ".join(f"{n} {metric_of[n][4:]}={v:.3f}" for n, v in val_aux.items())
                     )
+                if real_val_ds is not None:  # every fully annotated photo of each fixed real set, alone and with it
+                    metrics.update(evaluate_sets(eval_model, real_val_ds, device=dev, num_workers=workers, amp=amp,
+                                                 verbose=main, all_views=True, prefix="real"))
+                    if main:
+                        print(
+                            f"[epoch {epoch}] val real sets: segm mAP {metrics['real/segm/mAP_alone']:.4f} alone -> "
+                            f"{metrics['real/segm/mAP_set']:.4f} with their set; links F1 "
+                            f"{metrics['real/match/f1']:.3f} (re-ID of the photos alone {metrics['real/reid/f1']:.3f})"
+                        )
+                        if math.isfinite(metrics["real/match/thres"]):  # the links' threshold, calibrated on real sets
+                            match_thres = metrics["real/match/thres"]
                 if val_sets_ds is not None:  # the hard photo of each fixed set, alone and with its set
                     metrics.update(evaluate_sets(eval_model, val_sets_ds, device=dev, num_workers=workers, amp=amp,
                                                  verbose=main))
@@ -1603,7 +1695,7 @@ def train(
                             f"{metrics['sets/match/f1']:.3f} at {metrics['sets/match/thres']:.2f} "
                             f"(re-ID of the photos alone {metrics['sets/reid/f1']:.3f})"
                         )
-                        if math.isfinite(metrics["sets/match/thres"]):
+                        if math.isfinite(metrics["sets/match/thres"]) and real_val_ds is None:
                             match_thres = metrics["sets/match/thres"]
                 if tb is not None:
                     tb.log({f"val/{k}": v for k, v in metrics.items()}, epoch)
@@ -1619,7 +1711,8 @@ def train(
             # best.pt holds the eval weights (EMA when enabled) for inference.
             # The best metric is updated BEFORE last.pt is written, so a resumed run starts from the right value
             # (it used to lag one epoch and could overwrite a better best.pt).
-            best_key = "sets/segm/mAP_set" if val_sets_ds is not None else "bbox/mAP" if is_detect else "segm/mAP"
+            best_key = ("real/segm/mAP_set" if real_val_ds is not None else "sets/segm/mAP_set" if val_sets_ds is not None
+                        else "bbox/mAP" if is_detect else "segm/mAP")
             cur = metrics.get(best_key, None)
             improved = deployable and cur is not None and cur > best_metric
             # with a high-resolution phase, each phase also keeps its own best (best_<imgsz>.pt)
@@ -1638,7 +1731,8 @@ def train(
                 print(f"[epoch {epoch}] new best {best_key} at {cur_imgsz} px {phase_best:.4f} -> best_{cur_imgsz}.pt")
 
             # --- per-epoch metrics row (missing values -> nan) ---
-            row = {"epoch": epoch, "train/loss": epoch_loss, "train/match_loss": epoch_match, "imgsz": cur_imgsz}
+            row = {"epoch": epoch, "train/loss": epoch_loss, "train/match_loss": epoch_match,
+                   "train/harm_loss": epoch_harm, "imgsz": cur_imgsz}
             row.update({f"train/{metric_of[n]}/{n}": aux_acc[n] for n in aux_acc})
             row.update({f"train/aux_grad/{n}": g for n, g in aux_pull.items()})
             row.update({f"val/{k}": v for k, v in metrics.items()})

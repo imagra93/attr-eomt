@@ -443,6 +443,70 @@ them one by one); `"partition"` groups similar photos (mean patch token of a sma
 other photos of the subject, not a particular one. `scripts/predict.py --subject [MODE]` and
 `predict(subject=MODE)` take the mode (`--subject` alone is `"order"`).
 
+### Real multi-photo datasets
+
+Synthetic sets need no multi-photo annotations, but they show no real viewpoint change. With
+annotated photos of the same subjects, the post-training also draws **real sets**: several
+photos of one subject, each predicted with the others, the instances linked across them. The
+data is a COCO instance-segmentation file like any other, with four optional additions
+([`eomt/data/subjects.py`](eomt/data/subjects.py)):
+
+```jsonc
+"images": [
+  {"id": 1, "file_name": "subject_42/front.jpg", "subject_id": "subject_42"},     // a photo of subject_42
+  {"id": 2, "file_name": "subject_42/closeup.jpg", "subject_id": "subject_42", "supervision": "positives"},
+  {"id": 3, "file_name": "subject_42/side.jpg", "subject_id": "subject_42", "supervision": "none"}
+],
+"annotations": [
+  {"id": 10, "image_id": 1, "category_id": 3, "instance_id": 7, ...},   // the same physical instance ...
+  {"id": 11, "image_id": 2, "category_id": 3, "instance_id": 7, ...},   // ... in another photo of subject_42
+  {"id": 12, "image_id": 1, "category_id": 5, ...},                     // not linked to the other photos
+  {"id": 13, "image_id": 3, "category_id": 3, "iscrowd": 1, ...}        // a region to leave out of the loss
+]
+```
+
+| key | meaning |
+|-----|---------|
+| image `subject_id` | photos with the same id show the same subject; photos without one take no part in the real sets |
+| image `supervision` | `full` (default): every instance is annotated, the rest is background. `positives`: only some are; nothing unannotated is taught as background (the photo's unmatched queries take no "no object" loss). `none`: input only for the other photos of its set |
+| annotation `instance_id` | the same physical instance in every photo of the subject that shows it (a number or string); the matching head learns those links. Absent: linked to nothing |
+| annotation `iscrowd: 1` | unsure pixels: a query whose mask lies mostly inside takes no "no object" loss, and validation drops detections there (single-photo training already skips these annotations) |
+
+Partly annotated photos are what pseudo-labelling gives: labels that list some instances per
+photo, or say which photos show an instance but not where. The loss then trains on what is
+known and leaves the rest out, instead of teaching it as background.
+
+Real sets join the post-training through the `real` section of the multiview config. A share
+`p` of the sets are real, the rest synthetic sets from the run's own train data:
+
+```yaml
+# in the multiview config (a copy of configs/xview.yaml), next to its other keys
+real:
+  json: datasets/my_subjects/annotations/train.json     # default: the run's train data
+  images: datasets/my_subjects/images
+  val_json: datasets/my_subjects/annotations/val.json   # real validation sets; best.pt is chosen on them
+  val_images: datasets/my_subjects/images               # default: images
+  p: 0.5                    # share of the training sets that are real (1 = real only)
+  sets:                     # eomt.data.subjects.SubjectSetConfig
+    max_views: 4
+    sizes: {2: 0.2, 3: 0.2, 4: 0.6}   # set sizes (capped by the subject's photos)
+    p_single: 0.0           # sets of the anchor photo alone
+    p_shared: 0.5           # companions sharing a linked instance with the anchor first
+```
+
+Every photo of a subject that trains is the first photo of one set per epoch, with companions
+from the same subject. Each photo is augmented on its own, but the horizontal flip is drawn
+once per set, so left and right never mix within a subject. With real validation sets
+(`val_json`; without `json`, the run's val data when its images have a `subject_id`),
+`best.pt` is chosen on `val/real/segm/mAP_set`: every fully annotated photo of each fixed set,
+unaugmented (fitted to the input) and predicted with its set (`_alone` next to it), and the
+links are scored against the annotated instance ids (`val/real/match/*`; a detection that is no
+annotated instance in a photo not fully annotated, or lies in a crowd region, has no known link
+and is left out). The synthetic sets can also take other photos of the same
+subject as companions (`sets.fill: {subject: 1.0}`, `p_subject`); their instances are then not
+linked. `eomt.data.subjects_from_file_names` sets `subject_id` from file names that start with
+the subject (`<subject>_...`).
+
 ---
 
 ## Install

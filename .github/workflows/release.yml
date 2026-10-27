@@ -8,6 +8,7 @@ name: release
 # To ship a new version:
 #   1. In your PR, bump `version = "X.Y.Z"` in pyproject.toml.
 #   2. Merge to main. That's it — this workflow tags vX.Y.Z and publishes.
+# To try a branch first, publish a pre-release of it with prerelease.yml (version X.Y.ZrcN).
 # Pushes that don't change the version are no-ops (the Release already exists).
 #
 # Publishing is delegated to publish.yml via `workflow_call` (not the release event),
@@ -65,10 +66,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
+          # a pre-release version (aN / bN / rcN / .devN) merged to main is released as a GitHub pre-release
+          PRE=$(python3 -c "import re; print('--prerelease' if re.search(r'(a|b|rc|\.dev)[0-9]+$', '$VERSION') else '')")
           gh release create "v$VERSION" \
             --title "v$VERSION" \
             --generate-notes \
-            --target "$GITHUB_SHA"
+            --target "$GITHUB_SHA" $PRE
 
   publish:
     needs: [check, release]
