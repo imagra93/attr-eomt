@@ -1,0 +1,85 @@
+name: prerelease
+
+# Publish a pre-release of any branch to PyPI, to try a change in another project before the final release.
+#
+#   1. On the branch, set a PEP 440 pre-release version in pyproject.toml: `version = "2.1.0rc1"` (or 2.1.0a1,
+#      2.1.0b1, 2.1.0.dev1) and commit it.
+#   2. Tag that commit with the version and push the tag (the branch too, if you like):
+#        git tag v2.1.0rc1 && git push origin v2.1.0rc1
+#      Once this file is on main, GitHub -> Actions -> prerelease -> "Run workflow" on a branch works as well
+#      (GitHub lists manual workflows from the default branch only; a pushed tag runs the workflow of its own commit).
+#   3. The tests run, a GitHub pre-release vX.Y.ZrcN is cut on that commit and the package goes to PyPI.
+#
+# pip and uv skip pre-releases unless asked, so nothing that depends on `attr-eomt>=...` picks it up by accident:
+#   pip install attr-eomt==2.1.0rc1          uv add "attr-eomt==2.1.0rc1"      (or --prerelease allow)
+# A version already released is refused (bump rcN for the next try); the final release stays release.yml's job
+# (merge to main with the final version).
+#
+# NOTE: the PyPI trusted publisher (workflow publish.yml, environment pypi) must accept runs from branches other
+# than main: if the `pypi` environment limits its deployment branches, allow these branches (or tags) there.
+
+on:
+  push:
+    tags: ["v*a[0-9]*", "v*b[0-9]*", "v*rc[0-9]*", "v*.dev[0-9]*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read the version and check it is a new pre-release
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(grep -m1 -E '^version *= *"' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if ! python3 -c "import re, sys; sys.exit(0 if re.search(r'(a|b|rc|\.dev)[0-9]+$', '$VERSION') else 1)"; then
+            echo "::error::$VERSION is not a pre-release version (X.Y.ZaN / bN / rcN / .devN); final releases go through release.yml"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject.toml's version $VERSION"
+            exit 1
+          fi
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::v$VERSION is already released; bump the pre-release number"
+            exit 1
+          fi
+          echo "::notice::pre-releasing v$VERSION from ${GITHUB_REF_NAME}"
+
+  test:
+    needs: check
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write    # create the tag + GitHub pre-release
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create the GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # on a tag push the tag exists already and the release is cut on it; on a manual run the tag is created
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --prerelease \
+            --generate-notes \
+            --target "$GITHUB_SHA"
+
+  publish:
+    needs: [check, release]
+    permissions:
+      id-token: write    # PyPI Trusted Publishing (OIDC)
+      contents: read
+    uses: ./.github/workflows/publish.yml

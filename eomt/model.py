@@ -632,10 +632,12 @@ class EoMTEncoder(nn.Module):
     # --- loss plumbing (mirrors HF get_loss_dict / get_loss) ----------------
 
     def get_loss_dict(self, masks_queries_logits, class_queries_logits, mask_labels, class_labels,
-                      pred_boxes=None, box_labels=None, pred_quality=None):
+                      pred_boxes=None, box_labels=None, pred_quality=None, ignore_masks=None, neg_weight=None):
         extra = {"pred_boxes": pred_boxes, "box_labels": box_labels} if pred_boxes is not None else {}
         if pred_quality is not None:
             extra["pred_quality"] = pred_quality
+        if self.family != "detect" and (ignore_masks is not None or neg_weight is not None):
+            extra.update(ignore_masks=ignore_masks, neg_weight=neg_weight)  # partial labels (eomt.data.subjects)
         loss_dict = self.criterion(
             masks_queries_logits=masks_queries_logits,
             class_queries_logits=class_queries_logits,
@@ -726,9 +728,13 @@ class EoMTEncoder(nn.Module):
         class_labels: list[torch.Tensor] | None = None,
         box_labels: list[torch.Tensor] | None = None,
         set_ids: torch.Tensor | None = None,
+        ignore_masks: list[torch.Tensor | None] | None = None,
+        neg_weight: torch.Tensor | None = None,
     ) -> EoMTOutput:
         """``set_ids`` ``[B]`` groups the photos into sets of the same subject predicted together (equal ids = one set)
-        for the cross-view modules; ``None``, or a photo alone in its set, is the single-photo model."""
+        for the cross-view modules; ``None``, or a photo alone in its set, is the single-photo model. ``ignore_masks``
+        and ``neg_weight`` (training only) leave regions and partly annotated photos out of the "no object" loss
+        (:class:`~eomt.loss.EoMTLoss`)."""
         cross_view = self.xview is not None or self.refiner is not None
         groups = _set_groups(set_ids, pixel_values.device) if cross_view else []
         # Per-layer geometry (mask logits or box preds) for deep supervision.
@@ -842,7 +848,8 @@ class EoMTEncoder(nn.Module):
             for i, (g, c) in enumerate(zip(geom_per_layer, class_per_layer)):
                 pb = box_per_layer[i] if box_per_layer else None
                 pq = quality_logits if i == last else None
-                loss = loss + self.get_loss(self.get_loss_dict(g, c, geom_labels, class_labels, pb, gt_boxes, pq))
+                loss = loss + self.get_loss(self.get_loss_dict(g, c, geom_labels, class_labels, pb, gt_boxes, pq,
+                                                               ignore_masks, neg_weight))
 
         return EoMTOutput(
             loss=loss,
@@ -1077,6 +1084,8 @@ class EoMTModel(nn.Module):
         class_labels: list[torch.Tensor] | None = None,
         box_labels: list[torch.Tensor] | None = None,
         set_ids: torch.Tensor | None = None,
+        ignore_masks: list[torch.Tensor | None] | None = None,
+        neg_weight: torch.Tensor | None = None,
     ):
         out = self.eomt(
             pixel_values=pixel_values,
@@ -1084,6 +1093,8 @@ class EoMTModel(nn.Module):
             class_labels=class_labels,
             box_labels=box_labels,
             set_ids=set_ids,
+            ignore_masks=ignore_masks,
+            neg_weight=neg_weight,
         )
         geom_labels = box_labels if self.family == "detect" else mask_labels
         training = geom_labels is not None and class_labels is not None

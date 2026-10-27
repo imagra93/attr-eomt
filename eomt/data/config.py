@@ -18,13 +18,13 @@ optional::
     attributes:                    # the per-instance heads to train (an attribute of the data left out is not) and how
       laterality: {flip_aware: {left: right}}       # each one learns (eomt.data.coco.BEHAVIOR_KEYS); without the
       area: {log: true, range: [0, 50000], crop: scale}   # section, every attribute as the data declares it
-      typology:
-    aug:                           # AugConfig fields (``train_aug``, the older name, is the same)
+      pose:
+    aug:                          # AugConfig fields (``train_aug``, the older name, is the same)
       min_scale: 0.6
       instance_crop_prob: 0.8
     train:                         # train() keywords: epochs, imgsz, lr0, init_weights, project, name, hires_epochs...
       epochs: 20
-      init_weights: ../runs/parts/weights/best.pt
+      init_weights: ../runs/base/weights/best.pt
     inference:                     # saved in every checkpoint; the defaults of predict() / track() with that model
       conf_thres: 0.25
 

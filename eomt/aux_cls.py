@@ -195,6 +195,8 @@ def match_loss(out: dict, indices, inst_ids: list[torch.Tensor], set_ids: torch.
     every other matched query of the set (in any of its photos) is a negative. Each query with a positive is an anchor:
     ``-log`` of the softmax mass (temperature ``tau``) its positives take among all its candidates (supervised InfoNCE).
     ``indices`` is the query->target matching (gated as for the attribute heads); returns 0 when nothing pairs up.
+    Targets with a negative id (another photo of the subject, which of its instances are which unknown,
+    :data:`eomt.data.sets.UNKNOWN_IDS`) are neither anchors nor candidates.
     """
     emb = out["match_embed"]
     feats, ids, photo, sets = [], [], [], []
@@ -207,6 +209,10 @@ def match_loss(out: dict, indices, inst_ids: list[torch.Tensor], set_ids: torch.
     if not feats:
         return emb.sum() * 0.0
     f, ids, photo, sets = torch.cat(feats), torch.cat(ids), torch.cat(photo), torch.cat(sets)
+    known = ids >= 0
+    if not known.any():
+        return emb.sum() * 0.0
+    f, ids, photo, sets = f[known], ids[known], photo[known], sets[known]
     sim = (f @ f.T) / tau
     cand = (sets[:, None] == sets[None]) & ~torch.eye(len(f), dtype=torch.bool, device=f.device)
     pos = cand & (ids[:, None] == ids[None]) & (photo[:, None] != photo[None])
@@ -216,6 +222,29 @@ def match_loss(out: dict, indices, inst_ids: list[torch.Tensor], set_ids: torch.
     sim, cand, pos = sim[anchors], cand[anchors], pos[anchors]
     neg_inf = torch.finfo(sim.dtype).min
     return (sim.masked_fill(~cand, neg_inf).logsumexp(1) - sim.masked_fill(~pos, neg_inf).logsumexp(1)).mean()
+
+
+def harm_loss(out: dict, alone: dict, indices, class_labels: list[torch.Tensor], set_ids: torch.Tensor):
+    """Do-no-harm loss of the cross-view post-training: how much predicting a photo with the other photos of its set
+    lowers the probability of a true instance's class below predicting it alone, hinged at 0 (the others may raise it,
+    never lower it). ``alone`` is the forward of the same photos each in its own set (with the checkpoint frozen, its
+    own prediction); ``indices`` the query->target matching of ``out``. Mean over the matched queries of the photos in
+    sets of several; 0 when there are none.
+
+    NOTE: what is lost to a lowered true instance downstream (an FP filter can drop false detections, not bring back a
+    true one) is not what is gained by a lowered false one, so only the true instances are held to their score alone.
+    """
+    sizes = torch.bincount(set_ids.cpu())
+    drops = []
+    for b, (src, tgt) in enumerate(indices):
+        if src.numel() and sizes[int(set_ids[b])] > 1:
+            cls = class_labels[b][tgt.to(class_labels[b].device)].to(out["class_queries_logits"].device)[:, None]
+            p = out["class_queries_logits"][b, src].float().softmax(-1).gather(1, cls)[:, 0]
+            p_alone = alone["class_queries_logits"][b, src].float().softmax(-1).gather(1, cls)[:, 0]
+            drops.append((p_alone - p).clamp(min=0))
+    if not drops:
+        return out["class_queries_logits"].sum() * 0.0
+    return torch.cat(drops).mean()
 
 
 @torch.no_grad()

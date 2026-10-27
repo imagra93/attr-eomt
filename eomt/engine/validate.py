@@ -565,16 +565,31 @@ def _mask_iou(a: torch.Tensor, b: torch.Tensor) -> np.ndarray:
     return (inter / (a.sum(1)[:, None] + b.sum(1)[None] - inter).clamp_min(1)).cpu().numpy()
 
 
-def _set_links(results, embeds, gt_masks, gt_ids, conf: float, gate: float) -> list[tuple[float, bool]]:
+def _in_ignore(masks: torch.Tensor, ignore: torch.Tensor | None) -> torch.Tensor:
+    """Per detection (``masks`` ``(N, H, W)`` bool), whether at least half of it lies in the ``ignore`` map
+    (1 = left out), on the CPU."""
+    if ignore is None or not len(masks) or not bool(ignore.any()):
+        return torch.zeros(len(masks), dtype=torch.bool)
+    ign = ignore.to(masks.device) > 0.5
+    inside = (masks & ign).flatten(1).sum(1).float() / masks.flatten(1).sum(1).clamp(min=1)
+    return (inside >= 0.5).cpu()
+
+
+def _set_links(results, embeds, gt_masks, gt_ids, conf: float, gate: float,
+               unsure: list[torch.Tensor] | None = None) -> list[tuple[float, bool]]:
     """The links a set's photos get: between every two photos, the detections (score >= ``conf``) matched by the
     Hungarian algorithm on the cosine similarity of ``embeds``, as ``(similarity, same instance)``; a detection is an
-    instance when its mask overlaps that instance's (IoU >= ``gate``, one to one)."""
+    instance when its mask overlaps that instance's (IoU >= ``gate``, one to one). ``unsure[b]`` marks the detections
+    of photo ``b`` that may be an instance nobody annotated (a photo not fully annotated, an ignore region): unless
+    they match an annotated instance, their links are left out, as are those of the instances of unknown id."""
     from scipy.optimize import linear_sum_assignment
 
     ids, feats = [], []
-    for r, e, gm, gi in zip(results, embeds, gt_masks, gt_ids):
+    for b, (r, e, gm, gi) in enumerate(zip(results, embeds, gt_masks, gt_ids)):
         sel = (r["scores"] >= conf).nonzero().flatten()
-        d_ids = np.full(len(sel), -1)
+        d_ids = np.full(len(sel), -1)  # -1: no instance; below -1: unknown
+        if unsure is not None:
+            d_ids[unsure[b][sel.cpu()].numpy()] = -2
         for d, g in _greedy_pairs(_mask_iou(r["masks"][sel.to(r["masks"].device)], gm), gate):
             d_ids[d] = int(gi[g])
         ids.append(d_ids)
@@ -585,6 +600,8 @@ def _set_links(results, embeds, gt_masks, gt_ids, conf: float, gate: float) -> l
             if len(ids[a]) and len(ids[b]):
                 sim = (feats[a] @ feats[b].T).cpu().numpy()
                 for i, j in zip(*linear_sum_assignment(-sim)):
+                    if min(ids[a][i], ids[b][j]) < -1:  # unknown whether the two are one instance
+                        continue
                     pairs.append((float(sim[i, j]), bool(ids[a][i] >= 0 and ids[a][i] == ids[b][j])))
     return pairs
 
@@ -619,9 +636,17 @@ def evaluate_sets(
     link_conf: float = 0.3,
     iou_gate: float = 0.5,
     verbose: bool = True,
+    all_views: bool = False,
+    prefix: str = "sets",
 ) -> dict[str, float]:
     """Score a cross-view model on fixed synthetic sets (:class:`~eomt.data.sets.CocoViewSets` with a ``seed``): there
     are no real multi-photo annotations, so this measures what the sets were built to teach, not real viewpoints.
+
+    With ``all_views`` (real sets, :class:`~eomt.data.subjects.CocoSubjectSets`) every photo of a set is scored, not
+    only the first, except those not fully annotated (their extras' ``neg`` below 1), and the detections lying mostly
+    in a photo's ignore region are dropped first; a detection that is no annotated instance in a photo not fully
+    annotated, or in an ignore region, takes no part in the links (whether it is an instance is unknown). The keys then
+    start with ``prefix`` (e.g. ``real/segm/mAP_set``) and there is no per-case mAP.
 
     * ``sets/segm/<metric>_{alone,set}`` and ``sets/<case>/mAP_{alone,set}``: COCO segm of each set's hard view (the
       first photo), predicted alone and together with the rest of its set, over all sets and per case; the GT is the
@@ -658,41 +683,53 @@ def evaluate_sets(
                    for b in range(len(views))] for m, o in outs.items()}
         gt_masks = [v[1].to(device) > 0.5 for v in views]
         gt_ids = [v[4] for v in views]
+        extras = item.get("extras") or [{} for _ in views]
+        # per photo, the detections that may be an instance nobody annotated: all of a photo not fully annotated,
+        # else those lying in its ignore region
+        unsure = {m: [torch.ones(r["num_detections"], dtype=torch.bool) if e.get("neg", 1.0) < 1.0
+                      else _in_ignore(r["masks"], e.get("ignore")) for r, e in zip(res[m], extras)] for m in res}
 
-        # the hard view: COCO results and attributes, alone and with its set
-        keep = gt_masks[0].flatten(1).any(1).cpu()
-        a_masks, a_cls = gt_masks[0][keep.to(device)], views[0][2][keep]
-        a_attrs = {k: t[keep] for k, t in views[0][3].items()}
-        images.append({"id": idx, "width": size, "height": size})
-        cases.setdefault(item["case"], []).append(idx)
-        for g in range(len(a_masks)):
-            rle = _encode_mask(a_masks[g].cpu().numpy())
-            anns.append({"image_id": idx, "category_id": int(a_cls[g]) + 1, "segmentation": rle,
-                         "area": float(mask_utils.area(rle)), "bbox": [float(x) for x in mask_utils.toBbox(rle)],
-                         "iscrowd": 0})
-        for m in dets:
-            r = res[m][0]
-            for i in range(r["num_detections"]):
-                dets[m].append({"image_id": idx, "category_id": int(r["classes"][i]) + 1, "score": float(r["scores"][i]),
-                                "segmentation": _encode_mask(r["masks"][i].cpu().numpy())})
-            iou = _mask_iou(r["masks"], a_masks)
-            iou[r["classes"].cpu().numpy()[:, None] != a_cls.numpy()[None]] = 0.0
-            for d, g in _greedy_pairs(iou, iou_gate):
-                for s in specs:
-                    label = a_attrs[s.name][g]
-                    if s.regression and not torch.isnan(label):
-                        hits[m][s.name] += abs(float(r["aux_values"][s.name][d]) - float(label))
-                        tot[m][s.name] += 1
-                    elif not s.regression and int(label) != -100:
-                        hits[m][s.name] += int(r["aux"][s.name]["ids"][d]) == int(label)
-                        tot[m][s.name] += 1
+        # the scored views (the hard view; with all_views every fully annotated one): COCO results and attributes,
+        # alone and with its set
+        scored = [k for k in range(len(views)) if extras[k].get("neg", 1.0) >= 1.0] if all_views else [0]
+        for k in scored:
+            image_id = idx * sets_ds.sets.max_views + k if all_views else idx
+            keep = gt_masks[k].flatten(1).any(1).cpu()
+            a_masks, a_cls = gt_masks[k][keep.to(device)], views[k][2][keep]
+            a_attrs = {n: t[keep] for n, t in views[k][3].items()}
+            images.append({"id": image_id, "width": size, "height": size})
+            if not all_views:
+                cases.setdefault(item["case"], []).append(image_id)
+            for g in range(len(a_masks)):
+                rle = _encode_mask(a_masks[g].cpu().numpy())
+                anns.append({"image_id": image_id, "category_id": int(a_cls[g]) + 1, "segmentation": rle,
+                             "area": float(mask_utils.area(rle)), "bbox": [float(x) for x in mask_utils.toBbox(rle)],
+                             "iscrowd": 0})
+            for m in dets:
+                r = res[m][k]
+                for i in (~unsure[m][k]).nonzero().flatten().tolist():  # detections in an ignore region do not count
+                    dets[m].append({"image_id": image_id, "category_id": int(r["classes"][i]) + 1,
+                                    "score": float(r["scores"][i]),
+                                    "segmentation": _encode_mask(r["masks"][i].cpu().numpy())})
+                iou = _mask_iou(r["masks"], a_masks)
+                iou[r["classes"].cpu().numpy()[:, None] != a_cls.numpy()[None]] = 0.0
+                for d, g in _greedy_pairs(iou, iou_gate):
+                    for s in specs:
+                        label = a_attrs[s.name][g]
+                        if s.regression and not torch.isnan(label):
+                            hits[m][s.name] += abs(float(r["aux_values"][s.name][d]) - float(label))
+                            tot[m][s.name] += 1
+                        elif not s.regression and int(label) != -100:
+                            hits[m][s.name] += int(r["aux"][s.name]["ids"][d]) == int(label)
+                            tot[m][s.name] += 1
 
         # cross-photo links over every photo of the set
-        shown = [set(i.tolist()) for i in gt_ids]
+        shown = [{i for i in ids.tolist() if i >= 0} for ids in gt_ids]  # linked instances only
         n_true += sum(len(shown[a] & shown[b]) for a in range(len(views)) for b in range(a + 1, len(views)))
         set_embed = outs["set"].get("match_embed", outs["set"]["query_embed"])
-        links["match"] += _set_links(res["set"], set_embed, gt_masks, gt_ids, link_conf, iou_gate)
-        links["reid"] += _set_links(res["alone"], outs["alone"]["query_embed"], gt_masks, gt_ids, link_conf, iou_gate)
+        links["match"] += _set_links(res["set"], set_embed, gt_masks, gt_ids, link_conf, iou_gate, unsure["set"])
+        links["reid"] += _set_links(res["alone"], outs["alone"]["query_embed"], gt_masks, gt_ids, link_conf, iou_gate,
+                                    unsure["alone"])
 
     parts = gather((images, anns, cases, dets, hits, tot, links, n_true))
     if parts is None:  # several GPUs: the main process scores the sets of all
@@ -716,13 +753,14 @@ def evaluate_sets(
     for m in dets:
         # copies: ``loadRes`` writes ``bbox`` / ``area`` into the result dicts, which breaks a second evaluation of them
         ev = _cocoeval(coco, [dict(d) for d in dets[m]], ids, "segm", False)
-        metrics.update({f"sets/segm/{k}_{m}": ev[f"segm/{k}"] for k in ("mAP", "mAP50", "mAP_small", "AR100")})
+        metrics.update({f"{prefix}/segm/{k}_{m}": ev[f"segm/{k}"] for k in ("mAP", "mAP50", "mAP_small", "AR100")})
         for case, case_ids in sorted(cases.items()):
             wanted = set(case_ids)
             case_dets = [dict(d) for d in dets[m] if d["image_id"] in wanted]
-            metrics[f"sets/{case}/mAP_{m}"] = _cocoeval(coco, case_dets, case_ids, "segm", False)["segm/mAP"]
+            metrics[f"{prefix}/{case}/mAP_{m}"] = _cocoeval(coco, case_dets, case_ids, "segm", False)["segm/mAP"]
         for s in specs:
-            metrics[f"sets/{_attr_metric(s)}/{s.name}_{m}"] = hits[m][s.name] / tot[m][s.name] if tot[m][s.name] else float("nan")
+            metrics[f"{prefix}/{_attr_metric(s)}/{s.name}_{m}"] = (hits[m][s.name] / tot[m][s.name] if tot[m][s.name]
+                                                                   else float("nan"))
     for k, pairs in links.items():
-        metrics.update({f"sets/{k}/{n}": v for n, v in _link_f1(pairs, n_true).items()})
+        metrics.update({f"{prefix}/{k}/{n}": v for n, v in _link_f1(pairs, n_true).items()})
     return metrics
