@@ -1,8 +1,20 @@
-"""Inference + rendering for EoMT instance segmentation."""
+"""Inference: photos one by one (batched), or the photos of one subject together (cross-view), and their links.
+
+* :func:`predict_image` / :func:`predict_batch` — one photo (optionally with test-time augmentation / tiles), or
+  several independent ones in one forward pass;
+* :func:`predict` — a photo, a folder of photos, or a folder of subject folders: batched, streamed and rendered;
+* :func:`predict_set` — up to ``max_views`` photos of one subject in one forward pass;
+* :func:`predict_subject` — every photo of one subject, grouped into sets, optionally linked into identities.
+
+Every function runs the network in bf16 where the GPU has it (``amp="auto"``); ``amp=False`` runs it in fp32.
+"""
 
 from __future__ import annotations
 
+import collections
+import itertools
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +45,12 @@ def _subjects(source: str | Path) -> list[list[Path]]:
     return [photos for photos in (list(_iter_sources(f)) for f in folders) if photos]
 
 
+def _chunks(items, n: int):
+    it = iter(items)
+    while chunk := list(itertools.islice(it, n)):
+        yield chunk
+
+
 def _amp_dtype(device, amp):
     """The autocast dtype for ``amp`` on ``device`` (``None`` = run in the model's own precision).
 
@@ -55,6 +73,52 @@ def _amp_dtype(device, amp):
     raise ValueError(f"amp must be False, True, 'auto', 'bf16' or 'fp16', got {amp!r}")
 
 
+def _forward(model, x, device, amp, **kw):
+    dtype = _amp_dtype(device, amp)
+    if dtype is None:
+        return model(x, **kw)
+    with torch.autocast("cuda", dtype=dtype):  # only the network; postprocess casts the logits back to fp32
+        return model(x, **kw)
+
+
+def _aux_scopes(model) -> dict:
+    """The primary-class scope of each class-scoped attribute head: postprocess reports ``ids = -1`` outside it."""
+    return {s.name: s.applies_to for s in getattr(model, "aux_specs", []) if s.applies_to is not None}
+
+
+def _preprocess(model, image, imgsz: int, letterbox: bool):
+    return preprocess_numpy(np.asarray(image.convert("RGB")), imgsz, letterbox=letterbox,
+                            mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None))
+
+
+def _postprocess(model, out, b, size, meta, conf_thres, max_det, mask_thresh) -> dict:
+    """Photo ``b`` of a batched forward as a result dict (boxes for the detect family, else masks too)."""
+    one = slice_batch(out, b)
+    if getattr(model, "family", "instance") == "detect":
+        return postprocess_detection(one, conf_thres, size, max_det=max_det, preprocess_meta=meta,
+                                     aux_scopes=_aux_scopes(model))
+    return postprocess_instance(one, conf_thres, size, max_det=max_det, mask_thresh=mask_thresh, preprocess_meta=meta,
+                                aux_scopes=_aux_scopes(model))
+
+
+@torch.no_grad()
+def predict_batch(model, images: list[Image.Image], *, device, imgsz: int, conf_thres: float = 0.3, max_det: int = 100,
+                  mask_thresh: float = 0.5, letterbox: bool = True, amp: bool | str = "auto", embed: bool = False,
+                  prepared: list | None = None) -> list[dict]:
+    """Several independent photos in one forward pass, one result dict per photo (see :func:`predict_image`).
+    ``prepared`` (one ``(chw, meta)`` per photo, :func:`eomt.preprocess.preprocess_numpy`) skips the preprocessing."""
+    prepared = prepared or [_preprocess(model, im, imgsz, letterbox) for im in images]
+    x = torch.from_numpy(np.stack([chw for chw, _ in prepared])).to(device, non_blocking=True)
+    out = _forward(model, x, device, amp)
+    results = []
+    for b, (im, (_, meta)) in enumerate(zip(images, prepared)):
+        res = _postprocess(model, out, b, im.size, meta, conf_thres, max_det, mask_thresh)
+        if embed:  # the per-query embedding of each kept detection (raw: normalising is the linker's job)
+            res["embed"] = out["query_embed"][b, res["query_idx"]].float().cpu()
+        results.append(res)
+    return results
+
+
 @torch.no_grad()
 def predict_image(
     model,
@@ -67,118 +131,45 @@ def predict_image(
     mask_thresh: float = 0.5,
     letterbox: bool = True,
     embed: bool = False,
-    amp: bool | str = False,
+    amp: bool | str = "auto",
     augment: bool | dict = False,
     tiles: bool | int | dict = False,
 ) -> dict:
-    """Run the model on one PIL image and return a postprocess dict.
+    """Run the model on one PIL image and return a result dict: ``boxes`` (xyxy, original pixels), ``scores``,
+    ``classes``, ``masks`` (bool, original resolution; not for the detect family), ``query_idx`` and, with attribute
+    heads, ``aux`` (``{head: {"ids", "probs"}}``) and ``aux_values`` (regression heads, real units).
 
-    Returns a box-only :func:`~eomt.postprocess.postprocess_detection` dict for
-    ``family="detect"`` models, else a :func:`~eomt.postprocess.postprocess_instance`
-    dict (with masks).
-
-    ``amp`` runs the network under autocast (``True`` / ``"auto"`` = bf16 where supported, or
-    ``"bf16"`` / ``"fp16"``). Off by default.
-
-    With ``embed``, the result also carries ``"embed"`` ``(N, hidden)``: the per-query
-    embedding of each kept detection, sliced out of the same forward pass. It is the
-    appearance fingerprint cross-photo re-identification matches on
-    (:mod:`eomt.reid`). The vectors are **raw**, not normalized — normalizing (and
-    optionally mean-centering) is :func:`eomt.reid.similarity_matrix`'s job, and it
-    needs the raw vectors to do it.
-
-    ``augment=True`` adds the image zoomed to 1.5x ``imgsz`` (test-time augmentation) and ``tiles=True`` runs overlapping
-    native-resolution tiles plus the whole image (tiled inference); the views' instances are merged. Each also takes a
-    dict of options (``tiles`` an int tile size); see :mod:`eomt.tta`. Instance family only. The result then has no
-    ``query_idx`` (a merged instance comes from several queries); ``embed`` is the score-weighted mean of the merged
-    queries' embeddings.
+    With ``embed``, the result also carries ``"embed"`` ``(N, hidden)``: the per-query embedding of each kept detection
+    (re-identification's fingerprint, :mod:`eomt.reid`), raw. ``augment=True`` adds the image zoomed to 1.5x ``imgsz``
+    (test-time augmentation) and ``tiles=True`` runs overlapping native-resolution tiles plus the whole image; the views'
+    instances are merged. Each also takes a dict of options (``tiles`` an int tile size); see :mod:`eomt.tta`. Instance
+    family only; the result then has no ``query_idx`` and ``embed`` is the score-weighted mean of the merged queries'.
     """
-    # Class-scoped aux heads: pass their primary-class scope so postprocess emits
-    # ``ids = -1`` for detections the head does not apply to (the inference side of
-    # the hard class-routing). Unscoped heads (``applies_to=None``) are omitted here.
-    aux_scopes = {
-        s.name: s.applies_to
-        for s in getattr(model, "aux_specs", [])
-        if s.applies_to is not None
-    }
     cfg = TTAConfig.resolve(augment, tiles)
     if cfg is not None:
         return predict_views(
-            model, np.array(image.convert("RGB")), cfg, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det,
+            model, np.asarray(image.convert("RGB")), cfg, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det,
             mask_thresh=mask_thresh, letterbox=letterbox, mean=getattr(model, "pixel_mean", None),
-            std=getattr(model, "pixel_std", None), amp_dtype=_amp_dtype(device, amp), aux_scopes=aux_scopes,
+            std=getattr(model, "pixel_std", None), amp_dtype=_amp_dtype(device, amp), aux_scopes=_aux_scopes(model),
             embed=embed,
         )
-    orig_w, orig_h = image.size
-    chw, meta = preprocess_numpy(
-        np.array(image.convert("RGB")), imgsz, letterbox=letterbox,
-        mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None),
-    )
-    tensor = torch.from_numpy(chw).unsqueeze(0).to(device)
-    dtype = _amp_dtype(device, amp)
-    if dtype is None:
-        out = model(tensor)
-    else:  # only the network runs in reduced precision; postprocess casts the logits back to fp32
-        with torch.autocast("cuda", dtype=dtype):
-            out = model(tensor)
-    if getattr(model, "family", "instance") == "detect":
-        result = postprocess_detection(
-            out, conf_thres, (orig_w, orig_h), max_det=max_det, preprocess_meta=meta,
-            aux_scopes=aux_scopes,
-        )
-    else:
-        result = postprocess_instance(
-            out, conf_thres, (orig_w, orig_h), max_det=max_det,
-            mask_thresh=mask_thresh, preprocess_meta=meta, aux_scopes=aux_scopes,
-        )
-    if embed:
-        # Index with the returned ``query_idx``, never re-derive from the scores: the
-        # ``max_det`` topk reorders rows, so only ``query_idx`` is guaranteed aligned
-        # with the detections. ``.float()`` because the forward may run under autocast;
-        # ``.cpu()`` so a folder's worth of embeddings does not pin GPU memory.
-        qe = out.get("query_embed")
-        result["embed"] = (
-            qe[0, result["query_idx"]].detach().float().cpu()
-            if qe is not None
-            else torch.zeros((result["num_detections"], 0))
-        )
-    return result
+    return predict_batch(model, [image], device=device, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det,
+                         mask_thresh=mask_thresh, letterbox=letterbox, amp=amp, embed=embed)[0]
 
 
-#: The embeddings a joint forward can link detections with: the matching head's, or the per-query embedding
-#: (re-identification's fingerprint).
-LINK_EMBEDS = ("match", "reid")
-
-
-def link_defaults(model, embed: str | None = None) -> tuple[str, float, tuple[str, ...] | None]:
-    """``(embed, threshold, gate keys)`` the photos predicted together by ``model`` are linked with by default: the
-    embedding that linked best at the model's last validation (the checkpoint's ``link_embed``; without one, the
-    matching head's when the model has one), the similarity threshold stored for it (0.7 without one) and the gate keys
-    its links were validated with (``None`` = no gate). A model whose links were never trained nor validated (no
-    matching head, no recorded calibration) is gated by ``("class",)``, as re-identification of single photos is.
-    ``embed`` picks the embedding instead."""
-    has_head = getattr(model, "match_head", None) is not None
-    embed = embed or getattr(model, "link_embed", None) or ("match" if has_head else "reid")
-    if embed not in LINK_EMBEDS:
-        raise ValueError(f"embed {embed!r}: choose from {LINK_EMBEDS}")
-    if embed == "match" and not has_head:
-        raise ValueError("embed='match' needs a model with a matching head (train(multiview=...) with match_dim > 0)")
-    thres = getattr(model, "match_thres" if embed == "match" else "reid_thres", None)
-    if not (has_head or getattr(model, "link_embed", None)):
-        return embed, float(thres) if thres is not None else 0.7, ("class",)
+def link_defaults(model) -> tuple[float, tuple[str, ...] | None]:
+    """``(threshold, gate keys)`` the detections of a model are linked with by default: the cosine threshold its
+    validation calibrated (``match_thres``) and the gate it was calibrated with (``None`` = no gate); for a model never
+    calibrated (re-identification by the query embedding of a single-photo model), 0.7 within the same class."""
+    if getattr(model, "match_thres", None) is None:
+        return 0.7, ("class",)
     gate = getattr(model, "link_group_by", None)
-    return embed, float(thres) if thres is not None else 0.7, tuple(gate) if gate else None
+    return float(model.match_thres), tuple(gate) if gate else None
 
 
-def _view_type_ids(model, view_types, n: int):
-    """The model's ids of the photos' view types (names or values, compared as text with the checkpoint's vocabulary;
-    0 = unknown), or None."""
-    if view_types is None:
-        return None
-    if len(view_types) != n:
-        raise ValueError(f"view_types: one per photo ({n}), got {len(view_types)}")
-    vocab = [str(v) for v in (getattr(model, "xview_cfg", None) or {}).get("view_types") or []]
-    return torch.tensor([vocab.index(str(v)) + 1 if v is not None and str(v) in vocab else 0 for v in view_types])
+def max_views(model) -> int:
+    """The most photos ``model`` predicts together (1 without cross-view sublayers)."""
+    return int((getattr(model, "xview_cfg", None) or {}).get("max_views", 1))
 
 
 @torch.no_grad()
@@ -192,86 +183,69 @@ def predict_set(
     max_det: int = 100,
     mask_thresh: float = 0.5,
     letterbox: bool = True,
-    amp: bool | str = False,
-    embed: str | None = None,
-    view_types: list | None = None,
+    amp: bool | str = "auto",
 ) -> list[dict]:
-    """Predict the photos of ONE subject together, in one forward pass: with a cross-view model (``xview``) the
-    queries of each photo take what the others show; any other model predicts each photo as :func:`predict_image`.
+    """Predict photos of ONE subject in one forward pass: with cross-view sublayers the queries of each photo take what
+    the others show (at most :func:`max_views` photos); a model without them predicts each photo alone.
 
-    Returns one :func:`~eomt.postprocess.postprocess_instance` dict per photo, each with ``"embed"`` ``(N, d)``, the
-    embedding each kept detection is linked by: ``embed="match"`` the matching head's (L2-normalized), ``"reid"`` the
-    per-query embedding of this forward (re-identification's fingerprint, :mod:`eomt.reid`); by default the one that
-    linked best at the model's last validation (:func:`link_defaults`). At most the model's ``max_views`` photos.
-    ``view_types`` (one per photo, e.g. the images' ``view_type``) tells a model trained with view types what kind of
-    photo each one is; a value it does not know, or ``None``, is unknown.
+    Returns one result dict per photo (:func:`predict_image`), each with ``"embed"`` ``(N, d)``: the embedding its
+    detections are linked by — the matching head's (L2-normalized) when the model has one, else the per-query
+    embedding (re-identification's fingerprint, :mod:`eomt.reid`).
     """
-    max_views = int((getattr(model, "xview_cfg", None) or {}).get("max_views", len(images)))
-    if not 1 <= len(images) <= max_views:
-        raise ValueError(f"predict_set takes 1 to {max_views} photos of one subject, got {len(images)}.")
-    embed = link_defaults(model, embed)[0]
-    vt = _view_type_ids(model, view_types, len(images))
-    aux_scopes = {s.name: s.applies_to for s in getattr(model, "aux_specs", []) if s.applies_to is not None}
-    chws, metas = zip(*(
-        preprocess_numpy(np.array(im.convert("RGB")), imgsz, letterbox=letterbox,
-                         mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None))
-        for im in images
-    ))
-    x = torch.from_numpy(np.stack(chws)).to(device)
-    set_ids = torch.zeros(len(images), dtype=torch.long)
-    dtype = _amp_dtype(device, amp)
-    if dtype is None:
-        out = model(x, set_ids=set_ids, view_types=vt)
-    else:
-        with torch.autocast("cuda", dtype=dtype):
-            out = model(x, set_ids=set_ids, view_types=vt)
-    vectors = out["match_embed"] if embed == "match" else out["query_embed"]
+    if getattr(model, "xview_cfg", None) and not 1 <= len(images) <= max_views(model):
+        raise ValueError(f"predict_set takes 1 to {max_views(model)} photos of one subject, got {len(images)}.")
+    if getattr(model, "family", "instance") == "detect":
+        raise ValueError("predict_set: the detect family predicts photos one by one (predict_batch)")
+    prepared = [_preprocess(model, im, imgsz, letterbox) for im in images]
+    x = torch.from_numpy(np.stack([chw for chw, _ in prepared])).to(device, non_blocking=True)
+    out = _forward(model, x, device, amp, set_ids=torch.zeros(len(images), dtype=torch.long))
+    vectors = out.get("match_embed", out["query_embed"])
     results = []
-    for b, (im, meta) in enumerate(zip(images, metas)):
-        res = postprocess_instance(slice_batch(out, b), conf_thres, im.size, max_det=max_det, mask_thresh=mask_thresh,
-                                   preprocess_meta=meta, aux_scopes=aux_scopes)
+    for b, (im, (_, meta)) in enumerate(zip(images, prepared)):
+        res = _postprocess(model, out, b, im.size, meta, conf_thres, max_det, mask_thresh)
         res["embed"] = vectors[b, res["query_idx"]].float().cpu()
         results.append(res)
     return results
 
 
-def _explicit_groups(groups, n: int, max_views: int) -> list[list[int]]:
-    """``groups`` (photo indices) checked, plus every photo they leave out alone."""
+def subject_groups(model, n: int, groups: list[list[int]] | None = None, *, batch: int = 8) -> list[list[int]]:
+    """The groups of photo indices a subject's ``n`` photos are predicted in: ``groups`` checked (1 to
+    :func:`max_views` distinct photos each, every photo in one group at most; those left out are predicted alone), else
+    consecutive photos, :func:`max_views` at a time. Without cross-view sublayers the photos are independent: ``batch``
+    at a time."""
+    k = max_views(model)
+    if groups is None:
+        return [list(c) for c in _chunks(range(n), k if k > 1 else batch)]
     out, seen = [], set()
     for g in groups:
         g = [int(i) for i in g]
-        if not g or len(g) > max_views or len(set(g)) < len(g) or seen & set(g) or any(not 0 <= i < n for i in g):
-            raise ValueError(f"groups: {g} must hold 1 to {max_views} distinct photos of 0..{n - 1}, each in one group")
+        if not g or len(g) > k or len(set(g)) < len(g) or seen & set(g) or any(not 0 <= i < n for i in g):
+            raise ValueError(f"groups: {g} must hold 1 to {k} distinct photos of 0..{n - 1}, each in one group")
         seen.update(g)
         out.append(g)
     return out + [[i] for i in range(n) if i not in seen]
 
 
-def subject_sets(feats: torch.Tensor, max_views: int, *, mode: str = "partition", k: int = 3) -> list[list[int]]:
-    """The sets in which the photos of one subject are predicted together, from one feature row per photo.
+def link_results(model, results: list[dict], *, group_by="auto", sim_thres: float | None = None,
+                 paths: list[str] | None = None) -> dict:
+    """Link the detections of the photos of one subject (each result with its ``"embed"``, :func:`predict_set`) into
+    identities (:func:`eomt.reid.link_identities`: Hungarian per photo pair, union-find with a merge guard), with the
+    model's calibrated threshold and gate (:func:`link_defaults`; ``sim_thres`` and ``group_by`` override them,
+    ``group_by="auto"`` being the calibrated gate). Stamps every result with ``identity_ids`` and returns the linking
+    (:func:`eomt.reid.link_identities`) plus ``"matches"`` (every candidate pair, by photo and detection) and
+    ``"config"``."""
+    from ..reid import link_identities, validate_group_by
 
-    ``"order"``: consecutive photos, ``max_views`` at a time (``feats`` is only counted). ``"partition"``: each photo in
-    exactly one set, of up to ``max_views`` photos — the first photo not yet placed and the most similar photos (cosine
-    of ``feats``) not yet placed. Both predict every photo once. ``"anchor"``: one set per photo, the photo first with
-    its ``k`` most similar others (``k`` capped at ``max_views - 1``); only the first photo's result of each set is its
-    own. On real multi-photo sets (close-ups plus overviews of each subject) the three gave about the same gain.
-    """
-    if mode not in ("order", "partition", "anchor"):
-        raise ValueError(f"subject_sets: mode {mode!r} is 'order', 'partition' or 'anchor'")
-    if mode == "order":
-        return [list(range(s, min(s + max_views, len(feats)))) for s in range(0, len(feats), max_views)]
-    f = torch.nn.functional.normalize(feats.float(), dim=-1)
-    order = (f @ f.T).argsort(dim=1, descending=True).tolist()
-    if mode == "anchor":
-        return [[t] + [j for j in order[t] if j != t][: min(k, max_views - 1)] for t in range(len(f))]
-    placed, sets = set(), []
-    for t in range(len(f)):
-        if t in placed:
-            continue
-        group = [t] + [j for j in order[t] if j != t and j not in placed][: max_views - 1]
-        placed.update(group)
-        sets.append(group)
-    return sets
+    thres, gate = link_defaults(model)
+    keys = validate_group_by(gate if group_by == "auto" else group_by, getattr(model, "aux_specs", []))
+    thres = float(sim_thres) if sim_thres is not None else thres
+    linked = link_identities(results, sim_thres=thres, group_by=keys, dim=model.config.hidden_size,
+                             names=getattr(model, "names", None), aux_specs=getattr(model, "aux_specs", []), paths=paths)
+    origin = linked["origin"]
+    matches = [{"a_image": origin[p["a"]][0], "a_det": origin[p["a"]][1], "b_image": origin[p["b"]][0],
+                "b_det": origin[p["b"]][1], "similarity": round(p["similarity"], 4), "accepted": bool(p["accepted"]),
+                "reason": p["reason"], "identity_id": p.get("identity_id")} for p in linked["pairs"]]
+    return {**linked, "matches": matches, "config": {"sim_thres": thres, "group_by": list(keys)}}
 
 
 @torch.no_grad()
@@ -281,102 +255,48 @@ def predict_subject(
     *,
     device,
     imgsz: int,
-    mode: str = "order",
-    k: int = 3,
-    feature_size: int = 322,
+    groups: list[list[int]] | None = None,
     conf_thres: float = 0.3,
     max_det: int = 100,
     mask_thresh: float = 0.5,
     letterbox: bool = True,
-    amp: bool | str = False,
-    groups: list[list[int]] | None = None,
-    view_types: list | None = None,
-    embed: str | None = None,
+    amp: bool | str = "auto",
     identities: bool = False,
     group_by: tuple[str, ...] | str | None = "auto",
     sim_thres: float | None = None,
 ) -> list[dict] | dict:
-    """Predict every photo of one subject together with other photos of it: one result per photo, in
-    input order, as :func:`predict_set` gives them.
+    """Predict every photo of one subject, any number of them, together with other photos of it: grouped by
+    :func:`subject_groups` (``groups`` gives them, e.g. each overview with the close-ups it shows; by default
+    consecutive photos), one :func:`predict_set` per group. Returns one result per photo, in input order.
 
-    The photos are grouped by :func:`subject_sets`: ``mode="order"`` takes them ``max_views`` at a time in the given
-    order; ``"partition"`` and ``"anchor"`` group them on the mean patch token of a pass at ``feature_size`` (a small
-    input, about a quarter of the cost of a prediction at 644 px). ``"order"`` and ``"partition"`` predict every photo
-    once, ``"anchor"`` once per photo with its ``k`` most similar others. ``groups`` (lists of photo indices, each photo
-    in one at most; those left out are predicted alone) gives the groups instead, e.g. each overview with the close-ups
-    it shows. A model without cross-view modules predicts each photo alone either way. ``view_types`` (one per photo)
-    as in :func:`predict_set`.
-
-    ``identities=True`` also links the detections of every photo with those of every other (across the groups too) and
-    clusters them (:func:`eomt.reid.link_identities`), with the model's calibrated embedding, threshold and gate
-    (:func:`link_defaults`; ``embed``, ``sim_thres`` and ``group_by`` override them, ``group_by="auto"`` being the gate
-    the links were validated with). The return is then ``{"images": [one result per photo, each with "identity_ids"],
-    "identities": [one record per identity: its members, fused attributes (a vote) and regression values], "matches",
-    "config"}``.
+    ``identities=True`` also links the detections of every photo with those of every other, across the groups too
+    (:func:`link_results`), and returns ``{"images": [one result per photo, each with "identity_ids"], "identities":
+    [one record per identity: its members, fused attributes and regression values], "matches", "config"}``.
     """
-    if not images:
-        return {"images": [], "identities": [], "matches": [], "config": {}} if identities else []
+    results: list[dict | None] = [None] * len(images)
+    sets = subject_groups(model, len(images), groups)
     kw = dict(device=device, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
-              letterbox=letterbox, amp=amp, embed=embed)
-    max_views = int((getattr(model, "xview_cfg", None) or {}).get("max_views", 1))
-    if max_views < 2 or len(images) == 1:
-        sets, mode = [[i] for i in range(len(images))], "order"
-    elif groups is not None:
-        sets, mode = _explicit_groups(groups, len(images), max_views), "order"
-    else:
-        feats = torch.zeros(len(images), 1) if mode == "order" else _mean_patch_tokens(model, images, feature_size, **kw)
-        sets = subject_sets(feats, max_views, mode=mode, k=k)
-    results = _predict_groups(model, images, sets, mode, view_types=view_types, **kw)
+              letterbox=letterbox, amp=amp)
+    for group in sets:
+        for i, r in zip(group, predict_set(model, [images[i] for i in group], **kw)):
+            results[i] = r
     if not identities:
         return results
-    from ..reid import link_identities, validate_group_by
-
-    embed, thres, gate = link_defaults(model, embed)
-    keys = validate_group_by(gate if group_by == "auto" else group_by, getattr(model, "aux_specs", []))
-    thres = float(sim_thres) if sim_thres is not None else thres
-    linked = link_identities(results, sim_thres=thres, group_by=keys, names=getattr(model, "names", None),
-                             aux_specs=getattr(model, "aux_specs", []))
-    origin = linked["origin"]
-    matches = [{"a_image": origin[p["a"]][0], "a_det": origin[p["a"]][1], "b_image": origin[p["b"]][0],
-                "b_det": origin[p["b"]][1], "similarity": round(p["similarity"], 4), "accepted": bool(p["accepted"]),
-                "reason": p["reason"], "identity_id": p.get("identity_id")} for p in linked["pairs"]]
-    return {"images": results, "identities": linked["identities"], "matches": matches,
-            "config": {"embed": embed, "sim_thres": thres, "group_by": list(keys), "groups": sets}}
+    linked = link_results(model, results, group_by=group_by, sim_thres=sim_thres)
+    return {"images": results, "identities": linked["identities"], "matches": linked["matches"],
+            "config": {**linked["config"], "groups": sets}}
 
 
-@torch.no_grad()
-def _mean_patch_tokens(model, images, size, *, device, letterbox, amp, **_) -> torch.Tensor:
-    """``(N, hidden)``: the mean patch token of each photo predicted alone at ``size``."""
-    grab = {}
-    hook = model.eomt.layernorm.register_forward_hook(lambda m, i, o: grab.__setitem__("x", o))
-    pre = model.config.num_queries + model.eomt.embeddings.num_prefix_tokens
-    dtype = _amp_dtype(device, amp)
-    feats = []
-    try:
-        for im in images:
-            chw, _ = preprocess_numpy(np.array(im.convert("RGB")), size, letterbox=letterbox,
-                                      mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None))
-            x = torch.from_numpy(chw)[None].to(device)
-            if dtype is None:
-                model(x)
-            else:
-                with torch.autocast("cuda", dtype=dtype):
-                    model(x)
-            feats.append(grab["x"][0, pre:].float().mean(0))
-    finally:
-        hook.remove()
-    return torch.stack(feats)
-
-
-def _predict_groups(model, images, groups, mode, view_types=None, **kw) -> list[dict]:
-    """One :func:`predict_set` per group; every photo keeps its own result (the first photo only, for ``"anchor"``)."""
-    results: list[dict | None] = [None] * len(images)
-    for group in groups:
-        vt = [view_types[i] for i in group] if view_types is not None else None
-        res = predict_set(model, [images[i] for i in group], view_types=vt, **kw)
-        for i, r in zip(group if mode != "anchor" else group[:1], res):
-            results[i] = r
-    return results
+def _prefetched(fn, items, depth: int, workers: int = 4):
+    """``fn(item)`` of every item, in order, computed by ``workers`` threads at most ``depth`` items ahead (decoding the
+    next photos while the GPU runs the current batch, without holding a whole folder in memory)."""
+    items = iter(items)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        queue = collections.deque(pool.submit(fn, x) for x in itertools.islice(items, depth))
+        while queue:
+            done = queue.popleft().result()
+            queue.extend(pool.submit(fn, x) for x in itertools.islice(items, 1))
+            yield done
 
 
 def predict(
@@ -389,113 +309,86 @@ def predict(
     max_det: int = 100,
     mask_thresh: float = 0.5,
     device: str = "auto",
-    alpha: float = 0.35,
-    draw_boxes: bool = True,
-    aux_multiline: bool = True,
-    show_scores: bool = True,
-    color_by: str = "class",
     imgsz: int | None = None,
-    embed: bool = False,
-    amp: bool | str = False,
+    batch: int = 8,
+    stream: bool = False,
+    amp: bool | str = "auto",
     augment: bool | dict = False,
     tiles: bool | int | dict = False,
-    subject: bool | str = False,
-) -> list[dict]:
-    """Run inference on an image or a directory of images.
+    subject: bool = False,
+    alpha: float = 0.35,
+    draw_boxes: bool = True,
+    show_scores: bool = True,
+    color_by: str = "class",
+    verbose: bool = True,
+):
+    """Run inference on an image or a folder of images, ``batch`` photos per forward pass (the next ones decoded
+    meanwhile). Returns one result dict per image (:func:`predict_image`), each with its source ``path``; with
+    ``stream=True`` a generator of them instead, so a large folder is never held in memory.
 
-    ``model`` may be a loaded :class:`~eomt.model.EoMTModel` or a checkpoint path /
-    run folder (loaded with :func:`~eomt.serialization.load_model`). Returns one
-    result dict per image (``boxes`` / ``scores`` / ``classes`` / ``masks`` and,
-    for models with secondary heads, ``aux``), each annotated with its source
-    ``path``. When ``plot`` is set, every image is rendered with masks/boxes/labels
-    and written under ``save`` (default ``runs/predict``); the output path is added
-    to the result dict as ``plot_path``.
-
-    With ``embed``, each result also carries ``"embed"`` ``(N, hidden)`` — the
-    per-instance appearance fingerprint (see :func:`predict_image`). ``amp`` runs the
-    network under autocast; ``augment`` / ``tiles`` run test-time augmentation / tiled
-    inference (see :func:`predict_image`).
-
-    ``subject`` predicts the photos of each subject together, for a model post-trained with
-    ``multiview`` (:func:`predict_subject`; ``True`` or its ``mode``): the photos of ``source``
-    are one subject and each of its subfolders is another, whose annotated images keep the
-    subfolder under ``save``. Each result then carries ``"embed"``; no ``augment`` / ``tiles``.
+    ``model`` may be a loaded :class:`~eomt.model.EoMTModel` or a checkpoint path / run folder. With ``plot``, every
+    image is rendered with its masks / boxes / labels and written under ``save`` (``result["plot_path"]``; with
+    ``save=None`` the rendered image is kept as ``result["plot"]``). ``augment`` / ``tiles``: test-time augmentation /
+    tiled inference (one photo at a time). ``subject=True`` predicts the photos of each subject together
+    (:func:`predict_subject`, for a model post-trained with ``multiview``): the photos of ``source`` are one subject and
+    each of its subfolders is another, whose annotated images keep the subfolder under ``save``.
     """
     if subject and (augment or tiles):
-        raise ValueError("predict(subject=...) predicts the photos together, without augment / tiles.")
+        raise ValueError("predict(subject=True) predicts the photos together, without augment / tiles.")
     if isinstance(model, (str, Path)):
         model = load_model(model, device=device)
+    gen = _predict_iter(model, source, plot=plot, save=save, conf_thres=conf_thres, max_det=max_det,
+                        mask_thresh=mask_thresh, imgsz=imgsz, batch=batch, amp=amp, augment=augment, tiles=tiles,
+                        subject=subject, alpha=alpha, draw_boxes=draw_boxes, show_scores=show_scores, color_by=color_by,
+                        verbose=verbose)
+    return gen if stream else list(gen)
 
+
+def _predict_iter(model, source, *, plot, save, conf_thres, max_det, mask_thresh, imgsz, batch, amp, augment, tiles,
+                  subject, alpha, draw_boxes, show_scores, color_by, verbose):
     dev = next(model.parameters()).device
     imgsz = int(imgsz if imgsz is not None else model.image_size)
-    letterbox = bool(getattr(model, "preprocess_letterbox", False))
+    letterbox = bool(getattr(model, "preprocess_letterbox", True))
     names = getattr(model, "names", None)
     aux_names = {s.name: s.names for s in getattr(model, "aux_specs", [])}
-
-    family = getattr(model, "family", "instance")
-    print(
-        f"[predict] eomt-{getattr(model, 'size', '?')} ({family}, "
-        f"nc={getattr(model, 'nc', '?')}, imgsz={imgsz}) on {dev}"
-    )
-    if subject and getattr(model, "xview_cfg", None) is None:
-        print("[predict] the model has no cross-view modules: each photo is predicted alone")
-
+    tta = TTAConfig.resolve(augment, tiles) is not None
+    if verbose:
+        print(f"[predict] eomt-{model.size} ({model.family}, nc={model.nc}, imgsz={imgsz}) on {dev}")
+        if subject and getattr(model, "xview_cfg", None) is None:
+            print("[predict] the model has no cross-view sublayers: each photo is predicted alone")
     out_root = Path(save) if (plot and save) else None
-    if out_root is not None:
-        out_root.mkdir(parents=True, exist_ok=True)
-
     root = Path(source) if Path(source).is_dir() else Path(source).parent
-    results: list[dict] = []
-    total_t0 = time.perf_counter()
-    for paths in _subjects(source) if subject else ([p] for p in _iter_sources(source)):
+    kw = dict(device=dev, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
+              letterbox=letterbox, amp=amp)
+
+    def load(paths):  # decoded (and, for plain batches, preprocessed) in a worker thread
         images = [Image.open(p).convert("RGB") for p in paths]
-        t0 = time.perf_counter()
+        prepared = None if tta or subject else [_preprocess(model, im, imgsz, letterbox) for im in images]
+        return paths, images, prepared
+
+    groups = _subjects(source) if subject else _chunks(_iter_sources(source), batch)
+    n, t0 = 0, time.perf_counter()
+    for paths, images, prepared in _prefetched(load, groups, depth=2):
         if subject:
-            batch = predict_subject(
-                model, images, device=dev, imgsz=imgsz, mode="order" if subject is True else subject,
-                conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh, letterbox=letterbox, amp=amp,
-            )
+            results = predict_subject(model, images, **kw)
+        elif tta:
+            results = [predict_image(model, im, augment=augment, tiles=tiles, **kw) for im in images]
         else:
-            batch = [predict_image(
-                model, images[0], device=dev, imgsz=imgsz,
-                conf_thres=conf_thres, max_det=max_det,
-                mask_thresh=mask_thresh, letterbox=letterbox, embed=embed, amp=amp,
-                augment=augment, tiles=tiles,
-            )]
-        if dev.type == "cuda":
-            torch.cuda.synchronize(dev)
-        elapsed_ms = (time.perf_counter() - t0) * 1e3 / len(paths)
-        for path, image, result in zip(paths, images, batch):
-            result["elapsed_ms"] = elapsed_ms
+            results = predict_batch(model, images, prepared=prepared, **kw)
+        for path, image, result in zip(paths, images, results):
             result["path"] = str(path)
-            dst = None
             if plot:
-                rendered = draw_instances(
-                    image, result, names=names, aux_names=aux_names or None,
-                    alpha=alpha, draw_boxes=draw_boxes, aux_multiline=aux_multiline,
-                    show_scores=show_scores, color_by=color_by,
-                )
+                rendered = draw_instances(image, result, names=names, aux_names=aux_names or None, alpha=alpha,
+                                          draw_boxes=draw_boxes, show_scores=show_scores, color_by=color_by)
                 if out_root is not None:
                     dst = out_root / path.relative_to(root)
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     rendered.save(dst)
                     result["plot_path"] = str(dst)
-                result["plot"] = rendered
-            saved = f" -> {dst}" if dst is not None else ""
-            print(
-                f"[predict] {path.name}: {result['num_detections']} instances "
-                f"({elapsed_ms:.1f} ms){saved}"
-            )
-            results.append(result)
-
-    n = len(results)
-    if n:
-        total_s = time.perf_counter() - total_t0
-        avg_ms = total_s * 1e3 / n
-        fps = n / total_s if total_s > 0 else float("inf")
-        dest = f" -> {out_root}" if out_root is not None else ""
-        print(
-            f"[predict] done: {n} image(s) in {total_s:.2f} s "
-            f"({avg_ms:.1f} ms/img, {fps:.1f} FPS){dest}"
-        )
-    return results
+                else:
+                    result["plot"] = rendered
+            n += 1
+            yield result
+    if verbose and n:
+        s = time.perf_counter() - t0
+        print(f"[predict] {n} image(s) in {s:.2f} s ({s * 1e3 / n:.1f} ms/img)" + (f" -> {out_root}" if out_root else ""))

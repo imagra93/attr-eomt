@@ -75,14 +75,12 @@ def test_train_with_a_regression_head_then_predict_real_values(tmp_path):
 
     img_dir, jf = _with_cost(tmp_path)
     res = train(train_images=str(img_dir), train_json=str(jf), val_images=str(img_dir), val_json=str(jf), size="s",
-                imgsz=112, epochs=1, batch=1, accum=1, workers=0, device="cpu", amp=False, pretrained=False, ema=False,
-                seed=0, project=str(tmp_path / "runs"), name="r", warmup_steps=(1, 1), aux_iou_gate=0.0,
-                aux_class_gate=False, aux_class_weights=True, aux_balance="uncertainty")
+                imgsz=112, epochs=1, batch=1, nominal_batch=1, workers=0, device="cpu", amp=False, pretrained=False,
+                seed=0, project=str(tmp_path / "runs"), name="r", optim={"ema": False, "warmup_steps": (1, 1)},
+                aux={"iou_gate": 0.0, "class_gate": False, "class_weights": True})
     row = next(csv.DictReader(open(tmp_path / "runs" / "r" / "metrics.csv")))
     assert "train/aux_acc/kind" in row and "val/aux_acc/kind" in row
     assert math.isfinite(float(row["train/aux_mae/cost"])) and math.isfinite(float(row["val/aux_mae/cost"]))
-    assert float(row["train/aux_grad/cost"]) > 0 and float(row["train/aux_grad/kind"]) > 0
-    assert set(torch.load(res["last"], weights_only=False)["aux_log_vars"]) == {"kind", "cost"}
 
     model = load_model(res["last"], device="cpu")
     cost = model.aux_specs[1]

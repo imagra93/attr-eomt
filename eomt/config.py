@@ -196,13 +196,10 @@ DEFAULT_LOSS_WEIGHTS: dict = {
     "class_weight": 2.0,
     "mask_weight": 5.0,
     "dice_weight": 5.0,
-    # Only used with the auxiliary box head (``aux_box_head=True``): L1 / GIoU loss and matching weights.
-    "l1_weight": 5.0,
-    "giou_weight": 2.0,
     # Class target of a matched query = (1 + mask IoU) / 2 instead of 1 (scores rank masks by quality).
-    "iou_aware_cls": False,
+    "iou_aware_cls": True,
     # Mask-quality head: predicts each matched query's mask IoU (BCE); postprocess scores class x predicted IoU. 0 = off.
-    "quality_weight": 0.0,
+    "quality_weight": 2.0,
 }
 
 #: Detection (box-head) criterion weights. The shared ``no_object_weight`` /
@@ -217,12 +214,13 @@ DETECT_LOSS_WEIGHTS: dict = {
 
 
 #: Point-sampling knobs of the old PointRend mask loss (the mask terms are now dense on the logit grid, see
-#: :mod:`eomt.loss`), and matcher options that were tried and dropped. Checkpoints still carry them in ``loss_weights``,
-#: so they are dropped on load.
+#: :mod:`eomt.loss`), matcher options that were tried and dropped, and (instance family) the weights of the removed
+#: auxiliary box head. Checkpoints still carry them in ``loss_weights``, so they are dropped on load.
 _OBSOLETE_LOSS_KEYS = (
     "train_num_points", "oversample_ratio", "importance_sample_ratio", "match_class_weight", "match_full_res",
     "quality_detach", "o2m_k", "sem_weight",
 )
+_OBSOLETE_INSTANCE_KEYS = ("l1_weight", "giou_weight")
 
 
 def _loss_weight_defaults(family: str) -> dict:
@@ -238,7 +236,8 @@ def normalize_loss_weights(lw: dict | None, family: str = "instance") -> dict:
     the box L1/GIoU keys.
     """
     out = dict(_loss_weight_defaults(family))
-    lw = {k: v for k, v in (lw or {}).items() if k not in _OBSOLETE_LOSS_KEYS}
+    obsolete = _OBSOLETE_LOSS_KEYS + (() if family == "detect" else _OBSOLETE_INSTANCE_KEYS)
+    lw = {k: v for k, v in (lw or {}).items() if k not in obsolete}
     if lw:
         unknown = set(lw) - set(out)
         if unknown:

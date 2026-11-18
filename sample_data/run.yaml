@@ -1,12 +1,12 @@
 # A run config: one YAML with the data paths and everything about how a model is trained on them and run. Copy it for
 # your dataset and write every setting out here, in one file.
 #
-#   python scripts/train.py --data sample_data/run.yaml          # the images are not shipped: add yours first
-#   python scripts/train.py --data sample_data/run.yaml --epochs 1   # a flag (or a train() keyword in code) beats the file
+#   python scripts/train.py --data sample_data/run.yaml --size s       # the images are not shipped: add yours first
+#   python scripts/train.py --data sample_data/run.yaml --epochs 1     # a flag (or a train() keyword in code) beats the file
 #
 # The dataset (the COCO JSONs) holds only data: the images, the instances, and each attribute's name, type
 # (categorical, or "type": "regression") and categories. Everything below is how a model learns it. Every section is
-# optional: without one, the library's defaults. Relative paths are relative to this file.
+# optional: without one, the library's defaults (eomt.engine.train). Relative paths are relative to this file.
 
 # --- data
 path: .
@@ -20,7 +20,6 @@ val_json: annotations/instances_val.json
 attributes:
   scale:                           # a categorical head over the data's categories (small / modest / large)
   viewpoint:                       # frontal / side / back
-  # The other behaviours, for attributes your data might have:
   # posture: {applies_to: [skirt, trousers]}       # only trained on (and emitted for) these primary classes
   # side: {flip_aware: {left: right}}               # swapped when the augmentation mirrors the photo
   # price: {log: true, range: [0, 20000]}           # a regression head: regress log1p; values outside are ignored
@@ -28,28 +27,40 @@ attributes:
   # length_cm: {crop: ignore, min_visible: 0.95}    # dropped when less than 95 % of the instance is in view
   # weight_kg: {log: true, bins: [1, 10]}           # validation also reports its errors per GT bucket (<1, 1-10, >=10)
 
-# --- augmentation: eomt.data.transforms.AugConfig fields over its defaults (see the README, "Augmentation")
-aug:
-  flip_prob: 0.5
-  min_scale: 0.4                   # large-scale jitter: the long side of a sample is imgsz x 0.4-1.6
-  max_scale: 1.6
-  rotate_prob: 0.3
-  rotate_deg: 10.0
-
 # --- train() keywords (anything train() takes but the data paths; the model size: --size / EoMT("s"))
 train:
   project: ../runs/train
   name: sample
-  epochs: 12
+  epochs: 12                       # the LR schedule and the masked-attention annealing span them
   imgsz: 644
   batch: 4                         # per GPU; accumulated to nominal_batch
   nominal_batch: 16
-  val_interval: 2
   # init_weights: ../runs/train/eomt-l/weights/best.pt   # warm start from a checkpoint instead of DINOv2
-  # hires_epochs: 2                                       # the last epochs at a larger input (the photos' native size)
-  # hires_imgsz: 1022
 
-# --- saved in every checkpoint: the defaults of predict() / track() with the trained model
+# --- augmentation (eomt.data.transforms.AugConfig): the defaults are a strong general recipe
+aug:
+  flip_prob: 0.5
+  min_scale: 0.4                   # large-scale jitter: the long side of a sample is imgsz x 0.4-1.6
+  max_scale: 1.6
+
+# --- the other sections, at their defaults (eomt.engine.train: ModelConfig, OptimConfig, AuxConfig, ValConfig)
+# model: {fpn_scales: [2.0, 1.0, 0.5], iou_aware_cls: true, quality_weight: 2.0, aux_head_dropout: 0.0}
+# optim: {lr0: 1.0e-4, llrd: 0.8, warmup_steps: [500, 1000], ema_decay: 0.9999, mask_anneal: true}
+# aux: {w: 1.0, iou_gate: 0.5, class_gate: true, class_weights: false}
+val:
+  interval: 2                      # epochs between validations (and after the last)
+  # group_by: use_case             # the main metrics per value of an image field too
+
+# --- a post-training on sets of photos of one subject (MultiviewConfig): the images need a `subject_id`, the
+# annotations an `instance_id` for the links (eomt.data.subjects). Set train.init_weights to the model to post-train.
+# multiview:
+#   xview: true                    # the photos of a set are predicted together
+#   matching: true                 # a head that links the instances across photos
+#   gate: [class]                  # links only between instances of the same class (and listed attributes)
+#   trainable: new                 # only the added modules ("query_blocks": also the query blocks, slower)
+#   sets: {max_views: 4, sizes: {2: 0.2, 3: 0.2, 4: 0.6}, p_single: 0.3, p_shared: 0.5, p_hard: 0.25}
+
+# --- saved in every checkpoint: the defaults of predict() / match() with the trained model
 inference:
   conf_thres: 0.3
   mask_thresh: 0.5

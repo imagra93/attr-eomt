@@ -9,7 +9,8 @@ import pytest
 import torch
 from PIL import Image
 
-from eomt import build_model, postprocess_instance
+from eomt import build_model
+from eomt.postprocess import postprocess_instance
 
 IMGSZ = 140
 NC = 3

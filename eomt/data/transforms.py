@@ -474,9 +474,14 @@ class TrainAugment:
     #: the dataset checks this to decide whether to use the full call form
     is_train_augment = True
 
-    def __init__(self, imgsz: int, cfg: AugConfig | Mapping[str, Any] | None = None):
+    def __init__(self, imgsz: int, cfg: AugConfig | Mapping[str, Any] | None = None, *, place: str = "random"):
         self.imgsz = int(imgsz)
         self.cfg = AugConfig.from_any(cfg)
+        #: Where a photo smaller than the window lands when no instance places the window: "random", or "corner" (top
+        #: left, as the inference letterbox puts it: an unaugmented view of the photo, e.g. for validation).
+        if place not in ("random", "corner"):
+            raise ValueError(f"place {place!r}: 'random' or 'corner'")
+        self.place = place
         c = self.cfg
         self._cj = (
             v2.ColorJitter(brightness=c.brightness, contrast=c.contrast, saturation=c.saturation, hue=c.hue)
@@ -669,6 +674,8 @@ class TrainAugment:
                 mode = "empty"
             else:
                 y0, x0 = _random_origin(Hs, Ho), _random_origin(Ws, Wo)
+        elif self.place == "corner":
+            y0, x0 = 0, 0
         else:
             y0, x0 = _random_origin(Hs, Ho), _random_origin(Ws, Wo)
 

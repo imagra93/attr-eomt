@@ -1,63 +1,50 @@
-"""attr-eomt: standalone EoMT instance segmentation.
-
-Public API:
+"""attr-eomt: EoMT instance segmentation with per-instance attributes, multi-view prediction and instance matching.
 
     >>> from eomt import EoMT
-    >>> model = EoMT("l")                      # fresh model (DINOv2 backbone)
-    >>> model.train(data="coco")               # COCO auto-downloads if missing; 12 epochs, the official recipe
-    >>> model = EoMT("runs/train/eomt-l")      # reload a run (everything auto-detected)
+    >>> model = EoMT("l")                          # a new model (DINOv2 backbone)
+    >>> model.train(data="run.yaml")               # the run config: data, attribute heads, settings
+    >>> model = EoMT("runs/train/eomt-l")          # a trained run (everything read from its checkpoint)
     >>> results = model.predict("images/", plot=True)
+    >>> linked = model.match("photos/subject_42/")
 
-Lower-level building blocks (``build_model`` / ``load_model`` / ``EoMTModel`` /
-``EoMTEncoder``) remain available for advanced use.
+The settings sections of a training (:mod:`eomt.engine.train`) are exported too, for code that prefers them to plain
+mappings: ``EoMT("l").train(data=..., optim=OptimConfig(lr0=5e-5))``.
 """
 
 from __future__ import annotations
 
 from .api import EoMT
+from .config import EOMT_CONFIGS, SIZES, AuxHeadSpec
+from .data.subjects import SubjectSetConfig
 from .data.transforms import AugConfig
-from .config import EOMT_CONFIGS, SIZES, build_eomt_config
+from .engine.train import AuxConfig, ModelConfig, MultiviewConfig, OptimConfig, ValConfig
 from .model import EoMTEncoder, EoMTModel, build_model, load_dinov2_backbone
-from .postprocess import postprocess_instance
-from .device import resolve_device
-from .serialization import (
-    download_from_hub,
-    format_summary,
-    is_hf_ref,
-    load_model,
-    load_raw,
-    resolve_checkpoint,
-    save_checkpoint,
-    summarize_checkpoint,
-    wrap_checkpoint,
-)
+from .serialization import get_version, load_model, migrate_checkpoint, save_checkpoint, summarize_checkpoint
 
 __all__ = [
     "EoMT",
     "AugConfig",
+    "ModelConfig",
+    "OptimConfig",
+    "AuxConfig",
+    "ValConfig",
+    "MultiviewConfig",
+    "SubjectSetConfig",
+    "AuxHeadSpec",
     "EOMT_CONFIGS",
     "SIZES",
-    "build_eomt_config",
     "EoMTModel",
     "EoMTEncoder",
     "build_model",
     "load_dinov2_backbone",
-    "postprocess_instance",
     "load_model",
-    "load_raw",
-    "resolve_checkpoint",
+    "migrate_checkpoint",
     "save_checkpoint",
-    "wrap_checkpoint",
     "summarize_checkpoint",
-    "format_summary",
-    "download_from_hub",
-    "is_hf_ref",
-    "resolve_device",
 ]
 
-try:  # pragma: no cover
-    from importlib.metadata import PackageNotFoundError, version
 
-    __version__ = version("attr-eomt")
-except PackageNotFoundError:  # pragma: no cover
-    __version__ = "0.0.0.dev0"
+def __getattr__(name: str):
+    if name == "__version__":  # computed on first use: from a source checkout it asks git
+        return get_version()
+    raise AttributeError(f"module 'eomt' has no attribute {name!r}")

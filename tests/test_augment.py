@@ -491,8 +491,8 @@ def test_dataset_defaults_are_the_same_as_the_trainers(tmp_path):
     assert inst.aug == det.aug == AugConfig()
     assert isinstance(inst.transform, TrainAugment) and inst.transform.cfg == AugConfig()
     sig = inspect.signature(train).parameters
-    assert sig["flip_prob"].default is None and sig["min_scale"].default is None and sig["max_scale"].default is None
-    assert "aug" in sig and "train_transform" in sig
+    assert sig["aug"].default is None and AugConfig.resolve(None) == AugConfig()   # one source of the defaults
+    assert "train_transform" in sig and not {"flip_prob", "min_scale", "max_scale"} & set(sig)
 
 
 def test_keep_empty_keeps_negatives_as_zero_target_samples(tmp_path):
@@ -526,8 +526,9 @@ def test_collate_and_train_handle_negatives(tmp_path):
     # the real trainer: batch 2 over 2 positives + 6 negatives (so all-negative micro-batches occur), with the aux head
     from eomt.engine.train import train
 
-    res = train(train_images=str(img_dir), train_json=str(jf), size="s", imgsz=112, epochs=1, batch=2, accum=1, workers=0,
-                device="cpu", amp=False, pretrained=False, ema=False, seed=0, keep_empty=True, project=str(tmp_path / "runs"), name="neg")
+    res = train(train_images=str(img_dir), train_json=str(jf), size="s", imgsz=112, epochs=1, batch=2, nominal_batch=2,
+                workers=0, device="cpu", amp=False, pretrained=False, optim={"ema": False}, seed=0, keep_empty=True,
+                project=str(tmp_path / "runs"), name="neg")
     args = yaml.safe_load((tmp_path / "runs" / "neg" / "args.yaml").read_text())
     assert args["keep_empty"] is True and res["last"].endswith("last.pt")
     with pytest.raises(ValueError, match="keep_empty"):
@@ -600,14 +601,15 @@ def _tiny_train(tmp_path, **kw):
     from eomt.engine.train import train
 
     img_dir, jf = _mini_coco(tmp_path)
-    return train(train_images=str(img_dir), train_json=str(jf), size="s", imgsz=112, epochs=1, batch=1, accum=1, workers=0,
-                 device="cpu", amp=False, pretrained=False, ema=False, seed=0, project=str(tmp_path / "runs"), name="t", **kw)
+    return train(train_images=str(img_dir), train_json=str(jf), size="s", imgsz=112, epochs=1, batch=1, nominal_batch=1,
+                 workers=0, device="cpu", amp=False, pretrained=False, optim={"ema": False}, seed=0,
+                 project=str(tmp_path / "runs"), name="t", **kw)
 
 
 def test_train_records_the_resolved_augmentation_and_runs(tmp_path):
-    res = _tiny_train(tmp_path, aug={"rotate_prob": 0.9, "instance_crop_prob": 0.5, "preset": "default"}, min_scale=0.5)
+    res = _tiny_train(tmp_path, aug={"rotate_prob": 0.9, "instance_crop_prob": 0.5, "min_scale": 0.5})
     args = yaml.safe_load((tmp_path / "runs" / "t" / "args.yaml").read_text())
-    assert args["min_scale"] == 0.5 and args["aug"]["rotate_prob"] == 0.9 and args["aug"]["instance_crop_prob"] == 0.5
+    assert args["aug"]["rotate_prob"] == 0.9 and args["aug"]["instance_crop_prob"] == 0.5
     assert args["aug"]["min_scale"] == 0.5 and args["aug"]["mask_resize"] == "area"
     assert res["last"].endswith("last.pt")
 
@@ -625,38 +627,41 @@ def test_train_accepts_a_custom_train_transform(tmp_path):
     assert calls and args["aug"] == "custom train_transform"
 
 
-def test_eomt_train_merges_the_yaml_train_aug_block(monkeypatch, tmp_path):
+def test_eomt_train_merges_the_yaml_sections_under_the_keywords(monkeypatch, tmp_path):
     from eomt import EoMT
 
     img_dir, jf = _mini_coco(tmp_path)
     data = tmp_path / "data.yaml"
     data.write_text(yaml.safe_dump({
         "path": str(tmp_path), "train_images": "images", "train_json": jf.name,
-        "train_aug": {"rotate_prob": 0.9, "min_scale": 0.6, "preset": "legacy"},
+        "aug": {"rotate_prob": 0.9, "min_scale": 0.6}, "optim": {"lr0": 1e-5}, "train": {"epochs": 3, "batch": 2},
     }))
     seen = {}
-    monkeypatch.setattr("eomt.api._train", lambda **kw: seen.update(kw) or {"best": None, "last": None})
-    EoMT("s", device="cpu", pretrained=False).train(data=str(data), aug={"blur_prob": 0.5, "min_scale": 0.8}, flip_prob=0.0)
-    # code beats the YAML key by key; explicit keywords are forwarded untouched for train() to resolve last
-    assert seen["aug"] == {"rotate_prob": 0.9, "min_scale": 0.8, "preset": "legacy", "blur_prob": 0.5}
-    assert seen["flip_prob"] == 0.0
-    # a malformed block is rejected early
+    import sys
+
+    # the module, not the function the package re-exports under the same name
+    monkeypatch.setattr(sys.modules["eomt.engine.train"], "train", lambda **kw: seen.update(kw) or {"best": None, "last": None})
+    EoMT("s", device="cpu", pretrained=False).train(data=str(data), aug={"blur_prob": 0.5, "min_scale": 0.8}, epochs=1)
+    # a section given in code is merged over the YAML's key by key; a top-level keyword replaces the YAML's train value
+    assert seen["aug"] == {"rotate_prob": 0.9, "min_scale": 0.8, "blur_prob": 0.5} and seen["optim"] == {"lr0": 1e-5}
+    assert seen["epochs"] == 1 and seen["batch"] == 2
+    # a malformed section is rejected early
     bad = tmp_path / "bad.yaml"
-    bad.write_text(yaml.safe_dump({"path": str(tmp_path), "train_images": "images", "train_json": jf.name, "train_aug": [1, 2]}))
-    with pytest.raises(ValueError, match="train_aug"):
+    bad.write_text(yaml.safe_dump({"path": str(tmp_path), "train_images": "images", "train_json": jf.name, "aug": [1, 2]}))
+    with pytest.raises(ValueError, match="aug"):
         EoMT("s", device="cpu", pretrained=False).train(data=str(bad))
 
 
-def test_cli_aug_parsing():
+def test_cli_set_parsing():
     import importlib.util
     from pathlib import Path
 
     spec = importlib.util.spec_from_file_location("train_cli", Path(__file__).resolve().parents[1] / "scripts" / "train.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    out = mod._parse_aug(["rotate_prob=0.5", "blur_sigma=[0.3,1.0]", "erasing_avoid_instances=false", "instance_crop_rarity_attr=kind"], "legacy")
-    assert out == {"preset": "legacy", "rotate_prob": 0.5, "blur_sigma": [0.3, 1.0], "erasing_avoid_instances": False,
-                   "instance_crop_rarity_attr": "kind"}
-    assert mod._parse_aug([], None) is None
+    out = mod.parse_sets(["aug.rotate_prob=0.5", "aug.blur_sigma=[0.3,1.0]", "optim.mask_anneal=false", "epochs=3"])
+    assert out == {"aug": {"rotate_prob": 0.5, "blur_sigma": [0.3, 1.0]}, "optim": {"mask_anneal": False}, "epochs": 3}
     with pytest.raises(SystemExit):
-        mod._parse_aug(["oops"], None)
+        mod.parse_sets(["oops"])
+    with pytest.raises(SystemExit):
+        mod.parse_sets(["optimizer.lr0=1"])

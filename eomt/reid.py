@@ -188,7 +188,7 @@ def pairwise_matches(
     photo: torch.Tensor,
     keys: list[tuple[int, ...]],
     *,
-    sim_thres: float = 0.6,
+    sim_thres: float = 0.7,
 ) -> list[dict]:
     """Hungarian-match every pair of photos, one gate group at a time.
 
@@ -280,7 +280,7 @@ def cluster(
     photo: torch.Tensor,
     *,
     num_instances: int,
-    sim_thres: float = 0.6,
+    sim_thres: float = 0.7,
     guard: str = "mean",
     guard_factor: float = 1.0,
     gate: torch.Tensor | None = None,
@@ -502,14 +502,12 @@ def similarity_diagnostics(
     the JSON than to squint at the grid.
     """
     s = sim.detach().cpu().numpy()
-    g = gate.detach().cpu().numpy()
-    ident = identity.tolist()
-    within, across = [], []
-    for a in range(len(ident)):
-        for b in range(a + 1, len(ident)):
-            if not g[a, b]:
-                continue
-            (within if ident[a] == ident[b] else across).append(float(s[a, b]))
+    g = gate.detach().cpu().numpy().astype(bool)
+    ident = identity.detach().cpu().numpy()
+    a, b = np.triu_indices(len(ident), 1)  # every pair once, vectorised
+    keep = g[a, b] if len(ident) else np.zeros(0, dtype=bool)
+    vals, same = s[a, b][keep], (ident[a] == ident[b])[keep]
+    within, across = vals[same].tolist(), vals[~same].tolist()
 
     def stats(v):
         if not v:

@@ -31,6 +31,38 @@ from ..progress import progress
 from ..tta import TTAConfig, predict_views
 from .distributed import broadcast, gather, shard, shard_groups, sum_over_processes
 
+#: Seconds a validation data loader may wait for one batch before it raises (a stalled read, e.g. on a network share,
+#: then fails with a message instead of hanging every process until the distributed watchdog kills the run).
+LOADER_TIMEOUT = 900
+
+
+def _loader(ds, batch_size: int, num_workers: int, collate_fn) -> DataLoader:
+    return DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn,
+                      pin_memory=torch.cuda.is_available(), timeout=LOADER_TIMEOUT if num_workers > 0 else 0)
+
+
+def amp_dtype(device, amp: bool):
+    """The autocast dtype of an evaluation forward: bf16 where the GPU has it (as training and inference run), else
+    fp16; ``None`` (full precision) on the CPU or with ``amp=False``."""
+    if not amp or torch.device(device).type != "cuda":
+        return None
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def _autocast(device, amp: bool):
+    dtype = amp_dtype(device, amp)
+    return contextlib.nullcontext() if dtype is None else torch.autocast("cuda", dtype=dtype)
+
+
+def binarize_gt(masks: torch.Tensor) -> torch.Tensor:
+    """Soft (area-resized) GT masks ``(N, H, W)`` as boolean masks, each at half its own peak: a thin or tiny instance
+    whose resized mask never reaches 0.5 keeps its pixels (the rule of the loss's IoU and the attribute gate)."""
+    if not len(masks):
+        return masks.bool()
+    m = masks.float()
+    return m >= (0.5 * m.flatten(1).amax(1)).clamp(min=1e-6)[:, None, None]
+
+
 #: COCOeval.stats index -> metric name.
 _SEGM_KEYS = [
     "mAP",
@@ -240,21 +272,12 @@ def evaluate(
     """
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
-    use_amp = amp and device.type == "cuda"
     contig2cat = val_ds.contig2cat
     cfg = TTAConfig.resolve(augment, tiles)
     if cfg is not None and not getattr(val_ds, "raw", False):  # the views are cut from the original image
         val_ds = copy.copy(val_ds)
         val_ds.raw = True
-
-    loader = DataLoader(
-        shard(val_ds),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_val,
-        pin_memory=True,
-    )
+    loader = _loader(shard(val_ds), batch_size, num_workers, collate_val)
 
     segm_results: list[dict] = []
     bbox_results: list[dict] = []
@@ -273,13 +296,13 @@ def evaluate(
                 predict_views(
                     model, image, cfg, imgsz=val_ds.imgsz, conf_thres=conf_thres, max_det=max_det,
                     mask_thresh=mask_thresh, min_mask_area=min_mask_area, letterbox=val_ds.letterbox,
-                    mean=val_ds.mean, std=val_ds.std, amp_dtype=torch.float16 if use_amp else None,
+                    mean=val_ds.mean, std=val_ds.std, amp_dtype=amp_dtype(device, amp),
                 )
                 for image in pixel_values
             ]
         else:
-            pixel_values = pixel_values.to(device)
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            pixel_values = pixel_values.to(device, non_blocking=True)
+            with _autocast(device, amp):
                 out = model(pixel_values)
             mql = out["masks_queries_logits"]
             cql = out["class_queries_logits"]
@@ -303,13 +326,14 @@ def evaluate(
             ]
 
         for img_id, res in zip(image_ids, batch_results):
-            n = res["num_detections"]
+            # one copy to the host per image (not per detection)
+            classes, scores, boxes = res["classes"].tolist(), res["scores"].tolist(), res["boxes"].tolist()
+            masks = res["masks"].cpu().numpy()
             rles = []
-            for i in range(n):
-                cat_id = int(contig2cat[int(res["classes"][i])])
-                score = float(res["scores"][i])
-                mask_np = res["masks"][i].cpu().numpy()
-                rles.append(_encode_mask(mask_np))
+            for i in range(res["num_detections"]):
+                cat_id = int(contig2cat[int(classes[i])])
+                score = float(scores[i])
+                rles.append(_encode_mask(masks[i]))
                 segm_results.append(
                     {
                         "image_id": int(img_id),
@@ -319,7 +343,7 @@ def evaluate(
                     }
                 )
                 if also_bbox:
-                    x1, y1, x2, y2 = [float(v) for v in res["boxes"][i].tolist()]
+                    x1, y1, x2, y2 = [float(v) for v in boxes[i]]
                     bbox_results.append(
                         {
                             "image_id": int(img_id),
@@ -386,24 +410,15 @@ def evaluate_detection(
         raise NotImplementedError("augment / tiles support the instance family only.")
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
-    use_amp = amp and device.type == "cuda"
     contig2cat = val_ds.contig2cat
-
-    loader = DataLoader(
-        shard(val_ds),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_val,
-        pin_memory=True,
-    )
+    loader = _loader(shard(val_ds), batch_size, num_workers, collate_val)
 
     bbox_results: list[dict] = []
     for pixel_values, image_ids, sizes, metas in progress(
         loader, desc="val", unit="batch", leave=False, disable=not verbose
     ):
-        pixel_values = pixel_values.to(device)
-        with torch.amp.autocast("cuda", enabled=use_amp):
+        pixel_values = pixel_values.to(device, non_blocking=True)
+        with _autocast(device, amp):
             out = model(pixel_values)
         pb = out["pred_boxes"]
         cql = out["class_queries_logits"]
@@ -416,15 +431,15 @@ def evaluate_detection(
                 max_det=max_det,
                 preprocess_meta=meta,
             )
+            classes, scores, boxes = res["classes"].tolist(), res["scores"].tolist(), res["boxes"].tolist()
             for i in range(res["num_detections"]):
-                cat_id = int(contig2cat[int(res["classes"][i])])
-                x1, y1, x2, y2 = [float(v) for v in res["boxes"][i].tolist()]
+                x1, y1, x2, y2 = boxes[i]
                 bbox_results.append(
                     {
                         "image_id": int(img_id),
-                        "category_id": cat_id,
+                        "category_id": int(contig2cat[int(classes[i])]),
                         "bbox": [x1, y1, x2 - x1, y2 - y1],
-                        "score": float(res["scores"][i]),
+                        "score": float(scores[i]),
                     }
                 )
 
@@ -466,17 +481,8 @@ def sweep(
     """
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
-    use_amp = amp and device.type == "cuda"
     contig2cat = val_ds.contig2cat
-
-    loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_val,
-        pin_memory=True,
-    )
+    loader = _loader(val_ds, batch_size, num_workers, collate_val)
 
     # One result accumulator per grid point.
     segm_results: list[list[dict]] = [[] for _ in grid]
@@ -485,8 +491,8 @@ def sweep(
     for pixel_values, image_ids, sizes, metas in progress(
         loader, desc="sweep", unit="batch", leave=False, disable=not verbose
     ):
-        pixel_values = pixel_values.to(device)
-        with torch.amp.autocast("cuda", enabled=use_amp):
+        pixel_values = pixel_values.to(device, non_blocking=True)
+        with _autocast(device, amp):
             out = model(pixel_values)
         mql = out["masks_queries_logits"]
         cql = out["class_queries_logits"]
@@ -572,28 +578,20 @@ def aux_evaluate(
 
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
-    loader = DataLoader(
-        shard(val_seg_ds),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_train,
-        pin_memory=True,
-    )
+    loader = _loader(shard(val_seg_ds), batch_size, num_workers, collate_train)
     hits = {s.name: 0 for s in val_seg_ds.aux_specs}
     tot = {s.name: 0 for s in val_seg_ds.aux_specs}
     per_class: dict[str, dict[int, list[int]]] = {s.name: {} for s in val_seg_ds.aux_specs}
     reg: dict[str, tuple[list, list]] = {s.name: ([], []) for s in val_seg_ds.aux_specs if s.regression}
-    use_amp = amp and device.type == "cuda"
 
     for pixel_values, mask_labels, class_labels, aux_labels in progress(
         loader, desc="val-aux", unit="batch", leave=False, disable=not verbose
     ):
-        pixel_values = pixel_values.to(device)
+        pixel_values = pixel_values.to(device, non_blocking=True)
         mask_labels = [m.to(device) for m in mask_labels]
         class_labels = [c.to(device) for c in class_labels]
         aux_labels = {k: [t.to(device) for t in v] for k, v in aux_labels.items()}
-        with torch.amp.autocast("cuda", enabled=use_amp):
+        with _autocast(device, amp):
             out = model(pixel_values)
         indices = match_queries(model, out, mask_labels, class_labels)
         gated = gate_indices(
@@ -674,11 +672,10 @@ def _in_ignore(masks: torch.Tensor, ignore: torch.Tensor | None) -> torch.Tensor
     return (inside >= 0.5).cpu()
 
 
-#: The embeddings the links between the photos of a set are scored with (:func:`evaluate_sets`): ``match``, the
-#: matching head's in the joint forward (the per-query embedding for a model without one); ``reid_set``, the per-query
-#: embedding of the joint forward (re-identification's fingerprint, what ``predict_set(embed="reid")`` links on); and
-#: ``reid``, the per-query embedding of the photos predicted alone (re-ID without cross-view: the detections differ too).
-LINK_SOURCES = ("match", "reid_set", "reid")
+#: The embeddings the links between the photos of a set are scored with (:func:`evaluate_sets`): ``match``, the one
+#: inference links with (the matching head's, else the per-query embedding) in the forward of the set; and ``reid``, the
+#: per-query embedding of the photos predicted alone (the baseline: re-identification with no training for it).
+LINK_SOURCES = ("match", "reid")
 _MODES = ("alone", "set")
 _LINK_STATS = ("f1", "precision", "recall", "thres")
 
@@ -700,8 +697,9 @@ def _link_record(r: dict, embed: torch.Tensor, sel: torch.Tensor, d_ids: np.ndar
     CPU), instance ids (:func:`_det_ids`) and gate keys (the class and categorical attributes named by ``gate_keys``)."""
     q = r["query_idx"][sel.to(r["query_idx"].device)]
     emb = F.normalize(embed[q.to(embed.device)].float(), dim=-1).cpu()
-    keys = [tuple(int(r["classes"][i]) if k == "class" else int(r["aux"][k]["ids"][i]) for k in gate_keys)
-            for i in sel.tolist()]
+    classes = r["classes"].tolist()
+    aux_ids = {k: r["aux"][k]["ids"].tolist() for k in gate_keys if k != "class"}
+    keys = [tuple(classes[i] if k == "class" else aux_ids[k][i] for k in gate_keys) for i in sel.tolist()]
     return {"emb": emb, "ids": d_ids, "keys": keys}
 
 
@@ -731,37 +729,10 @@ def _record_links(records: list[dict], gated: bool) -> list[tuple[float, bool]]:
     return out
 
 
-def _count_agreement(seen: dict, counts: dict) -> None:
-    """Add to ``counts`` (``{head: [agreeing, pairs]}``) one set's views that agree on a linked instance: ``seen`` maps
-    each view to ``{instance id: {head: predicted id}}`` (the detection matched to that instance; -1, a class-scoped
-    head outside its classes, takes no part). Every two views showing one instance make a pair per head."""
-    views = sorted(seen)
-    for a, k1 in enumerate(views):
-        for k2 in views[a + 1:]:
-            for inst in seen[k1].keys() & seen[k2].keys():
-                for head, c in counts.items():
-                    p, q = seen[k1][inst][head], seen[k2][inst][head]
-                    if p >= 0 and q >= 0:
-                        c[0] += int(p == q)
-                        c[1] += 1
-
-
-def _set_links(results, embeds, gt_masks, gt_ids, conf: float, gate: float,
-               unsure: list[torch.Tensor] | None = None) -> list[tuple[float, bool]]:
-    """The links a set's photos get (ungated): the detections scoring at least ``conf`` of every two photos matched
-    by the Hungarian algorithm on the cosine similarity of ``embeds``, as ``(similarity, same instance)``; a detection is
-    an instance when its mask overlaps that instance's (IoU >= ``gate``, one to one). ``unsure[b]`` marks the detections
-    of photo ``b`` that may be an instance nobody annotated: unless they match an annotated instance, their links are
-    left out, as are those of the instances of unknown id."""
-    records = []
-    for b, (r, e, gm, gi) in enumerate(zip(results, embeds, gt_masks, gt_ids)):
-        sel = (r["scores"] >= conf).nonzero().flatten()
-        records.append(_link_record(r, e, sel, _det_ids(r, sel, gm, gi, gate, None if unsure is None else unsure[b]), ()))
-    return _record_links(records, gated=False)
-
-
-def _link_arrays(pairs) -> tuple[np.ndarray, np.ndarray]:
-    return (np.array([p[0] for p in pairs], dtype=np.float64), np.array([p[1] for p in pairs], dtype=bool))
+def _prf(tp: int, n: int, n_true: int) -> tuple[float, float, float]:
+    """Precision, recall and F1 of ``n`` kept links of which ``tp`` are right, ``n_true`` to find."""
+    p, r = (tp / n if n else 0.0), tp / n_true
+    return p, r, (2 * p * r / (p + r) if p + r else 0.0)
 
 
 def _link_f1(pairs: list[tuple[float, bool]], n_true: int) -> dict[str, float]:
@@ -770,12 +741,11 @@ def _link_f1(pairs: list[tuple[float, bool]], n_true: int) -> dict[str, float]:
     best = {"f1": 0.0, "precision": 0.0, "recall": 0.0, "thres": float("nan")}
     if not len(pairs) or not n_true:
         return best
-    sim, ok = _link_arrays(pairs)
+    sim = np.array([p[0] for p in pairs], dtype=np.float64)
+    ok = np.array([p[1] for p in pairs], dtype=bool)
     for t in np.linspace(-1.0, 1.0, 201):
         sel = sim >= t
-        tp, n = int((sel & ok).sum()), int(sel.sum())
-        p, r = (tp / n if n else 0.0), tp / n_true
-        f = 2 * p * r / (p + r) if p + r else 0.0
+        p, r, f = _prf(int((sel & ok).sum()), int(sel.sum()), n_true)
         if f > best["f1"]:
             best = {"f1": f, "precision": p, "recall": r, "thres": float(t)}
     return best
@@ -785,11 +755,10 @@ def _f1_at(pairs, n_true: int, thres) -> float:
     """F1 of the links kept at a given similarity threshold (NaN without a threshold or links to find)."""
     if thres is None or not math.isfinite(thres) or not n_true:
         return float("nan")
-    sim, ok = _link_arrays(pairs)
+    sim = np.array([p[0] for p in pairs], dtype=np.float64)
+    ok = np.array([p[1] for p in pairs], dtype=bool)
     sel = sim >= thres
-    tp, n = int((sel & ok).sum()), int(sel.sum())
-    p, r = (tp / n if n else 0.0), tp / n_true
-    return 2 * p * r / (p + r) if p + r else 0.0
+    return _prf(int((sel & ok).sum()), int(sel.sum()), n_true)[2]
 
 
 def _bcubed(identity: np.ndarray, ids: np.ndarray) -> tuple[float, float, int]:
@@ -837,18 +806,14 @@ def _coco_gt(images: list[dict], anns: list[dict], names: dict, ignore=None):
     return coco
 
 
-def set_metric_keys(prefix: str, specs, *, cases=(), all_views: bool = False, gated: bool = False,
-                    groups: dict | None = None) -> list[str]:
+def set_metric_keys(prefix: str, specs, *, gated: bool = False, groups: dict | None = None) -> list[str]:
     """The keys :func:`evaluate_sets` returns (the ``metrics.csv`` columns of a set validation, without ``val/``)."""
     keys = [f"segm/{k}_{m}" for k in ("mAP", "mAP50", "mAP_small", "AR100") for m in _MODES]
     keys += [f"segm/{k}_{sub}_{m}" for sub in ("linked", "unlinked") for k in ("mAP", "AR100") for m in _MODES]
-    keys += [f"{c}/mAP_{m}" for c in cases for m in _MODES]
     keys += [f"{n}_{m}" for s in specs for n in attr_metric_names(s) for m in _MODES]
     keys += [f"{src}{v}/{n}" for src in LINK_SOURCES for v in ("", "_gated")[: 1 + gated] for n in _LINK_STATS]
-    keys += [f"{src}/f1_stored" for src in LINK_SOURCES[:2]]
-    if all_views:
-        keys += [f"{src}/cluster_{n}" for src in LINK_SOURCES for n in ("f1", "precision", "recall")]
-        keys += [f"aux_agree/{s.name}_{m}" for s in specs if not s.regression for m in _MODES]
+    keys += ["match/f1_stored"]
+    keys += [f"{src}/cluster_{n}" for src in LINK_SOURCES for n in ("f1", "precision", "recall")]
     for field, values in (groups or {}).items():
         for v in values:
             keys += [f"{field}={v}/segm/mAP_{m}" for m in _MODES] + [f"{field}={v}/{src}/f1" for src in LINK_SOURCES]
@@ -857,8 +822,7 @@ def set_metric_keys(prefix: str, specs, *, cases=(), all_views: bool = False, ga
 
 def set_group_values(sets_ds, group_by) -> dict[str, list[str]]:
     """The values each ``group_by`` image field takes over the first photos of the sets of ``sets_ds``."""
-    first = sets_ds.first_photos() if hasattr(sets_ds, "first_photos") else list(sets_ds.ids)
-    return group_values(sets_ds.coco, first, group_by)
+    return group_values(sets_ds.coco, sets_ds.first_photos(), group_by)
 
 
 @torch.no_grad()
@@ -873,44 +837,37 @@ def evaluate_sets(
     link_conf: float = 0.3,
     iou_gate: float = 0.5,
     verbose: bool = True,
-    all_views: bool = False,
     prefix: str = "sets",
     link_group_by=None,
-    thres: dict | None = None,
+    thres: float | None = None,
     group_by: str | list[str] | None = None,
 ) -> dict[str, float]:
-    """Score a cross-view model on fixed sets of photos, each predicted alone and with its set.
+    """Score a model on fixed sets of photos of one subject (:class:`~eomt.data.subjects.CocoSubjectSets`, unaugmented),
+    each photo predicted alone and with its set.
 
-    Synthetic sets (:class:`~eomt.data.sets.CocoViewSets` with a ``seed``) have no real multi-photo annotations: they
-    measure what the sets were built to teach, not real viewpoints. With ``all_views`` (real sets,
-    :class:`~eomt.data.subjects.CocoSubjectSets`) every photo of a set is scored, not only the first, except those not
-    fully annotated (their extras' ``neg`` below 1), and the detections lying mostly in a photo's ignore region are
-    dropped first; a detection that is no annotated instance in a photo not fully annotated, or in an ignore region,
-    takes no part in the links (whether it is an instance is unknown). The keys start with ``prefix`` (e.g.
-    ``real/segm/mAP_set``; :func:`set_metric_keys` lists them):
+    Every fully annotated photo of a set is scored (those whose extras' ``neg`` is below 1 are not), and the detections
+    lying mostly in a photo's ignore region are dropped first; a detection that is no annotated instance in a photo not
+    fully annotated, or in an ignore region, takes no part in the links (whether it is an instance is unknown). The GT is
+    each photo's own masks at the input resolution (so the size buckets are those of the input size), binarized as the
+    loss does (:func:`binarize_gt`). The keys start with ``prefix`` (:func:`set_metric_keys` lists them):
 
-    * ``segm/<metric>_{alone,set}`` and, for synthetic sets, ``<case>/mAP_{alone,set}``: COCO segm of the scored views,
-      predicted alone and together with the rest of the set, over all sets and per case; the GT is the view's own masks
-      at the input resolution (so the size buckets are those of the input size).
+    * ``segm/<metric>_{alone,set}``: COCO segm of the scored photos, predicted alone and together with the rest of the
+      set. A model without cross-view sublayers predicts each photo alone either way.
     * ``segm/{mAP,AR100}_linked_{alone,set}``: the same restricted to the **linked** instances, those with a known id
       that another photo of the set shows (where the other photos can help), the others left out as crowd regions;
       ``_unlinked_`` the rest.
     * ``aux_acc/<head>_{alone,set}`` (``aux_mae`` and the others of :func:`attr_metric_names` for a regression head): the
-      scored views' attributes on their GT instances matched to a same-class detection (mask IoU >= ``iou_gate``).
+      scored photos' attributes on their GT instances matched to a same-class detection (mask IoU >= ``iou_gate``).
     * ``<source>/{f1,precision,recall,thres}`` for each of :data:`LINK_SOURCES`: the links between the photos of each set
       (Hungarian per photo pair, as at inference) of the detections scoring at least ``link_conf``, at the similarity
-      threshold of the best F1 (``thres``). With ``link_group_by`` (gate keys, as ``match(group_by=...)``: ``"class"``
-      and categorical heads) also ``<source>_gated/*``: the links only within each gate group.
-    * ``match/f1_stored``, ``reid_set/f1_stored``: F1 at the thresholds given in ``thres`` (``{source: threshold}``,
-      e.g. the checkpoint's stored ones) instead of the best one of this validation (an optimistic number); gated when
-      ``link_group_by`` is set, as the links are then made.
-    * With ``all_views``: ``<source>/cluster_{f1,precision,recall}``, the identities over each whole subject: the first
-      photo of every set (each predicted with its own set) linked with all the others of its subject and clustered as
-      ``predict_subject(identities=True)`` does, at the ``thres`` threshold (else this validation's best), scored
-      B-cubed (:func:`_bcubed`): a transitive error costs more than a pair.
-    * With ``all_views``: ``aux_agree/<head>_{alone,set}`` per categorical head, what ``consistency_w`` asks for: of
-      every two scored photos of a set whose detections are matched (as for ``aux_acc``) to one linked instance, the
-      share predicting the same value. No attribute label is needed.
+      threshold of the best F1 (``thres``). With ``link_group_by`` (gate keys: ``"class"`` and categorical heads) also
+      ``<source>_gated/*``: the links only within each gate group.
+    * ``match/f1_stored``: F1 at the given ``thres`` (e.g. the checkpoint's stored one) instead of the best one of this
+      validation (an optimistic number); gated when ``link_group_by`` is set, as the links are then made.
+    * ``<source>/cluster_{f1,precision,recall}``: the identities over each whole subject: the first photo of every set
+      (each predicted with its own set) linked with all the others of its subject and clustered as
+      ``predict_subject(identities=True)`` does, at ``thres`` (else this validation's best), scored B-cubed
+      (:func:`_bcubed`): a transitive error costs more than a pair.
     * ``group_by`` (image fields): ``<field>=<value>/segm/mAP_{alone,set}`` and ``<field>=<value>/<source>/f1`` (at the
       overall best threshold) per value of the field of each set's first photo.
     """
@@ -920,70 +877,63 @@ def evaluate_sets(
 
     device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
-    use_amp = amp and device.type == "cuda"
     size = sets_ds.imgsz
     specs = _check_attr_vocab(model, sets_ds)
     gate_keys = validate_group_by(link_group_by, getattr(model, "aux_specs", []))
     variants = (False, True) if gate_keys else (False,)
-    deployed = bool(gate_keys)  # the variant the stored thresholds, the clusters and the groups use
+    deployed = bool(gate_keys)  # the variant the stored threshold, the clusters and the groups use
     # a class-scoped head says -1 ("not applicable") outside its classes, as predict_set does: the gate groups of
     # the links are those of inference
     aux_scopes = {s.name: s.applies_to for s in getattr(model, "aux_specs", []) if s.applies_to is not None}
+    cross_view = getattr(getattr(model, "eomt", None), "xview", None) is not None
     fields = _fields(group_by)
-    subjects = all_views and hasattr(sets_ds, "subject_of_set")
     indexed = _Indexed(sets_ds)
-    mine = shard_groups(indexed, [sets_ds.subject_of_set(i) for i in range(len(sets_ds))]) if subjects else shard(indexed)
-    loader = DataLoader(mine, batch_size=1, shuffle=False, num_workers=num_workers, collate_fn=_only)
+    mine = shard_groups(indexed, [sets_ds.subject_of_set(i) for i in range(len(sets_ds))])
+    loader = DataLoader(mine, batch_size=1, shuffle=False, num_workers=num_workers, collate_fn=_only,
+                        timeout=LOADER_TIMEOUT if num_workers > 0 else 0)
     max_views = sets_ds.sets.max_views
-    images, anns, cases, img_group = [], [], {}, {}
+    images, anns, img_group = [], [], {}
     dets: dict[str, list] = {m: [] for m in _MODES}
     hits = {m: {s.name: 0 for s in specs if not s.regression} for m in _MODES}
     tot = {m: {s.name: 0 for s in specs if not s.regression} for m in _MODES}
     reg = {m: {s.name: ([], []) for s in specs if s.regression} for m in _MODES}
-    # per categorical head, [view pairs agreeing, view pairs] on the linked instances (all_views)
-    agree = {m: {s.name: [0, 0] for s in specs if not s.regression} for m in _MODES} if all_views else None
     links = {(src, g): [] for src in LINK_SOURCES for g in variants}  # (similarity, same instance, set's groups)
     n_true: dict = {}  # set's groups -> instances shown by two photos (the links to find)
     anchors: dict = {}  # subject -> {source: [record of the first photo of each of its sets]}
     for idx, item in progress(loader, desc="val-sets", unit="set", leave=False, disable=not verbose):
         views = item["views"]
         pv = torch.stack([v[0] for v in views]).to(device)
-        gt_masks = [v[1].to(device) > 0.5 for v in views]
+        gt_masks = [binarize_gt(v[1].to(device)) for v in views]
         gt_ids = [v[4] for v in views]
-        extras = item.get("extras") or [{} for _ in views]
-        view_types = item.get("view_types")
-        first = (item.get("photos") or [None])[0]
+        extras = item["extras"]
+        first = item["photos"][0]
         grp = tuple((f, _field_value(sets_ds.coco, first, f)) for f in fields)
         shown = [{i for i in ids.tolist() if i >= 0} for ids in gt_ids]  # linked instances only
-        pairs_true = sum(len(shown[a] & shown[b]) for a in range(len(views)) for b in range(a + 1, len(views)))
-        n_true[grp] = n_true.get(grp, 0) + pairs_true
-        # the scored views (the hard view; with all_views every fully annotated one), their GT
-        scored = [k for k in range(len(views)) if extras[k].get("neg", 1.0) >= 1.0] if all_views else [0]
-        gt_of, inst_of = {}, {}
-        for k in scored:
-            image_id = idx * max_views + k if all_views else idx
+        n_true[grp] = n_true.get(grp, 0) + sum(len(shown[a] & shown[b]) for a in range(len(views))
+                                               for b in range(a + 1, len(views)))
+        # the scored views (every fully annotated one) and their GT
+        gt_of = {}
+        for k in (k for k in range(len(views)) if extras[k].get("neg", 1.0) >= 1.0):
+            image_id = idx * max_views + k
             keep = gt_masks[k].flatten(1).any(1).cpu()
             others = set().union(*(shown[j] for j in range(len(views)) if j != k))
-            a_ids = inst_of[k] = gt_ids[k][keep]
+            a_ids = gt_ids[k][keep]
             gt_of[k] = (image_id, gt_masks[k][keep.to(device)], views[k][2][keep],
                         {n: t[keep] for n, t in views[k][3].items()})
             images.append({"id": image_id, "width": size, "height": size})
             img_group[image_id] = grp
-            if not all_views:
-                cases.setdefault(item["case"], []).append(image_id)
-            for g in range(len(a_ids)):
-                rle = _encode_mask(gt_of[k][1][g].cpu().numpy())
+            for g, rle in enumerate(_encode_mask(m) for m in gt_of[k][1].cpu().numpy()):
                 anns.append({"image_id": image_id, "category_id": int(gt_of[k][2][g]) + 1, "segmentation": rle,
                              "area": float(mask_utils.area(rle)), "bbox": [float(x) for x in mask_utils.toBbox(rle)],
                              "linked": int(a_ids[g]) >= 0 and int(a_ids[g]) in others})
         records = {src: [] for src in LINK_SOURCES}
+        out = None
         for m in _MODES:  # one forward at a time, each photo's masks dropped once used (validation memory)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                out = model(pv) if m == "alone" else model(pv, set_ids=torch.zeros(len(views), dtype=torch.long),
-                                                           view_types=view_types)
+            if out is None or cross_view:  # without cross-view sublayers a photo's prediction is the same in its set
+                with _autocast(device, amp):
+                    out = model(pv) if m == "alone" else model(pv, set_ids=torch.zeros(len(views), dtype=torch.long))
             embeds = ({"reid": out["query_embed"]} if m == "alone"
-                      else {"match": out.get("match_embed", out["query_embed"]), "reid_set": out["query_embed"]})
-            seen: dict = {}  # view -> {linked instance: {head: predicted id}}
+                      else {"match": out.get("match_embed", out["query_embed"])})
             for k in range(len(views)):
                 r = postprocess_instance(slice_batch(out, k), 0.0, (size, size), max_det=max_det, aux_scopes=aux_scopes)
                 # the detections that may be an instance nobody annotated: all of a photo not fully annotated, else
@@ -992,78 +942,70 @@ def evaluate_sets(
                           else _in_ignore(r["masks"], extras[k].get("ignore")))
                 if k in gt_of:
                     image_id, a_masks, a_cls, a_attrs = gt_of[k]
+                    classes, scores = r["classes"].tolist(), r["scores"].tolist()
+                    masks = r["masks"].cpu().numpy()
                     for i in (~unsure).nonzero().flatten().tolist():  # detections in an ignore region do not count
-                        dets[m].append({"image_id": image_id, "category_id": int(r["classes"][i]) + 1,
-                                        "score": float(r["scores"][i]),
-                                        "segmentation": _encode_mask(r["masks"][i].cpu().numpy())})
+                        dets[m].append({"image_id": image_id, "category_id": classes[i] + 1, "score": scores[i],
+                                        "segmentation": _encode_mask(masks[i])})
                     iou = _mask_iou(r["masks"], a_masks)
-                    iou[r["classes"].cpu().numpy()[:, None] != a_cls.numpy()[None]] = 0.0
+                    iou[np.array(classes)[:, None] != a_cls.numpy()[None]] = 0.0
+                    aux_ids = {s.name: r["aux"][s.name]["ids"].tolist() for s in specs if not s.regression}
+                    aux_vals = {s.name: r["aux_values"][s.name].tolist() for s in specs if s.regression}
                     for d, g in _greedy_pairs(iou, iou_gate):
-                        if agree is not None and int(inst_of[k][g]) >= 0:
-                            seen.setdefault(k, {})[int(inst_of[k][g])] = {
-                                h: int(r["aux"][h]["ids"][d]) for h in agree[m]}
                         for s in specs:
                             label = a_attrs[s.name][g]
                             if s.regression and not torch.isnan(label):
-                                reg[m][s.name][0].append(float(r["aux_values"][s.name][d]))
+                                reg[m][s.name][0].append(float(aux_vals[s.name][d]))
                                 reg[m][s.name][1].append(float(label))
                             elif not s.regression and int(label) != -100:
-                                hits[m][s.name] += int(r["aux"][s.name]["ids"][d]) == int(label)
+                                hits[m][s.name] += aux_ids[s.name][d] == int(label)
                                 tot[m][s.name] += 1
                 sel = (r["scores"] >= link_conf).nonzero().flatten()
                 d_ids = _det_ids(r, sel, gt_masks[k], gt_ids[k], iou_gate, unsure)
                 for src, e in embeds.items():
                     records[src].append(_link_record(r, e[k], sel, d_ids, gate_keys))
                 del r
-            del out, embeds
-            if agree is not None:
-                _count_agreement(seen, agree[m])
+            del embeds
+        del out
         for src, recs in records.items():
             for g in variants:
                 links[(src, g)] += [(sim, ok, grp) for sim, ok in _record_links(recs, g)]
-            if subjects:
-                anchors.setdefault(sets_ds.subject_of_set(idx), {}).setdefault(src, []).append(recs[0])
+            anchors.setdefault(sets_ds.subject_of_set(idx), {}).setdefault(src, []).append(recs[0])
 
-    parts = gather((images, anns, cases, dets, hits, tot, reg, links, n_true, img_group, agree))
+    parts = gather((images, anns, dets, hits, tot, reg, links, n_true, img_group))
     metrics: dict[str, float] = {}
     cluster_thres = None
     if parts is not None:  # the main process scores the sets of all
-        # every case the sets can draw has its keys, NaN when none of these sets drew it
-        drawable = [] if all_views else (list(sets_ds.sets.cases) + (["locate"] if sets_ds.sets.p_focus > 0 else [])
-                                         or ["single"])
-        metrics, cluster_thres = _score_sets(model, sets_ds, parts, specs, prefix, variants, deployed, thres, fields,
-                                             drawable)
-    if subjects:  # every process clusters its own subjects, at the main process's thresholds
-        cluster_thres = broadcast(cluster_thres)
-        counts = {src: [0.0, 0.0, 0] for src in LINK_SOURCES}
-        for by_src in anchors.values():
-            for src, recs in by_src.items():
-                p, r, n = _cluster_counts(recs, cluster_thres[src], deployed)
-                counts[src] = [counts[src][0] + p, counts[src][1] + r, counts[src][2] + n]
-        counts = sum_over_processes(counts)
-        if counts is not None:
-            for src, (p_sum, r_sum, n) in counts.items():
-                p, r = (p_sum / n, r_sum / n) if n else (math.nan, math.nan)
-                f = 2 * p * r / (p + r) if n and p + r else (math.nan if not n else 0.0)
-                metrics.update({f"{prefix}/{src}/cluster_f1": f, f"{prefix}/{src}/cluster_precision": p,
-                                f"{prefix}/{src}/cluster_recall": r})
+        metrics, cluster_thres = _score_sets(sets_ds, parts, specs, prefix, variants, deployed, thres, fields)
+    cluster_thres = broadcast(cluster_thres)  # every process clusters its own subjects, at the main process's thresholds
+    counts = {src: [0.0, 0.0, 0] for src in LINK_SOURCES}
+    for by_src in anchors.values():
+        for src, recs in by_src.items():
+            p, r, n = _cluster_counts(recs, cluster_thres[src], deployed)
+            counts[src] = [counts[src][0] + p, counts[src][1] + r, counts[src][2] + n]
+    counts = sum_over_processes(counts)
+    if counts is not None:
+        for src, (p_sum, r_sum, n) in counts.items():
+            p, r = (p_sum / n, r_sum / n) if n else (math.nan, math.nan)
+            f = 2 * p * r / (p + r) if n and p + r else (math.nan if not n else 0.0)
+            metrics.update({f"{prefix}/{src}/cluster_f1": f, f"{prefix}/{src}/cluster_precision": p,
+                            f"{prefix}/{src}/cluster_recall": r})
     return metrics if parts is not None else {}
 
 
-def _score_sets(model, sets_ds, parts, specs, prefix, variants, deployed, thres, fields, drawable=()):
+def _score_sets(sets_ds, parts, specs, prefix, variants, deployed, thres, fields):
     """The metrics of :func:`evaluate_sets` from the gathered results of every process, and the thresholds the subjects
-    are clustered at (the given ``thres``, else this validation's best)."""
+    are clustered at (the given ``thres`` for ``match``, else this validation's best)."""
     images = [x for p in parts for x in p[0]]
     anns = [x for p in parts for x in p[1]]
-    cases = {c: [i for p in parts for i in p[2].get(c, [])] for c in {c for p in parts for c in p[2]} | set(drawable)}
-    dets = {m: [x for p in parts for x in p[3][m]] for m in _MODES}
-    links = {key: [x for p in parts for x in p[7][key]] for key in parts[0][7]}
+    dets = {m: [x for p in parts for x in p[2][m]] for m in _MODES}
+    links = {key: [x for p in parts for x in p[6][key]] for key in parts[0][6]}
     n_true: dict = {}
     for p in parts:
-        for grp, n in p[8].items():
+        for grp, n in p[7].items():
             n_true[grp] = n_true.get(grp, 0) + n
     n_all = sum(n_true.values())
-    group_of = {im_id: grp for p in parts for im_id, grp in p[9].items()}
+    group_of = {im_id: grp for p in parts for im_id, grp in p[8].items()}
     ids = [i["id"] for i in images]
     names = sets_ds.names if isinstance(sets_ds.names, dict) else dict(enumerate(sets_ds.names))
     coco = _coco_gt(images, anns, names)
@@ -1078,30 +1020,21 @@ def _score_sets(model, sets_ds, parts, specs, prefix, variants, deployed, thres,
             ev = _cocoeval(sub_coco, [dict(d) for d in dets[m]], ids, "segm", False)
             metrics.update({f"{prefix}/segm/{k}_{sub}_{m}": ev[f"segm/{k}"] if ev[f"segm/{k}"] >= 0 else math.nan
                             for k in ("mAP", "AR100")})
-        for case, case_ids in sorted(cases.items()):
-            wanted = set(case_ids)
-            case_dets = [dict(d) for d in dets[m] if d["image_id"] in wanted]
-            metrics[f"{prefix}/{case}/mAP_{m}"] = (_cocoeval(coco, case_dets, case_ids, "segm", False)["segm/mAP"]
-                                                   if case_ids else math.nan)
         for s in specs:
             if s.regression:
-                got = regression_metrics(s, [x for p in parts for x in p[6][m][s.name][0]],
-                                         [x for p in parts for x in p[6][m][s.name][1]])
+                got = regression_metrics(s, [x for p in parts for x in p[5][m][s.name][0]],
+                                         [x for p in parts for x in p[5][m][s.name][1]])
                 metrics.update({f"{prefix}/{k}_{m}": v for k, v in got.items()})
             else:
-                hit, tot = sum(p[4][m][s.name] for p in parts), sum(p[5][m][s.name] for p in parts)
+                hit, tot = sum(p[3][m][s.name] for p in parts), sum(p[4][m][s.name] for p in parts)
                 metrics[f"{prefix}/aux_acc/{s.name}_{m}"] = hit / tot if tot else float("nan")
-        for head in (parts[0][10] or {}).get(m, {}):
-            same, pairs = (sum(p[10][m][head][i] for p in parts) for i in (0, 1))
-            metrics[f"{prefix}/aux_agree/{head}_{m}"] = same / pairs if pairs else math.nan
     best = {}
     for (src, gated), pairs in links.items():
         res = _link_f1(pairs, n_all)
         metrics.update({f"{prefix}/{src}{'_gated' if gated else ''}/{n}": v for n, v in res.items()})
         if gated == deployed:
             best[src] = res["thres"]
-    for src in LINK_SOURCES[:2]:
-        metrics[f"{prefix}/{src}/f1_stored"] = _f1_at(links[(src, deployed)], n_all, (thres or {}).get(src))
+    metrics[f"{prefix}/match/f1_stored"] = _f1_at(links[("match", deployed)], n_all, thres)
     for f in fields:  # per value of each field of the sets' first photos
         for v in sorted({dict(g).get(f) for g in n_true} - {None}):
             in_group = lambda g: dict(g).get(f) == v  # noqa: E731
@@ -1114,7 +1047,6 @@ def _score_sets(model, sets_ds, parts, specs, prefix, variants, deployed, thres,
             for src in LINK_SOURCES:
                 pairs = [x for x in links[(src, deployed)] if in_group(x[2])]
                 metrics[f"{prefix}/{f}={v}/{src}/f1"] = _f1_at(pairs, n, best[src])
-    stored = {src: (thres or {}).get(src) for src in LINK_SOURCES}
-    cluster_thres = {src: stored[src] if stored[src] is not None and math.isfinite(stored[src]) else best[src]
-                     for src in LINK_SOURCES}
+    stored = thres if thres is not None and math.isfinite(thres) else None
+    cluster_thres = {"match": stored if stored is not None else best["match"], "reid": best["reid"]}
     return metrics, cluster_thres

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F  # noqa: N812
-from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 
 
@@ -102,44 +101,23 @@ class DetectionHungarianMatcher(nn.Module):
         box_labels: list[Tensor],
         class_labels: list[Tensor],
     ) -> list[tuple[Tensor, Tensor]]:
-        indices: list = []
-        batch_size = pred_boxes.shape[0]
-        for i in range(batch_size):
-            # Cost math in fp32: cdist/GIoU are not implemented for fp16 on CUDA, and
-            # the matcher is called both inside autocast (training) and outside it
-            # (eval/aux), where the tensors stay half.
+        from .loss import solve_assignments
+
+        costs = []
+        for i in range(pred_boxes.shape[0]):
+            # Cost math in fp32: cdist/GIoU are not implemented for fp16 on CUDA, and the matcher is called both inside
+            # autocast (training) and outside it (eval/aux), where the tensors stay half.
             tgt_boxes = box_labels[i].to(device=pred_boxes.device, dtype=torch.float32)
-            tgt_cls = class_labels[i]
-            if tgt_boxes.numel() == 0:
-                indices.append(
-                    (
-                        torch.as_tensor([], dtype=torch.int64),
-                        torch.as_tensor([], dtype=torch.int64),
-                    )
-                )
-                continue
             pred_probs = class_queries_logits[i].float().softmax(-1)  # [Q, C+1]
             out_boxes = pred_boxes[i].float()  # [Q, 4]
-
-            cost_class = -pred_probs[:, tgt_cls]  # [Q, num_tgt]
+            if tgt_boxes.numel() == 0:
+                costs.append(out_boxes.new_zeros((out_boxes.shape[0], 0)))
+                continue
+            cost_class = -pred_probs[:, class_labels[i]]  # [Q, num_tgt]
             cost_bbox = torch.cdist(out_boxes, tgt_boxes, p=1)  # [Q, num_tgt]
-            cost_giou = -generalized_box_iou(
-                box_cxcywh_to_xyxy(out_boxes), box_cxcywh_to_xyxy(tgt_boxes)
-            )
-            cost_matrix = (
-                self.cost_bbox * cost_bbox
-                + self.cost_class * cost_class
-                + self.cost_giou * cost_giou
-            )
-            cost_matrix = torch.minimum(cost_matrix, torch.tensor(1e10))
-            cost_matrix = torch.maximum(cost_matrix, torch.tensor(-1e10))
-            cost_matrix = torch.nan_to_num(cost_matrix, 0)
-            indices.append(linear_sum_assignment(cost_matrix.cpu()))
-
-        return [
-            (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-            for i, j in indices
-        ]
+            cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_boxes), box_cxcywh_to_xyxy(tgt_boxes))
+            costs.append(self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou)
+        return solve_assignments(costs)
 
 
 class DetectionLoss(nn.Module):
@@ -147,15 +125,13 @@ class DetectionLoss(nn.Module):
 
     ``weight_dict`` carries ``{"loss_cross_entropy", "loss_bbox", "loss_giou"}``; the
     matcher reuses ``class_weight`` (from the config) and the L1/GIoU weights from
-    ``weight_dict``. ``forward`` returns the three *unweighted* loss terms — the caller
+    ``weight_dict``. ``forward`` returns the three *unweighted* loss terms and the matching — the caller
     (``EoMTEncoder.get_loss_dict``) applies ``weight_dict``, exactly as for the mask loss.
     """
 
     def __init__(self, config, weight_dict: dict[str, float]):
         super().__init__()
         self.num_labels = config.num_labels
-        self.weight_dict = weight_dict
-
         self.eos_coef = config.no_object_weight
         empty_weight = torch.ones(self.num_labels + 1)
         empty_weight[-1] = self.eos_coef
@@ -190,7 +166,7 @@ class DetectionLoss(nn.Module):
 
     def loss_boxes(self, pred_boxes, box_labels, indices, num_boxes) -> dict[str, Tensor]:
         idx = self._get_predictions_permutation_indices(indices)
-        src_boxes = pred_boxes[idx]  # [N, 4] cxcywh
+        src_boxes = pred_boxes[idx].float()  # [N, 4] cxcywh, fp32 under autocast too
         tgt_boxes = torch.cat(
             [t[j] for t, (_, j) in zip(box_labels, indices)]
         ).to(src_boxes)  # [N, 4] cxcywh
@@ -215,12 +191,11 @@ class DetectionLoss(nn.Module):
         class_queries_logits: Tensor,
         mask_labels: list[Tensor],  # actually box_labels (cxcywh) for the detect family
         class_labels: list[Tensor],
-        auxiliary_predictions=None,
-    ) -> dict[str, Tensor]:
+    ) -> tuple[dict[str, Tensor], list]:
         pred_boxes, box_labels = masks_queries_logits, mask_labels
         indices = self.matcher(pred_boxes, class_queries_logits, box_labels, class_labels)
         num_boxes = self.get_num_boxes(class_labels, device=class_queries_logits.device)
         return {
             **self.loss_boxes(pred_boxes, box_labels, indices, num_boxes),
             **self.loss_labels(class_queries_logits, class_labels, indices),
-        }
+        }, indices

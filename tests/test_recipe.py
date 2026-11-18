@@ -11,9 +11,7 @@ from eomt import build_model
 from eomt.engine.train import (
     EOMT_MASK_ANNEAL_END,
     EOMT_MASK_ANNEAL_START,
-    _attn_mask_prob,
     _attn_mask_probs,
-    _per_block,
     _poly_two_stage_factors,
     build_optimizer,
 )
@@ -93,38 +91,33 @@ def test_two_stage_warmup_then_polynomial_decay():
 
 def test_mask_annealing_is_staggered_per_block_and_polynomial():
     total = 60_000
-    probs = lambda frac: _attn_mask_probs(int(frac * total), total, EOMT_MASK_ANNEAL_START, EOMT_MASK_ANNEAL_END, 0.9)  # noqa: E731
+    probs = lambda frac: _attn_mask_probs(int(frac * total), total, 0.9)  # noqa: E731
     assert probs(0.0) == [1.0] * 4 and probs(0.10) == [1.0] * 4
     p = probs(0.25)                       # halfway through block 0's window (1/6 .. 2/6), later blocks untouched
     assert p[0] == pytest.approx(0.5 ** 0.9) and p[1:] == [1.0, 1.0, 1.0]
     assert probs(0.5) == [0.0, 0.0, 1.0, 1.0]                      # blocks anneal one after the other
     assert probs(0.8)[:3] == [0.0, 0.0, 0.0] and 0 < probs(0.8)[3] < 1
     assert probs(5 / 6) == [0.0] * 4 and probs(0.95) == [0.0] * 4  # the last sixth is mask-free
-    for a, b in zip(EOMT_MASK_ANNEAL_START, EOMT_MASK_ANNEAL_END):
-        seq = [_attn_mask_prob(i, total, a, b, 0.9) for i in range(0, total, 97)]
+    seqs = list(zip(*[_attn_mask_probs(i, total, 0.9) for i in range(0, total, 97)]))
+    assert len(seqs) == len(EOMT_MASK_ANNEAL_START) == len(EOMT_MASK_ANNEAL_END)
+    for seq in seqs:
         assert all(x >= y for x, y in zip(seq, seq[1:]))
-
-
-def test_per_block_values_must_match_the_number_of_query_blocks():
-    assert _per_block((0.1, 0.2, 0.3, 0.4), 4, "x") == [0.1, 0.2, 0.3, 0.4]
-    with pytest.raises(ValueError, match="one per query block"):
-        _per_block((0.1, 0.2), 4, "mask_anneal_start")
 
 
 def test_train_applies_the_recipe_to_the_optimizer(tmp_path):
     from eomt.engine.train import train
 
     img_dir, jf = _mini_coco(tmp_path)
-    kw = dict(train_images=str(img_dir), train_json=str(jf), size="s", imgsz=112, epochs=1, batch=1, accum=1, workers=0,
-              device="cpu", amp=False, pretrained=False, ema=False, seed=0, project=str(tmp_path / "runs"))
-    res = train(name="r", warmup_steps=(1, 1), **kw)
+    kw = dict(train_images=str(img_dir), train_json=str(jf), size="s", imgsz=112, epochs=1, batch=1, nominal_batch=1,
+              workers=0, device="cpu", amp=False, pretrained=False, seed=0, project=str(tmp_path / "runs"))
+    res = train(name="r", optim={"ema": False, "warmup_steps": (1, 1)}, **kw)
     args = yaml.safe_load((tmp_path / "runs" / "r" / "args.yaml").read_text())
-    assert args["llrd"] == 0.8 and args["backbone_lr_mult"] == 1.0 and args["poly_power"] == 0.9
-    assert args["warmup_steps"] == [1, 1] and len(args["mask_anneal_start"]) == len(args["mask_anneal_end"]) == 4
-    assert not {"warmup_epochs", "min_lr_ratio", "freeze_backbone_epochs", "lr_schedule"} & set(args)
+    o = args["optim"]
+    assert o["llrd"] == 0.8 and o["backbone_lr_mult"] == 1.0 and o["poly_power"] == 0.9
+    assert o["warmup_steps"] == [1, 1] and o["mask_anneal"] is True
     # 4 images, batch 1: the last micro-step is it = 3 of 4 optimizer steps
     head_f, vit_f = _poly_two_stage_factors(3, 4, (1, 1), 0.9)
-    ck = torch.load(res["last"], weights_only=False)
+    ck = torch.load(res["last"], weights_only=True)
     groups = ck["optimizer"]["param_groups"]
     assert any(not g["is_backbone"] for g in groups) and any(g["is_backbone"] for g in groups)
     for g in groups:
@@ -134,8 +127,10 @@ def test_train_applies_the_recipe_to_the_optimizer(tmp_path):
     assert max(g["initial_lr"] for g in groups) == pytest.approx(LR)
     top_backbone = max(g["initial_lr"] for g in groups if g["is_backbone"])
     assert top_backbone == pytest.approx(LR)                        # the top ViT block learns at the head's LR
-    with pytest.raises(ValueError, match="one per query block"):
-        train(name="bad", mask_anneal_start=(0.1, 0.2), **kw)
+    with pytest.raises(ValueError, match="warmup_steps"):
+        train(name="bad", optim={"warmup_steps": (1,)}, **kw)
+    with pytest.raises(ValueError, match="unknown keys"):
+        train(name="bad", optim={"lr": 1e-4}, **kw)
 
 
 def test_validation_follows_the_annealing_and_best_waits_until_mask_free(tmp_path, monkeypatch):
@@ -147,14 +142,14 @@ def test_validation_follows_the_annealing_and_best_waits_until_mask_free(tmp_pat
 
     seen = []
     monkeypatch.setattr(sys.modules["eomt.engine.train"], "evaluate",  # the package re-exports train() under that name
-                        lambda model, *a, **k: seen.append(model.eomt.attn_mask_probs.tolist()) or {"segm/mAP": 0.5})
+                        lambda model, *a, **k: seen.append(list(model.eomt.mask_probs)) or {"segm/mAP": 0.5})
     img_dir, jf = _mini_coco(tmp_path)
     kw = dict(train_images=str(img_dir), train_json=str(jf), val_images=str(img_dir), val_json=str(jf), size="s", imgsz=112,
-              epochs=2, val_interval=1, batch=1, accum=1, workers=0, device="cpu", amp=False, pretrained=False, ema=True,
-              seed=0, project=str(tmp_path / "runs"), name="v", warmup_steps=(1, 1))
+              epochs=2, val={"interval": 1}, batch=1, nominal_batch=1, workers=0, device="cpu", amp=False,
+              pretrained=False, optim={"warmup_steps": (1, 1)}, seed=0, project=str(tmp_path / "runs"), name="v")
     res = train(stop_after_epochs=1, **kw)
     assert seen == [[0.0, 0.0, 1.0, 1.0]] and res["best"] is None    # half-way: the last two blocks still mask
-    ck = torch.load(res["last"], weights_only=False)
-    assert not ck["model"]["eomt.attn_mask_probs"].any() and not ck["ema"]["module"]["eomt.attn_mask_probs"].any()
+    ck = torch.load(res["last"], weights_only=True)
+    assert "eomt.attn_mask_probs" not in ck["model"]   # no buffer: checkpoints are mask-free by construction
     res = train(resume=res["last"], **kw)
     assert seen[-1] == [0.0] * 4 and res["best"] is not None

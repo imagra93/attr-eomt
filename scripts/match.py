@@ -1,14 +1,12 @@
 #!/usr/bin/env python
-"""Re-identify instances across a set of photos of the same subject.
+"""Link the instances of the photos of one subject: which detections are the same physical instance.
 
-Each source folder is ONE subject photographed from several viewpoints; the script
-decides which detections across those photos are the same physical instance and writes
-an annotated grid plus a JSON summary.
+    python scripts/match.py runs/train/multiview photos/subject_42/      # one subject
+    python scripts/match.py runs/train/multiview photos/ --each-subdir   # one subject per subfolder
 
-    python scripts/match.py weights/best.pt photos/subject_42/
-    python scripts/match.py weights/best.pt photos/ --each-subdir
-    python scripts/match.py weights/best.pt photos/subject_42/ --group-by class,position
-    python scripts/match.py weights/best.pt photos/subject_42/ --no-group-by --sim-thres 0.9
+The links use the model's matching head when it has one (a ``multiview`` post-training with ``matching``), else the
+per-query embedding (re-identification), at its calibrated threshold and gate; ``--sim-thres`` and ``--group-by``
+override them. Writes a grid of the photos colored by identity and a JSON summary per subject.
 """
 
 from __future__ import annotations
@@ -23,63 +21,24 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("weights", help="Checkpoint .pt or a run/weights folder.")
     p.add_argument("source", help="Folder of photos of one subject (or a parent, with --each-subdir).")
-    p.add_argument("--out", default="runs/match", help="Output directory.")
-    p.add_argument("--conf", type=float, default=0.3, help="Detection confidence threshold.")
-    p.add_argument("--max-det", type=int, default=30, help="Max detections per photo.")
-    p.add_argument("--sim-thres", type=float, default=None,
-                   help="Cosine-similarity floor for 'same instance' (default: a cross-view model's calibrated "
-                        "threshold, else 0.7).")
+    p.add_argument("--each-subdir", action="store_true", help="Every subfolder of source is one subject.")
+    p.add_argument("--out", default="runs/match", help="Output folder.")
+    p.add_argument("--conf", type=float, default=None, help="Confidence threshold (default: the checkpoint's).")
+    p.add_argument("--sim-thres", type=float, default=None, help="Cosine floor of a link (default: the calibrated one).")
     p.add_argument("--group-by", default="auto",
-                   help="Comma-separated gate keys, e.g. class,position (default: none for a model with a "
-                        "matching head, else class).")
-    p.add_argument("--per-photo", action="store_true",
-                   help="One forward per photo even for a cross-view model (default: one joint forward).")
-    p.add_argument("--embed", default=None, choices=("match", "reid"),
-                   help="Joint forward: link on the matching head's embedding or the per-query one (default: the one "
-                        "that linked best at the model's last validation).")
-    p.add_argument("--no-group-by", action="store_true",
-                   help="Disable gating entirely (use a higher --sim-thres).")
-    p.add_argument("--guard", default="mean", choices=("mean", "min", "off"),
-                   help="Merge guard against transitive chaining.")
-    p.add_argument("--guard-factor", type=float, default=1.0)
-    p.add_argument("--center", action="store_true",
-                   help="Mean-center embeddings before normalizing (transductive).")
-    p.add_argument("--links", default="chain", choices=("chain", "all", "none"),
-                   help="Connector lines between matched instances.")
-    p.add_argument("--legend-attr", default=None,
-                   help="Attribute head shown beside the class in the legend "
-                        "(default: each identity's first attribute).")
-    p.add_argument("--panel-size", type=int, default=480)
-    p.add_argument("--each-subdir", action="store_true",
-                   help="Treat every immediate subfolder of SOURCE as its own subject.")
-    p.add_argument("--no-plot", action="store_true")
+                   help="Gate keys, comma-separated ('class' and attribute heads; 'none': no gate; default: calibrated).")
+    p.add_argument("--links", default="chain", choices=("chain", "all", "none"), help="Connectors drawn in the grid.")
+    p.add_argument("--no-plot", action="store_true", help="Only the JSON summary.")
     p.add_argument("--device", default="auto")
     args = p.parse_args()
-
-    group_by = None if args.no_group_by else "auto" if args.group_by == "auto" else tuple(
-        k.strip() for k in args.group_by.split(",") if k.strip()
-    )
-    root = Path(args.source)
-    if not root.exists():
-        raise SystemExit(f"[match] no such source: {root}")
-    if args.each_subdir and not root.is_dir():
-        raise SystemExit(f"[match] --each-subdir needs a parent folder, got a file: {root}")
-    sources = sorted(d for d in root.iterdir() if d.is_dir()) if args.each_subdir else [root]
-    if not sources:
-        raise SystemExit(f"[match] no subdirectories under {root}")
-
+    gate = args.group_by
+    gate = "auto" if gate == "auto" else None if gate.lower() in ("", "none", "off") else tuple(gate.split(","))
     model = EoMT(args.weights, device=args.device)
-    total = 0
-    for src in sources:
-        result = model.infer_match(
-            src, plot=not args.no_plot, save=args.out, conf_thres=args.conf,
-            max_det=args.max_det, group_by=group_by, sim_thres=args.sim_thres,
-            guard=args.guard, guard_factor=args.guard_factor, center=args.center,
-            link_mode=args.links, panel_size=args.panel_size,
-            legend_attr=args.legend_attr, joint=False if args.per_photo else None, embed=args.embed,
-        )
-        total += result["num_identities"]
-    print(f"[done] {total} identities across {len(sources)} subject(s) -> {args.out}")
+    src = Path(args.source)
+    subjects = sorted(d for d in src.iterdir() if d.is_dir()) if args.each_subdir else [src]
+    for folder in subjects:
+        model.match(folder, plot=not args.no_plot, save=args.out, conf_thres=args.conf, sim_thres=args.sim_thres,
+                    group_by=gate, link_mode=args.links)
 
 
 if __name__ == "__main__":

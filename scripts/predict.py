@@ -1,16 +1,11 @@
 #!/usr/bin/env python
-"""Predict and plot segmentation (+ any secondary attributes) on some images.
+"""Predict images with a trained EoMT model and render them.
 
-    python scripts/predict.py runs/train/eomt-l                       # uses scripts/sample_images
-    python scripts/predict.py runs/train/eomt-l/weights/best.pt path/to/images --conf 0.3
-    python scripts/predict.py runs/train/eomt-l big_images/ --tiles --augment   # tiles + the image at 1x and 1.5x
-    python scripts/predict.py runs/train/multiview photos/ --subject            # the photos of a subject together
+    python scripts/predict.py runs/train/eomt-l images/                  # every image of the folder, batched
+    python scripts/predict.py runs/train/eomt-l photo.jpg --tiles        # native-resolution tiles + the whole image
+    python scripts/predict.py runs/train/multiview photos/ --subject     # the photos of each subject together
 
-Annotated images are written to runs/predict/; each detection is labelled with its
-class and, for models with auxiliary heads, each attribute and its confidence.
-
---subject is for a model from scripts/train_multiview.py: the photos in the folder are one
-subject and each subfolder is another, so a folder of subfolders predicts many subjects.
+The confidence threshold and the other inference settings default to the checkpoint's (its run config's ``inference``).
 """
 
 from __future__ import annotations
@@ -18,27 +13,28 @@ from __future__ import annotations
 import argparse
 
 from eomt import EoMT
-from val import add_tta_args
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("weights", help="Checkpoint .pt or a run/weights folder.")
-    p.add_argument("source", nargs="?", default="scripts/sample_images", help="Image file or directory.")
-    p.add_argument("--out", default="runs/predict", help="Output directory for annotated images.")
-    p.add_argument("--conf", type=float, default=None, help="Confidence threshold (default: the checkpoint's inference setting, else 0.3).")
+    p.add_argument("source", help="Image file or folder (with --subject: one subject's photos, or a subfolder each).")
+    p.add_argument("--out", default="runs/predict", help="Output folder of the rendered images.")
+    p.add_argument("--conf", type=float, default=None, help="Confidence threshold (default: the checkpoint's).")
+    p.add_argument("--imgsz", type=int, default=None, help="Input size (default: the trained size).")
+    p.add_argument("--batch", type=int, default=8, help="Photos per forward pass.")
     p.add_argument("--device", default="auto")
-    add_tta_args(p)
-    p.add_argument("--subject", nargs="?", const="order", choices=["order", "partition", "anchor"],
-                   help="Predict the photos of each subject together (see above). A subject with more photos than the "
-                        "model takes at once is split in order (default), into similar photos (partition), or each "
-                        "photo with its most similar ones (anchor).")
+    p.add_argument("--fp32", action="store_true", help="Run the network in fp32 (default: bf16 on a GPU).")
+    p.add_argument("--augment", action="store_true", help="Also run the image at 1.5x imgsz and merge.")
+    p.add_argument("--tiles", type=int, nargs="?", const=True, default=False, metavar="SIZE",
+                   help="Overlapping tiles (SIZE px, default imgsz) plus the whole image, merged.")
+    p.add_argument("--subject", action="store_true", help="Predict the photos of each subject together (cross-view).")
     args = p.parse_args()
-
     model = EoMT(args.weights, device=args.device)
-    results = model.predict(args.source, plot=True, save=args.out, conf_thres=args.conf,
-                            augment=args.augment, tiles=args.tiles, subject=args.subject or False)
-    print(f"[done] wrote {len(results)} annotated image(s) to {args.out}")
+    for _ in model.predict(args.source, plot=True, save=args.out, conf_thres=args.conf, imgsz=args.imgsz,
+                           batch=args.batch, amp=not args.fp32, augment=args.augment, tiles=args.tiles,
+                           subject=args.subject, stream=True):
+        pass
 
 
 if __name__ == "__main__":

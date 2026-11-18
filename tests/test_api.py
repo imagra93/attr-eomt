@@ -9,7 +9,8 @@ import pytest
 import torch
 from PIL import Image
 
-from eomt import EoMT, EoMTModel, load_raw, summarize_checkpoint
+from eomt import EoMT, EoMTModel, summarize_checkpoint
+from eomt.serialization import load_raw
 
 IMGSZ = 140  # 14 * 10 -> tiny patch grid keeps the test fast
 NC = 3
@@ -48,9 +49,10 @@ def test_save_reload_and_predict_roundtrip(tmp_path):
     assert len(results) == 1
     r = results[0]
     assert {"num_detections", "boxes", "scores", "classes", "masks"} <= set(r)
-    assert "plot_path" in r and (out_dir / "a.png").is_file()
-    # Inference reports per-image timing.
-    assert "elapsed_ms" in r and r["elapsed_ms"] > 0
+    assert "plot_path" in r and (out_dir / "a.png").is_file() and "plot" not in r   # saved, not held in memory
+    # streamed, the same results one at a time
+    streamed = list(reloaded.predict(img_dir, conf_thres=0.0, stream=True))
+    assert len(streamed) == 1 and torch.equal(streamed[0]["scores"], r["scores"])
 
 
 def test_checkpoint_carries_norm_metadata(tmp_path):
@@ -88,7 +90,7 @@ def _write_photos(tmp_path, sizes):
     return d
 
 
-def test_infer_match_roundtrip(tmp_path):
+def test_match_roundtrip(tmp_path):
     import json
 
     from PIL import Image
@@ -96,9 +98,7 @@ def test_infer_match_roundtrip(tmp_path):
     src = _write_photos(tmp_path, [(60, 80), (80, 60), (50, 50)])
     out = tmp_path / "run"
     model = EoMT("s", device="cpu", nc=3, imgsz=140, pretrained=False)
-    result = model.infer_match(
-        src, plot=True, save=str(out), conf_thres=0.0, max_det=4, panel_size=96
-    )
+    result = model.match(src, plot=True, save=str(out), conf_thres=0.0, max_det=4, panel_size=96)
 
     assert result["num_images"] == 3 and len(result["images"]) == 3
     for i, res in enumerate(result["images"]):
@@ -129,15 +129,15 @@ def test_infer_match_roundtrip(tmp_path):
     Image.open(result["plot_path"]).close()
 
 
-def test_infer_match_rejects_unknown_group_by(tmp_path):
+def test_match_rejects_unknown_group_by(tmp_path):
     src = _write_photos(tmp_path, [(40, 40), (40, 40)])
     model = EoMT("s", device="cpu", nc=3, imgsz=140, pretrained=False)
     # Must raise on the typo before any forward runs (this model has no aux heads,
     # which doubles as the "group_by on an aux-less checkpoint" case).
     with pytest.raises(ValueError, match="Unknown group_by key"):
-        model.infer_match(src, plot=False, save=None, group_by=("class", "frontalty"))
+        model.match(src, plot=False, save=None, group_by=("class", "frontalty"))
     # "class" alone is always valid.
-    model.infer_match(src, plot=False, save=None, conf_thres=0.0, max_det=2)
+    model.match(src, plot=False, save=None, conf_thres=0.0, max_det=2)
 
 
 def test_chain_links_report_the_true_similarity_of_a_transitive_link():
@@ -165,22 +165,30 @@ def test_chain_links_report_the_true_similarity_of_a_transitive_link():
     assert drawn[(1, 2)] == pytest.approx(0.90, abs=1e-5)
 
 
-def test_infer_match_single_photo_and_empty_source(tmp_path):
+def test_match_single_photo_and_empty_source(tmp_path):
     src = _write_photos(tmp_path, [(48, 48)])
     model = EoMT("s", device="cpu", nc=3, imgsz=140, pretrained=False)
     with pytest.warns(UserWarning, match="single photo"):
-        result = model.infer_match(src, plot=False, save=None, conf_thres=0.0, max_det=3)
+        result = model.match(src, plot=False, save=None, conf_thres=0.0, max_det=3)
     assert result["matches"] == []
     assert result["num_identities"] == result["images"][0]["num_detections"]
 
     empty = tmp_path / "empty"
     empty.mkdir()
     with pytest.raises(FileNotFoundError, match="No images found"):
-        model.infer_match(empty, plot=False, save=None)
+        model.match(empty, plot=False, save=None)
+
+
+def test_resume_needs_a_checkpoint_and_val_needs_data(tmp_path):
+    m = EoMT("s", device="cpu", pretrained=False, nc=NC, imgsz=IMGSZ)
+    with pytest.raises(ValueError, match="resume=True"):
+        m.train(data="coco", resume=True)   # raised before the data is resolved (no download)
+    with pytest.raises(ValueError, match="no validation data"):
+        m.val()
 
 
 def test_save_in_bf16_halves_the_weights_and_keeps_what_the_checkpoint_records(tmp_path):
-    from eomt import save_checkpoint, wrap_checkpoint
+    from eomt.serialization import save_checkpoint, wrap_checkpoint
 
     torch.manual_seed(0)
     m = EoMT("s", device="cpu", pretrained=False, nc=NC, imgsz=IMGSZ)

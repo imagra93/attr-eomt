@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 import torch
 
-from eomt import build_eomt_config, build_model, postprocess_instance
+from eomt import build_model
+from eomt.config import build_eomt_config
+from eomt.postprocess import postprocess_instance
 from eomt.postprocess import postprocess_detection as _postprocess_detection
 from eomt.config import EOMT_CONFIGS
 
@@ -37,7 +39,7 @@ def test_build_forward_shapes():
         out = model(x)
     # ``query_embed`` is emitted unconditionally — including for models with no aux
     # heads, which is what lets cross-photo re-id run on any checkpoint.
-    assert set(out) == {"masks_queries_logits", "class_queries_logits", "query_embed"}
+    assert set(out) == {"masks_queries_logits", "class_queries_logits", "quality_logits", "query_embed"}
     q = EOMT_CONFIGS["s"].num_queries
     assert out["class_queries_logits"].shape == (2, q, NC + 1)
     assert out["masks_queries_logits"].shape[:2] == (2, q)
@@ -455,10 +457,8 @@ def test_model_ema_tracks_params_and_copies_buffers():
     after = ema.module.state_dict()[name]
     assert torch.allclose(after, 0.5 * before + 0.5 * live, atol=1e-5)
 
-    # The annealed attn_mask_probs buffer is copied verbatim, never averaged.
-    model.eomt.attn_mask_probs.fill_(0.7)
-    ema.update(model)
-    assert torch.allclose(ema.module.eomt.attn_mask_probs, model.eomt.attn_mask_probs)
+    # The masked-attention probabilities are no buffer: the trainer sets the EMA's own before validating it.
+    assert not any("attn_mask_probs" in k for k in ema.module.state_dict())
 
 
 def test_build_optimizer_no_decay_and_llrd():
@@ -606,7 +606,8 @@ def test_old_checkpoint_without_loss_metadata_loads(tmp_path):
 
     from eomt.serialization import _infer_num_upscale_blocks, load_model, save_checkpoint
 
-    model = build_model("s", nc=NC, imgsz=IMGSZ).eval()
+    # a model of that time: no quality head, hard class targets (the defaults before checkpoints recorded them)
+    model = build_model("s", nc=NC, imgsz=IMGSZ, loss_weights={"quality_weight": 0.0, "iou_aware_cls": False}).eval()
     sd = model.state_dict()
     assert _infer_num_upscale_blocks(sd) == 2
     save_checkpoint({"model": sd, "size": "s", "nc": NC, "imgsz": IMGSZ}, tmp_path / "old.pt")
