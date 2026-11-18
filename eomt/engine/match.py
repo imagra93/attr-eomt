@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .._log import LOG
 from ..serialization import load_model
 from ..visualize import draw_identity_grid
 from .predict import _IMAGE_EXTS, _iter_sources, link_defaults, link_results, predict_set, subject_groups
@@ -58,12 +59,12 @@ def _panelize(image: Image.Image, result: dict, panel_size: int) -> tuple[Image.
 def _print_summary(identities: list[dict], num_images: int, top: int = 15) -> None:
     if not identities:
         return
-    print(f"[match] top identities by photo count (of {len(identities)}):")
+    LOG.info(f"[match] top identities by photo count (of {len(identities)}):")
     for rec in identities[:top]:
         attrs = " ".join(f"{k}={v}" for k, v in (rec.get("attributes") or {}).items())
         sim = rec.get("mean_similarity")
         sim_txt = f" sim~{sim:.2f}" if sim is not None else ""
-        print(
+        LOG.info(
             f"  #{rec['identity_id']:<3} {rec['class_name']:<18} "
             f"{rec['num_photos']}/{num_images} photos{sim_txt}  {attrs}"
         )
@@ -127,7 +128,7 @@ def match(
     imgsz = int(imgsz if imgsz is not None else model.image_size)
     names = getattr(model, "names", None)
     sets = subject_groups(model, len(paths), groups)
-    print(f"[match] eomt-{model.size} on {dev}: {len(paths)} photo(s) in {len(sets)} group(s), "
+    LOG.info(f"[match] eomt-{model.size} on {dev}: {len(paths)} photo(s) in {len(sets)} group(s), "
           f"group_by={gate if group_by == 'auto' else group_by}, sim_thres={thres if sim_thres is None else sim_thres}")
 
     # --- 1. predict each group, reduce every photo to panel scale at once (nothing full-resolution outlives its group)
@@ -148,7 +149,7 @@ def match(
             if not keep_masks:
                 r.pop("masks", None)
             results[i] = r
-            print(f"[match] {paths[i].name}: {r['num_detections']} instances ({ms:.1f} ms)")
+            LOG.info(f"[match] {paths[i].name}: {r['num_detections']} instances ({ms:.1f} ms)")
 
     # --- 2. fingerprints, gate, Hungarian, link (each detection stamped with its identity)
     linked = link_results(model, results, group_by=group_by, sim_thres=sim_thres, paths=[str(p) for p in paths])
@@ -156,7 +157,7 @@ def match(
     origin, sim, diagnostics = linked["origin"], linked["sim"], linked["diagnostics"]
     accepted = [p for p in pairs if p["accepted"]]
     if not accepted and len(paths) > 1:
-        print("[match] 0 accepted matches — try lowering sim_thres or relaxing group_by")
+        LOG.info("[match] 0 accepted matches — try lowering sim_thres or relaxing group_by")
     config = {"size": model.size, "nc": model.nc, "imgsz": imgsz, "conf_thres": conf_thres, "max_det": max_det,
               "mask_thresh": mask_thresh, "groups": sets, **linked["config"]}
     result = {"source": str(source), "images": results, "identities": identities, "matches": linked["matches"],
@@ -174,7 +175,7 @@ def match(
             panel["caption"] = f"{i}. {Path(res['path']).stem[:22]} ({res['num_detections']} inst)"
         mode = link_mode
         if mode != "none" and len(panels) > 36:
-            print(f"[match] {len(panels)} panels: connectors disabled for legibility")
+            LOG.info(f"[match] {len(panels)} panels: connectors disabled for legibility")
             mode = "none"
         grid = draw_identity_grid(
             panels, names=names, aux_names=None, links=_links_for(mode, accepted, origin, identity, sim),
@@ -196,7 +197,7 @@ def match(
         dst.write_text(json.dumps(summary, indent=2) + "\n")
         result["summary_path"] = str(dst)
     _print_summary(identities, len(paths))
-    print(f"[match] done: {len(identities)} identities from {sum(int(r['num_detections']) for r in results)} detections "
+    LOG.info(f"[match] done: {len(identities)} identities from {sum(int(r['num_detections']) for r in results)} detections "
           f"across {len(paths)} photos in {time.perf_counter() - t0:.2f} s" + (f" -> {save_dir}" if save_dir else ""))
     return result
 

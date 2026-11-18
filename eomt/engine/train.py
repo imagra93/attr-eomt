@@ -36,6 +36,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
+from .._log import LOG
 from ..aux_cls import aux_loss, gate_indices, match_loss, match_loss_params
 from ..config import DEFAULT_IMAGE_SIZE, EOMT_CONFIGS, INFERENCE_DEFAULTS, PATCH_SIZE, aux_specs_from_meta, normalize_loss_weights
 from ..data import CocoDetection, CocoInstanceSeg, CocoSubjectSets, CocoValImages, collate_sets, collate_train
@@ -556,7 +557,7 @@ def validate_parts(model, parts: dict, *, device, batch: int = 4, workers: int =
                           conf_thres=conf_thres, max_det=max_det, amp=amp, verbose=verbose and main, group_by=group_by))
         if main:
             t = "bbox" if is_detect else "segm"
-            print(f"{tag} {t} mAP {metrics.get(f'{t}/mAP', 0):.4f} mAP50 {metrics.get(f'{t}/mAP50', 0):.4f}"
+            LOG.info(f"{tag} {t} mAP {metrics.get(f'{t}/mAP', 0):.4f} mAP50 {metrics.get(f'{t}/mAP50', 0):.4f}"
                   + ("" if is_detect else f" bbox mAP {metrics.get('bbox/mAP', 0):.4f}"))
         if "photos_aux" in parts:  # held-out matched-query accuracy per head
             val_aux, aux_pc = aux_evaluate(model, parts["photos_aux"], device=device, batch_size=batch,
@@ -564,7 +565,7 @@ def validate_parts(model, parts: dict, *, device, batch: int = 4, workers: int =
                                            iou_gate=aux_iou_gate, class_gate=aux_class_gate)
             metrics.update(val_aux)
             if main:
-                print(f"{tag} val aux: " + "  ".join(
+                LOG.info(f"{tag} val aux: " + "  ".join(
                     f"{k.split('/', 1)[1]} {k.split('/', 1)[0][4:]}={v:.3f}" for k, v in val_aux.items()
                     if k.startswith(("aux_acc/", "aux_mae/")) and "@" not in k))
     if "sets" in parts:
@@ -574,7 +575,7 @@ def validate_parts(model, parts: dict, *, device, batch: int = 4, workers: int =
         if main:
             g = "_gated" if link_group_by else ""
             m = lambda k: metrics.get(f"sets/{k}", float("nan"))  # noqa: E731
-            print(f"{tag} val sets: segm mAP {_fmt(m('segm/mAP_alone'), 4)} alone -> {_fmt(m('segm/mAP_set'), 4)} with "
+            LOG.info(f"{tag} val sets: segm mAP {_fmt(m('segm/mAP_alone'), 4)} alone -> {_fmt(m('segm/mAP_set'), 4)} with "
                   f"the set (linked instances {_fmt(m('segm/mAP_linked_alone'), 4)} -> {_fmt(m('segm/mAP_linked_set'), 4)});"
                   f" links F1 {_fmt(m(f'match{g}/f1'))} at {_fmt(m(f'match{g}/thres'), 2)} (re-ID of the photos alone "
                   f"{_fmt(m(f'reid{g}/f1'))}), at the stored threshold {_fmt(m('match/f1_stored'))}; identities per "
@@ -780,7 +781,7 @@ def train(
         torch.backends.cudnn.benchmark = True
     accum_steps = max(1, round(nominal_batch / (batch * world)))
     eff_batch = batch * accum_steps * world
-    print(f"[batch] micro={batch} x accum={accum_steps}" + (f" x {world} GPUs" if world > 1 else "")
+    LOG.info(f"[batch] micro={batch} x accum={accum_steps}" + (f" x {world} GPUs" if world > 1 else "")
           + f" -> effective {eff_batch}")
 
     # --- the checkpoint the run starts from: its size, family and input size, and (resume, multi-view) architecture
@@ -797,7 +798,7 @@ def train(
     src = resume_ckpt if resume_ckpt is not None else init_ckpt
     if src is not None:
         size, family, imgsz = src["size"], src["task"], int(src["imgsz"])
-        print(f"[{'resume' if resume else 'init'}] {resume_path or init_path} (size={size}, family={family}, "
+        LOG.info(f"[{'resume' if resume else 'init'}] {resume_path or init_path} (size={size}, family={family}, "
               f"imgsz={imgsz})" + ("" if resume else ": weights only, a new run from epoch 0"))
     is_detect = family == "detect"
     name = name or f"eomt-{size}"
@@ -827,9 +828,9 @@ def train(
 
     # --- data
     if train_transform is not None:
-        print("[aug] a custom train_transform: the aug settings are ignored")
+        LOG.info("[aug] a custom train_transform: the aug settings are ignored")
     else:
-        print(f"[aug] active: {', '.join(aug_cfg.active())}; LSJ {aug_cfg.min_scale}-{aug_cfg.max_scale}")
+        LOG.info(f"[aug] active: {', '.join(aug_cfg.active())}; LSJ {aug_cfg.min_scale}-{aug_cfg.max_scale}")
     if keep_empty and is_detect:
         raise ValueError("keep_empty applies to the instance family only")
     if mv is not None:  # sets of photos of one subject, with the checkpoint's attribute heads
@@ -840,16 +841,16 @@ def train(
         from ..reid import validate_group_by
 
         mv.gate = list(validate_group_by(mv.gate, train_ds.aux_specs)) or None
-        print(f"[data] train: {len(train_ds)} sets of up to {mv.sets.max_views} photos, {train_ds.num_subjects} "
+        LOG.info(f"[data] train: {len(train_ds)} sets of up to {mv.sets.max_views} photos, {train_ds.num_subjects} "
               f"subjects; {mv.sets}")
     else:
         train_ds = (CocoDetection if is_detect else CocoInstanceSeg)(
             train_images, train_json, imgsz=imgsz, transform=train_transform, aug=aug_cfg,
             attributes=True if attributes is None else attributes, **({"keep_empty": True} if keep_empty else {}))
         n_neg = sum(1 for i in train_ds.ids if not train_ds.coco.getAnnIds(imgIds=i, iscrowd=False)) if keep_empty else 0
-        print(f"[data] train: {len(train_ds)} images" + (f" (incl. {n_neg} negatives)" if keep_empty else ""))
+        LOG.info(f"[data] train: {len(train_ds)} images" + (f" (incl. {n_neg} negatives)" if keep_empty else ""))
     nc, names, aux_specs = train_ds.num_classes, train_ds.names, train_ds.aux_specs
-    print(f"[data] {nc} classes" + ("; attribute heads: " + "; ".join(_head_banner(s, names, train_ds) for s in aux_specs)
+    LOG.info(f"[data] {nc} classes" + ("; attribute heads: " + "; ".join(_head_banner(s, names, train_ds) for s in aux_specs)
                                     if aux_specs else ""))
     sampler = DistributedSampler(train_ds, shuffle=True, seed=seed or 0, drop_last=True) if world > 1 else None
     train_loader = DataLoader(
@@ -864,12 +865,12 @@ def train(
                                 aux=(aux_specs, train_ds._attr_id_maps), is_detect=is_detect,
                                 sets=mv.sets if mv is not None else None, fixed=fixed)
     if "photos" in val_parts:
-        print(f"[data] val: {len(val_parts['photos'])} images" + (f" at {val_size} px" if val_size != imgsz else ""))
+        LOG.info(f"[data] val: {len(val_parts['photos'])} images" + (f" at {val_size} px" if val_size != imgsz else ""))
     if "sets" in val_parts:
         vs = val_parts["sets"]
         _same_categories(train_ds, vs, "val sets")
         got = f" from {mv.val_sets} ({vs.fixed_report})" if fixed is not None else ""
-        print(f"[data] val sets: {len(vs)} fixed sets of {vs.num_subjects} subjects{got}")
+        LOG.info(f"[data] val sets: {len(vs)} fixed sets of {vs.num_subjects} subjects{got}")
         if main:  # the sets, so that another run or model can be scored on the same ones (multiview.val_sets)
             vs.write_sets(run_dir / "val_sets.json")
     aux_class_weight = _class_weights(train_ds) if aux_specs and acfg.class_weights else None
@@ -921,7 +922,7 @@ def train(
                       aux_head_arch=aux_head_arch, loss_weights=loss_weights, num_upscale_blocks=num_upscale_blocks,
                       fpn_scales=fpn_scales, xview=xview_cfg, match_dim=match_dim,
                       match_residual=match_residual).to(dev)
-    print(f"[model] loss weights: {loss_weights}; upscale blocks {net.num_upscale_blocks}"
+    LOG.info(f"[model] loss weights: {loss_weights}; upscale blocks {net.num_upscale_blocks}"
           + (f"; FPN {net.fpn_scales}" if net.fpn_scales else "")
           + (f"; attribute heads {net.aux_head_arch}" if aux_specs else ""))
     match_params = match_loss_params().to(dev) if mv is not None and net.match_head is not None else None
@@ -940,7 +941,7 @@ def train(
     optimizer = make_optimizer()
     if mv is not None:
         n_train = sum(p.numel() for p in net.parameters() if p.requires_grad) / 1e6
-        print(f"[multiview] {'cross-view attention' if net.eomt.xview is not None else 'no cross-view attention'}, "
+        LOG.info(f"[multiview] {'cross-view attention' if net.eomt.xview is not None else 'no cross-view attention'}, "
               + (f"matching head {net.match_dim}-d{' residual' if net.match_residual else ''}"
                  if net.match_head is not None else "no matching head")
               + f"; training {mv.groups()} ({n_train:.1f} M parameters), the rest of the checkpoint is frozen")
@@ -955,7 +956,7 @@ def train(
         best_metric = max(float(resume_ckpt.get("best_metric", float("-inf"))),
                           float(load_raw(best_path).get("best_metric", float("-inf"))) if best_path.is_file()
                           else float("-inf"))
-        print(f"[resume] at epoch {start_epoch} (best {best_metric:.4f})")
+        LOG.info(f"[resume] at epoch {start_epoch} (best {best_metric:.4f})")
     elif init_ckpt is not None:
         # Weights only; a tensor whose shape differs (another number of classes, a new head) keeps its fresh init.
         cur = net.state_dict()
@@ -964,11 +965,11 @@ def train(
         skipped = [k for k, v in ckpt_sd.items() if k in cur and cur[k].shape != v.shape]
         missing, unexpected = net.load_state_dict(filtered, strict=False)
         if skipped:
-            print(f"[init] re-initialized {len(skipped)} shape-mismatched tensors: {module_counts(skipped)}")
+            LOG.info(f"[init] re-initialized {len(skipped)} shape-mismatched tensors: {module_counts(skipped)}")
         if missing:
-            print(f"[init] fresh (not in the checkpoint): {module_counts(missing)}")
+            LOG.info(f"[init] fresh (not in the checkpoint): {module_counts(missing)}")
         if unexpected:
-            print(f"[init] in the checkpoint, not in the model: {module_counts(unexpected)}")
+            LOG.info(f"[init] in the checkpoint, not in the model: {module_counts(unexpected)}")
         if net.eomt.xview is not None and not any(k.startswith("eomt.xview.") for k in ckpt_sd):
             net.init_xview()  # each cross-view sublayer starts as a copy of its query block's attention
     elif pretrained:
@@ -1009,7 +1010,7 @@ def train(
     amp_on = amp and dev.type == "cuda"
     autocast_dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if amp_on else torch.float32
     scaler = torch.amp.GradScaler("cuda", enabled=autocast_dtype == torch.float16)
-    print(f"[amp] {'off' if not amp_on else str(autocast_dtype).split('.')[-1]}"
+    LOG.info(f"[amp] {'off' if not amp_on else str(autocast_dtype).split('.')[-1]}"
           + (" (+ gradient scaler)" if scaler.is_enabled() else ""))
 
     step_model = _Forward(net, micro_step, torch.nn.ModuleDict({"match": match_params} if match_params is not None else {}))
@@ -1021,7 +1022,7 @@ def train(
         ema = dict(resume_ckpt["ema"])
         ema["module"] = migrate_checkpoint({**resume_ckpt, "model": ema["module"]})["model"]
         ema_model.load_state_dict(ema)
-        print(f"[resume] restored EMA ({ema_model.updates} updates)")
+        LOG.info(f"[resume] restored EMA ({ema_model.updates} updates)")
 
     iters_per_epoch = max(1, len(train_loader))
     total_iters = epochs * iters_per_epoch
@@ -1029,7 +1030,7 @@ def train(
     if main and "photos" in val_parts and mask_anneal:
         free = max(EOMT_MASK_ANNEAL_END) * epochs
         windows = ", ".join(f"{a * epochs:.1f}-{b * epochs:.1f}" for a, b in zip(EOMT_MASK_ANNEAL_START, EOMT_MASK_ANNEAL_END))
-        print(f"[val] every {vcfg.interval} epoch(s) and after the last, in the training regime (as the official EoMT): "
+        LOG.info(f"[val] every {vcfg.interval} epoch(s) and after the last, in the training regime (as the official EoMT): "
               f"masked attention at the current annealing (query-block windows at epochs {windows}). best.pt runs "
               f"mask-free: it is chosen from epoch {free:.1f} on.")
     head_group = next((g for g in reversed(optimizer.param_groups) if not g.get("is_backbone")), optimizer.param_groups[-1])
@@ -1160,14 +1161,14 @@ def train(
             row["train/data_wait"] = wait_f / world / max(epoch_s, 1e-9)
             aux_acc = {n: s / c if c else float("nan") for n, (s, c) in aux_tot.items()}
             row.update({f"train/{metric_of[n]}/{n}": v for n, v in aux_acc.items()})
-            print(f"[epoch {epoch}] mean loss {row['train/loss']:.4f}; waited for data {100 * row['train/data_wait']:.0f} "
+            LOG.info(f"[epoch {epoch}] mean loss {row['train/loss']:.4f}; waited for data {100 * row['train/data_wait']:.0f} "
                   "% of the epoch" + ("; attribute heads (train) " + "  ".join(
                       f"{n} {metric_of[n][4:]}={v:.3f}" for n, v in aux_acc.items()) if aux_specs else ""))
             if match_params is not None:
                 seen = {k: s / c if c else float("nan") for k, (s, c) in match_tot.items()}
                 row["train/match_loss"] = match_f / (iters_per_epoch * world)
                 row.update({f"train/match/{k}": v for k, v in seen.items()})
-                print(f"[epoch {epoch}] matching loss {row['train/match_loss']:.4f}: same instance cos "
+                LOG.info(f"[epoch {epoch}] matching loss {row['train/match_loss']:.4f}: same instance cos "
                       f"{_fmt(seen['pos_cos'])}, hardest other cos {_fmt(seen['hardneg_cos'])}, "
                       f"{_fmt(100 * seen['unpaired'], 0)} % of the instances without a partner in their set")
             if tb is not None and aux_specs:
@@ -1207,7 +1208,7 @@ def train(
                 val_peak = torch.cuda.max_memory_allocated(dev)
                 torch.cuda.empty_cache()
                 if main:
-                    print(f"[epoch {epoch}] peak GPU memory: training {train_peak / 2**30:.1f} GiB, validation "
+                    LOG.info(f"[epoch {epoch}] peak GPU memory: training {train_peak / 2**30:.1f} GiB, validation "
                           f"{val_peak / 2**30:.1f} GiB")
 
         if main:  # the main process alone writes the checkpoints, the metrics row and the plots
@@ -1218,7 +1219,7 @@ def train(
                 best_metric = cur
                 _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), trainer_state=False, row=row,
                       best=best_metric)
-                print(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
+                LOG.info(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
             csv_log.append(row)
             try:  # plots never stop a run
                 plot_metrics_csv(run_dir / "metrics.csv", run_dir / "metrics.png")
@@ -1226,9 +1227,9 @@ def train(
                     plot_aux_per_class(aux_pc, names, run_dir / "aux_per_class.png",
                                        regression={n for n in aux_pc if metric_of[n] == "aux_mae"})
             except Exception as e:  # noqa: BLE001
-                print(f"[plot] failed: {e}")
+                LOG.info(f"[plot] failed: {e}")
         if stop_after_epochs is not None and epoch + 1 >= stop_after_epochs:
-            print(f"[stop] stopping after {epoch + 1} epoch(s) as requested; the schedule spans {epochs}")
+            LOG.info(f"[stop] stopping after {epoch + 1} epoch(s) as requested; the schedule spans {epochs}")
             break
 
     if tb is not None:

@@ -235,6 +235,35 @@ def _cocoeval(coco_gt, results, img_ids, iou_type: str, verbose: bool) -> dict:
     return {f"{iou_type}/{k}": float(v) for k, v in zip(_SEGM_KEYS, ev.stats)}
 
 
+def _records(img_id, res: dict, contig2cat, *, segm: bool = True, bbox: bool = True) -> tuple[list, list, list]:
+    """COCO result records of one image's detections ``(segm, bbox, rles)``, with one copy to the host per image."""
+    classes, scores, boxes = res["classes"].tolist(), res["scores"].tolist(), res["boxes"].tolist()
+    masks = res["masks"].cpu().numpy() if segm else None
+    seg, box, rles = [], [], []
+    for i in range(res["num_detections"]):
+        common = {"image_id": int(img_id), "category_id": int(contig2cat[int(classes[i])]), "score": float(scores[i])}
+        if segm:
+            rles.append(_encode_mask(masks[i]))
+            seg.append({**common, "segmentation": rles[-1]})
+        if bbox:
+            x1, y1, x2, y2 = (float(v) for v in boxes[i])
+            box.append({**common, "bbox": [x1, y1, x2 - x1, y2 - y1]})
+    return seg, box, rles
+
+
+def _group_metrics(coco, ids, group_by, results: dict[str, list[dict]]) -> dict[str, float]:
+    """``<field>=<value>/<type>/mAP`` for every value of the ``group_by`` image fields, from the results per type."""
+    out = {}
+    for field, values in group_values(coco, ids, group_by).items():
+        for v in values:
+            sub = [i for i in ids if _field_value(coco, i, field) == v]
+            wanted = set(sub)
+            for t, res in results.items():  # copies: loadRes writes into the result dicts
+                out[f"{field}={v}/{t}/mAP"] = _cocoeval(
+                    coco, [dict(r) for r in res if r["image_id"] in wanted], sub, t, False)[f"{t}/mAP"]
+    return out
+
+
 @torch.no_grad()
 def evaluate(
     model,
@@ -326,32 +355,9 @@ def evaluate(
             ]
 
         for img_id, res in zip(image_ids, batch_results):
-            # one copy to the host per image (not per detection)
-            classes, scores, boxes = res["classes"].tolist(), res["scores"].tolist(), res["boxes"].tolist()
-            masks = res["masks"].cpu().numpy()
-            rles = []
-            for i in range(res["num_detections"]):
-                cat_id = int(contig2cat[int(classes[i])])
-                score = float(scores[i])
-                rles.append(_encode_mask(masks[i]))
-                segm_results.append(
-                    {
-                        "image_id": int(img_id),
-                        "category_id": cat_id,
-                        "segmentation": rles[-1],
-                        "score": score,
-                    }
-                )
-                if also_bbox:
-                    x1, y1, x2, y2 = [float(v) for v in boxes[i]]
-                    bbox_results.append(
-                        {
-                            "image_id": int(img_id),
-                            "category_id": cat_id,
-                            "bbox": [x1, y1, x2 - x1, y2 - y1],
-                            "score": score,
-                        }
-                    )
+            seg, box, rles = _records(img_id, res, contig2cat, bbox=also_bbox)
+            segm_results += seg
+            bbox_results += box
             if attr_specs:
                 _count_attrs(res, rles, val_ds, int(img_id), attr_specs, attr_iou, attr_hits, attr_tot, attr_reg)
 
@@ -371,15 +377,8 @@ def evaluate(
         else:
             hit, tot = sum(p[2][s.name] for p in parts), sum(p[3][s.name] for p in parts)
             metrics[f"aux_acc/{s.name}"] = hit / tot if tot else float("nan")
-    for field, values in group_values(val_ds.coco, val_ds.ids, group_by).items():
-        for v in values:
-            ids = [i for i in val_ds.ids if _field_value(val_ds.coco, i, field) == v]
-            wanted = set(ids)
-            metrics[f"{field}={v}/segm/mAP"] = _cocoeval(
-                val_ds.coco, [dict(r) for r in segm_results if r["image_id"] in wanted], ids, "segm", False)["segm/mAP"]
-            if also_bbox:
-                metrics[f"{field}={v}/bbox/mAP"] = _cocoeval(
-                    val_ds.coco, [dict(r) for r in bbox_results if r["image_id"] in wanted], ids, "bbox", False)["bbox/mAP"]
+    metrics.update(_group_metrics(val_ds.coco, val_ds.ids, group_by,
+                                  {"segm": segm_results, **({"bbox": bbox_results} if also_bbox else {})}))
     return metrics
 
 
@@ -431,29 +430,14 @@ def evaluate_detection(
                 max_det=max_det,
                 preprocess_meta=meta,
             )
-            classes, scores, boxes = res["classes"].tolist(), res["scores"].tolist(), res["boxes"].tolist()
-            for i in range(res["num_detections"]):
-                x1, y1, x2, y2 = boxes[i]
-                bbox_results.append(
-                    {
-                        "image_id": int(img_id),
-                        "category_id": int(contig2cat[int(classes[i])]),
-                        "bbox": [x1, y1, x2 - x1, y2 - y1],
-                        "score": float(scores[i]),
-                    }
-                )
+            bbox_results += _records(img_id, res, contig2cat, segm=False)[1]
 
     parts = gather(bbox_results)
     if parts is None:  # several GPUs: the main process scores the results of all
         return {}
     results = [r for part in parts for r in part]
     metrics = _cocoeval(val_ds.coco, [dict(r) for r in results], val_ds.ids, "bbox", verbose)
-    for field, values in group_values(val_ds.coco, val_ds.ids, group_by).items():
-        for v in values:
-            ids = [i for i in val_ds.ids if _field_value(val_ds.coco, i, field) == v]
-            wanted = set(ids)
-            metrics[f"{field}={v}/bbox/mAP"] = _cocoeval(
-                val_ds.coco, [dict(r) for r in results if r["image_id"] in wanted], ids, "bbox", False)["bbox/mAP"]
+    metrics.update(_group_metrics(val_ds.coco, val_ds.ids, group_by, {"bbox": results}))
     return metrics
 
 
@@ -513,27 +497,9 @@ def sweep(
                     min_mask_area=float(knobs.get("min_mask_area", 0.0)),
                     preprocess_meta=meta,
                 )
-                for i in range(res["num_detections"]):
-                    cat_id = int(contig2cat[int(res["classes"][i])])
-                    score = float(res["scores"][i])
-                    segm_results[gi].append(
-                        {
-                            "image_id": int(img_id),
-                            "category_id": cat_id,
-                            "segmentation": _encode_mask(res["masks"][i].cpu().numpy()),
-                            "score": score,
-                        }
-                    )
-                    if also_bbox:
-                        x1, y1, x2, y2 = [float(v) for v in res["boxes"][i].tolist()]
-                        bbox_results[gi].append(
-                            {
-                                "image_id": int(img_id),
-                                "category_id": cat_id,
-                                "bbox": [x1, y1, x2 - x1, y2 - y1],
-                                "score": score,
-                            }
-                        )
+                seg, box, _ = _records(img_id, res, contig2cat, bbox=also_bbox)
+                segm_results[gi] += seg
+                bbox_results[gi] += box
 
     rows: list[dict] = []
     for gi, knobs in enumerate(grid):

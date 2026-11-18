@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.0
+## 3.0.0 (2026-11-19)
 
 A cleanup for a public release: one way to do each thing, one config per concern, and the options no trained model
 uses removed. **Checkpoints of 2.x load and predict exactly as before** (they are upgraded on load); run configs and
@@ -29,6 +29,8 @@ Removed options: `box_head`, `deep_supervision=False`, `hires_*`, `aux_balance`,
 `multiview` is a post-training on **real** sets (images with `subject_id`, annotations with `instance_id`):
 `{xview, matching, match_w, gate, trainable, sets, val_sets}`. `xview` and `matching` are each optional: the matching
 head trains without cross-view attention too. `trainable` takes the presets `new` and `query_blocks`, or a dict.
+New: `sets.groups` (an image field) trains on the fixed groups of photos an application predicts together, each once
+per epoch, with a `sets.p_random` share of random sets; validation scores those groups.
 
 Removed: synthetic sets (`sets.cases`, distractors, mirrored copies, `p_subject`, `focus`), the `real` sub-section (the
 run's own data is the sets' data), the refiner, view types, `xview.keys`, `xview_scale`, the InfoNCE and dustbin
@@ -44,6 +46,8 @@ per-part `val_interval`. The metrics are `val/sets/...` (was `val/real/...`); th
 - `val()` defaults to the checkpoint's own validation data.
 - Tracking moved to `examples/track.py`; int8 compression and the auxiliary box head were removed.
 - Checkpoints load with `weights_only=True` and strictly; `eomt.migrate_checkpoint` upgrades 2.x ones.
+- Messages go through the standard `eomt` logger (stdout, INFO) instead of `print`:
+  `logging.getLogger("eomt").setLevel(logging.WARNING)` silences them.
 
 ### Fixes
 

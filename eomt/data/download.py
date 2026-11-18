@@ -11,6 +11,8 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
+from .._log import LOG
+
 COCO_URLS = {
     "annotations": "http://images.cocodataset.org/annotations/annotations_trainval2017.zip",
     "train2017": "http://images.cocodataset.org/zips/train2017.zip",
@@ -37,7 +39,7 @@ def _download_file(url: str, dest: Path) -> None:
 
 
 def _extract_zip(zip_path: Path, out_dir: Path) -> None:
-    print(f"[coco] extracting {zip_path.name} -> {out_dir}")
+    LOG.info(f"[coco] extracting {zip_path.name} -> {out_dir}")
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(out_dir)
 

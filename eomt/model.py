@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
+from ._log import LOG
 from .box_loss import DetectionLoss
 from .config import (
     DEFAULT_IMAGE_SIZE,
@@ -1085,7 +1086,7 @@ def load_dinov2_backbone(model: EoMTModel, *, verbose: bool = True) -> dict[str,
 
     size_cfg = EOMT_CONFIGS[model.size]
     if verbose:
-        print(f"[eomt] loading DINOv2 backbone: {size_cfg.dinov2_repo}")
+        LOG.info(f"[eomt] loading DINOv2 backbone: {size_cfg.dinov2_repo}")
     dino = Dinov2WithRegistersModel.from_pretrained(size_cfg.dinov2_repo)
     dino_sd = dino.state_dict()
 
@@ -1126,7 +1127,7 @@ def load_dinov2_backbone(model: EoMTModel, *, verbose: bool = True) -> dict[str,
 
     model.eomt.load_state_dict(new_sd, strict=False)
     if verbose:
-        print(
+        LOG.info(
             f"[eomt] DINOv2 -> EoMT: matched={matched} skipped={skipped} "
             f"interpolated={interpolated}; prediction head left random."
         )

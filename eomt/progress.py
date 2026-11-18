@@ -13,6 +13,8 @@ import time
 
 from tqdm import tqdm
 
+from ._log import LOG
+
 #: In a log file: a line every this many percent of the loop ...
 LINE_EVERY_PCT = 10
 #: ... or every this many seconds, whichever comes first.
@@ -67,4 +69,4 @@ class LineProgress:
         eta = f", {_clock(elapsed * (self.total - n) / n)} left" if pct is not None and n < self.total else ""
         rate = f", {n / elapsed:.2f} {self.unit}/s" if elapsed > 0 else ""
         post = f", {self.postfix}" if self.postfix else ""
-        print(f"{self.desc}: {done}, {_clock(elapsed)} elapsed{eta}{rate}{post}", flush=True)
+        LOG.info(f"{self.desc}: {done}, {_clock(elapsed)} elapsed{eta}{rate}{post}")

@@ -254,6 +254,12 @@ occluded) while its companions stay as they are, so the evidence has to come fro
 `{group or parameter-name prefix: LR multiplier}` (groups `xview`, `match_head`, `query_blocks`, `heads`; e.g.
 `{xview: 1.0, aux_heads.price: 0.0}`).
 
+When your application predicts fixed groups of photos (decided before the model sees them), train on those groups:
+`sets: {groups: <image field>, p_random: 0.25}` makes the photos of a subject sharing that field's value one set (split
+into sets of `max_views`), each once per epoch, plus a `p_random` share of sets drawn at random as above, as
+augmentation. The model is told nothing about the photos of a set: which photos go together is the data's decision.
+Validation then scores the groups.
+
 **Validation** scores fixed sets of the validation photos of each subject, unaugmented and placed exactly as inference
 places them: `sets/segm/mAP_{alone,set}` (each photo predicted alone and with its set; `_linked_` restricted to the
 instances another photo shows, where the others can help), the attributes alone and with the set, and the links:
@@ -316,7 +322,8 @@ m.save("best_bf16.pt", dtype="bf16")                       # half the file, the 
 ```
 
 `conf_thres`, `max_det` and `mask_thresh` default to the checkpoint's `inference` settings. Masks come back at the
-photo's resolution; the network runs in bf16 on a GPU (`amp=False`: fp32).
+photo's resolution; the network runs in bf16 on a GPU (`amp=False`: fp32). What the library reports goes to the
+standard `eomt` logger (stdout): `logging.getLogger("eomt").setLevel(logging.WARNING)` silences it.
 
 ## Checkpoints
 

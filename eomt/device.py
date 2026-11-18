@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import torch
 
+from ._log import LOG
+
 #: Devices already announced, so the "using ..." line is printed once each.
 _logged: set[str] = set()
 
@@ -53,8 +55,8 @@ def _log_once(dev: torch.device) -> None:
         try:
             name = torch.cuda.get_device_name(idx)
             free, _total = torch.cuda.mem_get_info(idx)
-            print(f"[eomt] using cuda:{idx} ({name}, {free / 1e9:.1f} GB free)")
+            LOG.info(f"[eomt] using cuda:{idx} ({name}, {free / 1e9:.1f} GB free)")
         except Exception:  # pragma: no cover
-            print(f"[eomt] using cuda:{idx}")
+            LOG.info(f"[eomt] using cuda:{idx}")
     else:
-        print(f"[eomt] using {dev}")
+        LOG.info(f"[eomt] using {dev}")

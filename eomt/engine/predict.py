@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .._log import LOG
 from ..postprocess import postprocess_detection, postprocess_instance, slice_batch
 from ..preprocess import preprocess_numpy
 from ..serialization import load_model
@@ -353,9 +354,9 @@ def _predict_iter(model, source, *, plot, save, conf_thres, max_det, mask_thresh
     aux_names = {s.name: s.names for s in getattr(model, "aux_specs", [])}
     tta = TTAConfig.resolve(augment, tiles) is not None
     if verbose:
-        print(f"[predict] eomt-{model.size} ({model.family}, nc={model.nc}, imgsz={imgsz}) on {dev}")
+        LOG.info(f"[predict] eomt-{model.size} ({model.family}, nc={model.nc}, imgsz={imgsz}) on {dev}")
         if subject and getattr(model, "xview_cfg", None) is None:
-            print("[predict] the model has no cross-view sublayers: each photo is predicted alone")
+            LOG.info("[predict] the model has no cross-view sublayers: each photo is predicted alone")
     out_root = Path(save) if (plot and save) else None
     root = Path(source) if Path(source).is_dir() else Path(source).parent
     kw = dict(device=dev, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
@@ -391,4 +392,4 @@ def _predict_iter(model, source, *, plot, save, conf_thres, max_det, mask_thresh
             yield result
     if verbose and n:
         s = time.perf_counter() - t0
-        print(f"[predict] {n} image(s) in {s:.2f} s ({s * 1e3 / n:.1f} ms/img)" + (f" -> {out_root}" if out_root else ""))
+        LOG.info(f"[predict] {n} image(s) in {s:.2f} s ({s * 1e3 / n:.1f} ms/img)" + (f" -> {out_root}" if out_root else ""))

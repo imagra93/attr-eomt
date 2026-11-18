@@ -18,6 +18,7 @@ from __future__ import annotations
 import warnings
 from pathlib import Path
 
+from ._log import LOG
 from .config import INFERENCE_DEFAULTS, SIZES
 from .data import CocoValImages, load_data_config
 from .device import resolve_device
@@ -359,7 +360,7 @@ class EoMT:
             raise ValueError("info() needs a checkpoint-backed model; save() one first.")
         summary = summarize_checkpoint(self._ckpt)
         if verbose:
-            print(format_summary(summary))
+            LOG.info(format_summary(summary))
         return summary
 
     def __repr__(self) -> str:
