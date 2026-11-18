@@ -360,28 +360,23 @@ matched  = gather_matched(out, indices)                          <span class="c"
   <h3>2 · a per-annotation <code>attributes</code> map</h3>
 <pre>{ "id": 1, "image_id": 42, "category_id": 1, "bbox": [...], "segmentation": [...],
   "attributes": {<span class="s">"attribute_1"</span>: 3, <span class="s">"attribute_2"</span>: 0} }</pre>
-  <p class="dim" style="font-size:15px">Raw ids are remapped to a contiguous <code>0..n-1</code> per head (so <code>attribute_1</code>'s <code>1/2/3</code> → <code>0/1/2</code>). A missing value defaults to <code>0</code>; a JSON with no <code>attributes</code> is just detection-only, exactly as before.</p>
+  <p class="dim" style="font-size:15px">Raw ids are remapped to a contiguous <code>0..n-1</code> per head (so <code>attribute_1</code>'s <code>1/2/3</code> → <code>0/1/2</code>). A missing or unknown value is ignored by that head's loss (never trained as class <code>0</code>), so a partly tagged dataset works; a JSON with no <code>attributes</code> is just instance segmentation.</p>
 
   <h3>At inference</h3>
   <p>Each kept detection gets an <code>aux = {head: {"ids", "probs"}}</code> entry, and <code>predict(plot=True)</code> renders every attribute next to the class label, using the names stored in the checkpoint — the primary class on the first row, each attribute + its confidence on the row beneath.</p>
 
   <figure style="margin:30px 0 6px">
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px">
-      <img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/rosalia.jpg"
-           alt="A detected instance labelled with its primary class plus several independent per-instance attributes"
-           style="width:100%;height:auto;border-radius:10px;border:1px solid rgba(255,255,255,.12);display:block">
-      <img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/taylor_swift.jpg"
-           alt="Another detected instance labelled with its primary class plus several independent per-instance attributes"
-           style="width:100%;height:auto;border-radius:10px;border:1px solid rgba(255,255,255,.12);display:block">
-    </div>
+    <img src="https://raw.githubusercontent.com/imagra93/attr-eomt/main/docs/examples/sample.jpg"
+         alt="Detected garments, each labelled with its primary class plus several independent per-instance attributes"
+         style="width:100%;height:auto;border-radius:10px;border:1px solid rgba(255,255,255,.12);display:block">
     <figcaption class="dim" style="font-size:15px;margin-top:12px">
-      Two predictions: every detected instance carries its <span class="pr-em">primary class</span> plus several <span class="ax-em">independent attributes</span> — all read off the same per-query embedding, drawn by <code>eomt.visualize.draw_instances</code> (primary class on the first row, each attribute + its confidence beneath).
+      Every detected instance carries its <span class="pr-em">primary class</span> plus several <span class="ax-em">independent attributes</span> — all read off the same per-query embedding, drawn by <code>eomt.visualize.draw_instances</code> (primary class on the first row, each attribute + its confidence beneath).
     </figcaption>
   </figure>
 
   <div class="note q">
     <span class="ic">↳</span>
-    <p>Roadmap idea worth noting: train an aux head with a <em>contrastive</em> objective and its per-instance embedding becomes a <strong>re-identification vector</strong> — matching the same object across frames and cameras, reusing the detector's matched queries instead of a separate tracker.</p>
+    <p>The same idea links instances across photos: a <strong>matching head</strong> on the per-query embedding, trained on the matched queries of photos of one subject (<code>multiview: {matching: true}</code>), embeds each instance so that the same physical instance in two photos lands close; <code>EoMT.match()</code> turns that into one identity per instance.</p>
   </div>
 </section>
 
@@ -398,44 +393,35 @@ matched  = gather_matched(out, indices)                          <span class="c"
     <li><strong>Masked-attention annealing</strong> <code>1 → 0</code>, one query block after the other, so the final sixth of training is mask-free and matches efficient (mask-less) inference.</li>
   </ul>
 
+  <p>Every setting has the reference recipe as its default and lives in one section of the run config (or a keyword of
+  <code>train()</code>; a mapping is merged over the YAML's section key by key):</p>
   <table>
-    <thead><tr><th>arg</th><th>default</th><th>effect</th></tr></thead>
+    <thead><tr><th>section</th><th>what it holds</th></tr></thead>
     <tbody>
-      <tr><td><code>family</code></td><td><code>"instance"</code></td><td><code>"instance"</code> (masks) or <code>"detect"</code> (boxes only)</td></tr>
-      <tr><td><code>nominal_batch</code> / <code>accum</code></td><td><code>16</code> / <code>0</code></td><td>gradient accumulation to an effective batch of <code>nominal_batch</code>; <code>accum=N</code> sets the step count explicitly</td></tr>
-      <tr><td><code>ema</code> / <code>ema_decay</code> / <code>ema_tau</code></td><td><code>True</code> / <code>0.9999</code> / <code>2000</code></td><td>validate &amp; export <code>best.pt</code> from an EMA of the weights</td></tr>
-      <tr><td><code>llrd</code> / <code>backbone_lr_mult</code></td><td><code>0.8</code> / <code>1.0</code></td><td>layer-wise LR decay on the DINOv2 encoder, top block at <code>lr0 &times; backbone_lr_mult</code> (<code>llrd=1.0</code> = flat)</td></tr>
-      <tr><td><code>box_head</code></td><td><code>False</code></td><td>auxiliary box head: L1 + GIoU loss and a box term in the Hungarian matching cost</td></tr>
-      <tr><td><code>deep_supervision</code></td><td><code>True</code></td><td><code>False</code> stops supervising a query block once its masked attention is annealed away</td></tr>
-      <tr><td><code>poly_power</code> / <code>warmup_steps</code></td><td><code>0.9</code> / <code>(500, 1000)</code></td><td>polynomial LR decay to 0; two-stage warmup in optimizer steps (head, then ViT with its LR held at 0 during the head warmup)</td></tr>
-      <tr><td><code>aug</code></td><td>strong recipe</td><td>every augmentation knob (<code>AugConfig</code>): flip, Large-Scale Jitter, rotate / shear / perspective, gamma, grayscale, blur, noise, JPEG, glare, safe erasing; mosaic / mixup / copy-paste and the instance-aware crop are off. A mapping, or a <code>train_aug</code> block in the dataset YAML; <code>{"preset": "legacy"}</code> restores the original recipe</td></tr>
-      <tr><td><code>min_scale</code> / <code>max_scale</code></td><td><code>0.1</code> / <code>2.0</code></td><td>Large-Scale Jitter range (explicit values beat <code>aug</code>)</td></tr>
-      <tr><td><code>letterbox</code></td><td><code>True</code></td><td>aspect-preserving letterbox eval (vs legacy square stretch); recorded in the checkpoint</td></tr>
-      <tr><td><code>flip_prob</code></td><td><code>0.5</code></td><td>horizontal-flip probability (explicit values beat <code>aug</code>)</td></tr>
-      <tr><td><code>train_transform</code></td><td><code>None</code></td><td>your own <code>(image, masks) &rarr; (image, masks)</code> callable, replacing the built-in pipeline</td></tr>
-      <tr><td><code>mask_anneal</code> / <code>mask_anneal_start</code> / <code>mask_anneal_end</code></td><td><code>True</code> / <code>(1/6, 2/6, 3/6, 4/6)</code> / <code>(2/6, 3/6, 4/6, 5/6)</code></td><td>anneal masked attention <code>1→0</code>, one window (fraction of training) per query block</td></tr>
-      <tr><td><code>aux_w</code></td><td><code>1.0</code></td><td>weight on the summed secondary-head loss</td></tr>
+      <tr><td><code>train</code></td><td><code>epochs</code>, <code>batch</code> (per GPU) / <code>nominal_batch</code> (16, the rest accumulated), <code>imgsz</code>, <code>workers</code>, <code>seed</code>, <code>init_weights</code>, <code>project</code> / <code>name</code></td></tr>
+      <tr><td><code>model</code></td><td>architecture and loss weights of a new model: <code>fpn_scales</code>, <code>num_upscale_blocks</code>, <code>iou_aware_cls</code>, <code>quality_weight</code>, the attribute heads' shape</td></tr>
+      <tr><td><code>optim</code></td><td><code>lr0</code> (1e-4), <code>llrd</code> (0.8), <code>warmup_steps</code> ((500, 1000)), <code>poly_power</code> (0.9), <code>ema_decay</code> (0.9999), <code>mask_anneal</code> (on)</td></tr>
+      <tr><td><code>aux</code></td><td>how the attribute heads train: <code>w</code>, <code>per_head</code>, <code>class_weights</code>, the IoU / class gate</td></tr>
+      <tr><td><code>aug</code></td><td>every augmentation knob (<code>AugConfig</code>): flip, Large-Scale Jitter, rotate / shear / perspective, gamma, grayscale, blur, noise, JPEG, glare, safe erasing; mosaic / mixup / copy-paste and the instance-aware crop are off</td></tr>
+      <tr><td><code>val</code></td><td><code>interval</code>, <code>imgsz</code>, <code>group_by</code>, <code>best_key</code></td></tr>
+      <tr><td><code>multiview</code></td><td>a post-training on photos of one subject: <code>xview</code>, <code>matching</code>, <code>gate</code>, <code>trainable</code>, <code>sets</code></td></tr>
     </tbody>
   </table>
 
   <div class="note" style="border-left-color:var(--warn)">
     <span class="ic" style="color:var(--warn)">⚑</span>
-    <p><strong>Orientation gotcha.</strong> If an attribute encodes orientation, train with <code>flip_prob=0</code> — a horizontal flip mirrors the pixels but <em>not</em> the label, silently corrupting it. The same goes for <code>vflip_prob</code> / <code>rot90_prob</code> (off by default) and, to a lesser degree, the small rotations (<code>rotate_prob</code>).</p>
+    <p><strong>Orientation gotcha.</strong> If an attribute encodes orientation, train with <code>aug: {flip_prob: 0}</code>, or mark the attribute <code>flip_aware</code> — a horizontal flip mirrors the pixels but <em>not</em> the label, silently corrupting it. The same goes for <code>vflip_prob</code> / <code>rot90_prob</code> (off by default) and, to a lesser degree, the small rotations (<code>rotate_prob</code>).</p>
   </div>
 </section>
 
-<!-- ============ COMPRESS ============ -->
+<!-- ============ DEPLOY ============ -->
 <section>
   <div class="tag">Deployment</div>
-  <h2>Compress to int8</h2>
-  <p><code>compress()</code> applies <strong>int8 weight-only quantization</strong> (via <a href="https://github.com/pytorch/ao">torchao</a>) to the ViT transformer blocks — the bulk of the parameters — while keeping the prediction heads in full precision. It's <strong>data-free</strong> (no calibration) and shrinks the checkpoint <strong>≈3.4×</strong> on <code>l</code>; pass <code>data=</code> to measure the mAP before and after.</p>
+  <h2>Half the file, the same predictions</h2>
+  <p>Inference runs in bf16 on a GPU by default. <code>save(path, dtype="bf16")</code> (or <code>scripts/export.py</code>) stores the Linear and Conv weights in bf16, about half the checkpoint, and scores like the fp32 one.</p>
 <pre>m = EoMT(<span class="s">"runs/train/eomt-l"</span>)
-m.<span class="f">compress</span>(<span class="s">"int8"</span>, data=<span class="s">"coco"</span>, save=<span class="s">"runs/train/eomt-int8/weights/best.pt"</span>)
-<span class="c"># deltas returned + written to compression_metrics.json; omit `data` to skip validation</span>
-
-<span class="c"># reload like any run — the int8 layout is rebuilt from the checkpoint recipe</span>
-EoMT(<span class="s">"runs/train/eomt-int8"</span>).<span class="f">predict</span>(<span class="s">"images/"</span>)</pre>
-  <p class="dim" style="font-size:15px">The compressed model is GPU-only (torchao's int8 kernels have no CPU path), and <code>best.pt</code> exported from an EMA run quantizes exactly those EMA weights.</p>
+m.<span class="f">save</span>(<span class="s">"best_bf16.pt"</span>, dtype=<span class="s">"bf16"</span>)
+EoMT(<span class="s">"best_bf16.pt"</span>).<span class="f">predict</span>(<span class="s">"images/"</span>, batch=<span class="n">16</span>, stream=<span class="kw">True</span>)</pre>
 </section>
 
 <!-- ============ RECAP ============ -->

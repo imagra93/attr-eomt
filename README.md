@@ -19,79 +19,74 @@
 
 ## What it is
 
-**attr-eomt** is a standalone **EoMT** (Encoder-only Mask Transformer) for **instance
-segmentation** and **object detection**, with one feature that sets it apart: **independent
-per-instance attribute heads**. Alongside the mask/box + class output, it predicts one or
-several orthogonal attributes for *every* detected instance — read straight off the **same**
-per-query embedding the detector already computes. No second model, no second pass, and the
-primary detection metric is untouched (the figure above tells the whole story).
+**attr-eomt** is a standalone **EoMT** (Encoder-only Mask Transformer, CVPR 2025) for instance segmentation and
+object detection on a DINOv2 backbone, built around three things:
 
-It's a clean-room, Apache-2.0 reimplementation: the weights you train are yours to release.
+1. **Instances with attributes.** Every detected instance gets its class and any number of **independent attributes** —
+   categorical (classify) or real-valued (regress) — read off the same per-query embedding the detector computes. No
+   second model, no crops, no combinatorial label space.
+2. **Several photos of one subject, predicted together** (if you have them labelled): cross-view attention lets each
+   photo's queries take what the other photos show, so an instance that is tiny or ambiguous in one photo is found and
+   classified with the help of another.
+3. **Instance matching across photos** (if you have it labelled): a matching head embeds every instance so that the same
+   physical instance in two photos lands close; `match()` turns a folder of photos into one identity per instance.
+
+It is a clean-room, Apache-2.0 reimplementation: the weights you train are yours to release.
 
 ```python
 from eomt import EoMT
 
-model = EoMT("l")                            # fresh large model (DINOv2 backbone)
-model.train(data="coco")                     # COCO 2017 auto-downloads if missing; 12 epochs, the official recipe
-
-model = EoMT("runs/train/eomt-l")            # reload a run — size/classes/heads auto-detected
-model.predict("images/", plot=True)          # render masks/boxes + per-instance attributes
+model = EoMT("l")                                  # a new large model (DINOv2 backbone)
+model.train(data="run.yaml")                       # the run config: data, attribute heads, settings
+model = EoMT("runs/train/my-run")                  # a trained run: everything is read from its checkpoint
+model.val()                                        # on its own validation data
+results = model.predict("images/", plot=True)      # masks, boxes, classes and attributes per instance
+identities = model.match("photos/subject_42/")     # one identity per physical instance across the photos
 ```
+
+---
+
+## Install
+
+```bash
+pip install attr-eomt                  # from PyPI
+pip install -e ".[dev]"                # from source (editable; [dev] adds pytest)
+```
+
+Python 3.10+, PyTorch 2.4+. Training and inference run in bf16 on GPUs that support it.
 
 ---
 
 ## Architecture
 
-EoMT is a **DINOv2-with-registers ViT** whose last few transformer blocks are augmented
-with a fixed set of **learnable queries** (the Mask2Former idea) — each query is one
-"slot" that latches onto one object instance. After the encoder runs, every query emits
-a single vector, the **per-query embedding** of shape `[B, Q, hidden]`. The whole model
-is then just "turn that embedding into predictions": a **class head** for the primary
-label and a **mask/box head** for geometry. It is **NMS-free**, so two overlapping
-garments stay two distinct queries instead of being merged — the property that lets
-attributes stay attached to the right instance.
+EoMT is a **DINOv2-with-registers ViT** whose last four transformer blocks also process a fixed set of **learnable
+queries** (the Mask2Former idea): each query latches onto one object instance, and after the encoder every query emits
+one vector, the **per-query embedding** `[B, Q, hidden]`. A class head and a mask head (or a box head for the
+`detect` family) turn it into predictions. It is **NMS-free**, so two overlapping objects stay two queries — which is
+what keeps attributes attached to the right instance.
 
-The attribute heads add nothing to this picture except themselves: they tap the **exact
-same embedding** (captured non-invasively with a forward hook), each a small classifier
-on top.
+The attribute heads tap the **same embedding**: each is a small MLP, trained on the queries the detector's Hungarian
+matcher assigned to an instance. The optional matching head reads it too, and the optional cross-view sublayers let the
+queries of several photos of one subject attend to each other's tokens.
 
-This collapses what is classically a *two-stage* pipeline — detect, crop each box, run a
-second classifier per crop — into a single pass. Attributes therefore cost only a thin head
-each, see **full-image context** (not just a cropped box), and never inherit a second
-model's cropping errors — the modern, single-stage formulation of the DETR / Mask2Former
-lineage (see the figure at the top).
+| size | backbone        | hidden | layers | queries | params |
+|------|-----------------|--------|--------|---------|--------|
+| `s`  | DINOv2-small    | 384    | 12     | 100     | 24 M   |
+| `b`  | DINOv2-base     | 768    | 12     | 200     | 94 M   |
+| `l`  | DINOv2-large    | 1024   | 24     | 200     | 317 M  |
 
-### Two model families: segmentation & detection
+The default input is 644 px (patch-14 aligned, so DINOv2's weights load 1:1). Two families: `instance` (masks, the
+default) and `detect` (boxes only, a DETR-style box head).
 
-Both families share the same DINOv2 encoder, query mechanism, NMS-free matching and
-auxiliary heads — they differ only in the head on top and what they output:
+What differs from the reference EoMT, all on by default and measured on real data:
 
-| family | `--task` | output | metric driving `best.pt` |
-|--------|----------|--------|--------------------------|
-| **instance** (default) | `instance` | per-instance **masks** + boxes + class | `segm/mAP` |
-| **detect** | `detect`  | per-instance **boxes** + class (DETR-style box head, no masks) | `bbox/mAP` |
-
-```python
-EoMT("l").train(data="coco", family="instance")   # masks (default)
-EoMT("l").train(data="coco", family="detect")     # boxes only
-```
-
-The family is recorded in the checkpoint, so `val` / `predict` pick the right
-post-processing automatically. Everything below applies identically to both.
-
-### Models & sizes
-
-| size | backbone        | hidden | layers | heads | queries | params |
-|------|-----------------|--------|--------|-------|---------|--------|
-| `s`  | DINOv2-small    | 384    | 12     | 6     | 100     | 24 M   |
-| `b`  | DINOv2-base     | 768    | 12     | 12    | 200     | 94 M   |
-| `l`  | DINOv2-large    | 1024   | 24     | 16    | 200     | 317 M  |
-
-Default input is a patch-14-aligned square (`644 = 14 × 46`) so DINOv2 weights load 1:1. The `detect` family drops the
-mask-upsampling head and is lighter; each attribute head adds only a thin linear / MLP layer.
+- **Small objects stay visible.** Masked attention max-pools the mask logits onto the patch grid (a query whose mask
+  touches no patch attends to all of them, as in Mask2Former), matching scores every query on every cell of the mask
+  grid, and dice is computed on every GT pixel — so instances of a few pixels are matched and supervised.
+- **A multi-scale pyramid** (ViTDet-style FPN) that the queries cross-attend to.
+- **Scores that rank masks by quality**: IoU-aware class targets and a mask-quality head (Mask Scoring R-CNN).
 
 ---
-
 ## Factorizing the label space
 
 This is the contribution. Conventional detectors fold every distinction into one flat
@@ -127,776 +122,230 @@ product + facing**, **documents → element + role**, **cells → type + health*
 
 ---
 
-## Training — it rides on the detector's own match
+## Data
 
-Attributes never run their own matcher. Detection already solves "which query is
-responsible for which ground-truth object" via the **Hungarian matcher**; attributes
-simply reuse that same query→GT assignment and read the answer off the matched queries.
+A COCO instance-segmentation (or detection) JSON. Everything the model needs is read from it: the classes from
+`categories`, the attribute heads from two additions.
 
-- **Embedding source.** Each head reads the per-query embedding — the input to EoMT's
-  `class_predictor`, captured with a forward hook (`[B, Q, hidden]`).
-- **Matching.** Supervision reuses EoMT's *own* Hungarian matcher
-  (`model.eomt.criterion.matcher`), so every attribute is trained on the **same**
-  query→GT assignment the detection loss used; the attribute is read *after* matching.
-- **Gate.** An optional IoU gate drops barely-overlapping matched pairs (common early in
-  training) so attributes only learn from queries that actually localize the object.
-- **Loss.** Cross-entropy per head over matched queries (a regression head: Huber on its
-  standardized value, see below), summed across heads and scaled
-  by `aux_w` (default `1.0`), added to the detector loss. Empty-match batches contribute
-  a graph-preserving zero, and missing labels use `ignore_index` and contribute nothing.
-- **Balancing.** Both losses are O(1), so equal weights are a sane start. `aux_w_per_head`
-  weights each head, `aux_class_weights=True` re-weights rare classes (rare values of a
-  regression head, by smoothed density), and `aux_balance="uncertainty"` learns one weight
-  per head (Kendall et al. 2018) with the detector loss as the fixed anchor. Each epoch
-  prints every head's pull on the shared queries (its gradient norm over the detector's,
-  `train/aux_grad/<head>`): well above 1 a head steers the encoder, far below it only reads it.
-- **Checkpoint selection is unchanged.** The attribute "rides along": its per-head
-  matched-query accuracy is shown live and written to `metrics.csv`, but never drives
-  `best.pt` (still `segm/mAP` or `bbox/mAP`).
-- **Inference.** Each result attaches `aux = {head: {"ids", "probs"}}` for the kept
-  detections (and `aux_values = {head: values}` in real units for the regression heads), and
-  `predict(plot=True)` renders each attribute next to the class label
-  using names stored in the checkpoint.
-
----
-
-## Data format (auto-discovered from the COCO JSON)
-
-Attributes live **inside the COCO annotations** — each annotation is already a
-per-instance object, so alignment is automatic and `pycocotools` still parses it. Just
-two additions to a standard COCO file — heads (count, classes, names) are discovered from the
-JSON, the same as `nc`. The dataset holds **only data** (each attribute's name, type and
-categories); which attributes get a head and how each one learns (`applies_to`, `flip_aware`,
-`log`, `range`, `crop`) is the **run config**'s `attributes` section — see *Run config* below.
-
-**1. A top-level `attributes` list** — one entry per head, defining its vocabulary:
+**1. A top-level `attributes` list**, one entry per attribute, with its categories, or `"type": "regression"`:
 
 ```jsonc
 "attributes": [
-  {
-    "name": "scale",
-    "categories": [
-      {"id": 1, "name": "small"},
-      {"id": 2, "name": "modest"},
-      {"id": 3, "name": "large"}
-    ]
-  },
-  {
-    "name": "viewpoint",
-    "categories": [
-      {"id": 0, "name": "frontal"},
-      {"id": 1, "name": "side"},
-      {"id": 2, "name": "back"}
-    ]
-  }
-]
-```
-
-**2. A per-annotation `attributes` map** — `{head: raw_id}` on each instance:
-
-```jsonc
-{
-  "id": 1, "image_id": 42, "category_id": 1,
-  "segmentation": [...], "bbox": [...], "area": 1234, "iscrowd": 0,
-  "attributes": {"scale": 3, "viewpoint": 0}
-}
-```
-
-Notes:
-
-- Raw ids are remapped to a contiguous `0..n-1` per head (so `scale`'s `1`/`2`/`3` become
-  `0`/`1`/`2`); `categories` may be omitted, in which case the id set is inferred.
-- A **missing or out-of-vocab** per-annotation value is *ignored* (`-100`), not trained as
-  class `0` — so a **partially tagged** dataset is valid: each head learns only from the
-  instances that actually carry its value. A JSON with **no** `attributes` ⇒ detection-only,
-  exactly as before.
-
-**Class-conditional heads.** Give an attribute an optional `applies_to` list of primary-class
-names or ids in the run config, and that head is only trained on — and only emitted for —
-instances of those classes (hard routing on the primary class). Omit it and the head applies
-to every class. So different attributes can attach to different classes, each with its own
-label set, in one model:
-
-```yaml
-# run config
-attributes:
-  posture: {applies_to: [cat, dog]}
-```
-
-At inference a scoped head reports `ids = -1` ("not applicable") for detections whose class it
-does not cover. The scope is stored in the checkpoint, so it survives reload.
-
-**Flip-aware attributes.** A horizontal flip mirrors the photo but not the labels, so an attribute
-that encodes a side (a left shoe shows up as a right one) is corrupted by `flip_prob > 0`. Give
-it `flip_aware` in the run config, a map of category names to the ones they become on a horizontal
-flip, and the training augmentation swaps them for every instance it flips (each pair swaps both
-ways, so `{left: right}` is enough; unlisted categories stay as they are):
-
-```jsonc
-// data: the attribute's categories
-{"name": "side", "categories": [{"id": 0, "name": "left"}, {"id": 1, "name": "center"}, {"id": 2, "name": "right"}]}
-```
-
-```yaml
-# run config: how it learns
-attributes:
-  side: {flip_aware: {left: right}}
-```
-
-Mosaic, mixup and copy-paste flip each source image independently, and the swap follows each
-instance. Only the horizontal flip is handled: keep `vflip_prob` and `rot90_prob` off for such an
-attribute. It is categorical only. The mapping is stored in the checkpoint, and test-time augmentation with
-`flip` swaps it back in each mirrored view's prediction before the views are merged (a checkpoint saved before the
-mapping was stored takes it from the val JSON, with a warning). The training banner lists each head's swapped pairs. A
-regression head needs no mapping: its value must not change under a flip (see below).
-
-**Regression attributes.** `"type": "regression"` in the data makes a head regress one real number
-per instance instead of choosing a category; categorical and regression heads mix freely in one
-dataset. In the run config, `log` (regress `log1p` of the value, for heavy-tailed positives such as
-costs) and `range` (valid values; predictions are clipped to it) are optional, and `applies_to` works as above:
-
-```jsonc
-// data
-"attributes": [
-  {"name": "grade", "categories": [...]},
+  {"name": "scale", "categories": [{"id": 1, "name": "small"}, {"id": 2, "name": "modest"}, {"id": 3, "name": "large"}]},
   {"name": "price", "type": "regression", "unit": "EUR"}
 ]
-// per annotation:
-"attributes": {"grade": 3, "price": 812.5}
 ```
 
-```yaml
-# run config
-attributes:
-  grade:
-  price: {log: true, range: [0, 20000], applies_to: [sofa]}
-```
-
-A missing, non-numeric or out-of-range value is ignored. The head is trained on the value
-standardized by the train split's mean and std (stored in the checkpoint), validated as the
-mean absolute error in real units (`val/aux_mae/<head>`; `metrics.png` gives each regression
-head its own MAE panel, `aux_per_class.png` its MAE per primary class), and predicted in real units
-(`aux_values`). The MAE is dominated by the large values: a `log` head also reports the MAE of
-the `log1p` values (`aux_logmae`) and the median of prediction / GT (`aux_ratio`), and `bins`
-in the run config (`area: {log: true, bins: [10, 35]}`) reports them per GT-value bucket too
-(`aux_mae/area@<10`, `@10-35`, `@>=35`). The value must not change under the augmentations (scale, crop, flip,
-rotation): a cost or a score is fine, a pixel area or an angle is not. Tracking votes on the
-categorical heads only, and re-identification cannot gate on a regression head.
-
-A value that depends on how much of the instance is in view can say so with `crop`: the
-training augmentation measures, per instance, the fraction it keeps in view (mask mass, or box
-area, inside the crop window, after copy-paste occlusion), and the value follows it.
-`"crop": "scale"` multiplies the value by that fraction — for an extensive quantity such as the
-object's surface in cm² (half the object cropped away ⇒ half the surface). `"crop": "ignore"` drops the
-value when less than `min_visible` (default `0.9`) is kept — for a property of the whole object
-that a cut view no longer shows. Validation and inference see whole images, so the head predicts
-the full value there:
-
-```yaml
-# run config
-attributes:
-  surface_cm2: {log: true, crop: scale}
-  length_cm: {crop: ignore, min_visible: 0.95}
-```
-
-The fraction is the share of the instance's mask mass kept inside the window (box overlap for the detect family),
-exposed as `TrainAugment.last_info["visible"]`. `crop` applies to regression heads only, is training-only (not stored in
-the checkpoint), and is not applied to a custom `transform=`.
-
-**Sidecar format (optional).** You can keep the COCO JSON as plain, standard COCO and put the
-attributes beside it instead of inside it: an `attributes.yaml` schema (same keys, regression heads included) in the dataset root plus
-`attributes/<split>.json` values keyed by annotation id (`{ann_id: {head: value}}`). If present
-(and the JSON has no embedded `attributes`), it is merged in memory at load — so a plain COCO
-dataset always works and the sidecar is picked up automatically when you add it. Embedded
-`attributes` in the JSON take precedence.
-
-A tiny, self-contained example (two heads, including a non-contiguous id set) lives in
-[sample_data/](sample_data/), with its run config [sample_data/run.yaml](sample_data/run.yaml).
-
-Datasets built before the run config may still carry `applies_to` / `flip_aware` / `log` / `range` / `crop` in their
-attribute definitions: they are still read, and the run config's `attributes` win over them.
-
----
-
-## Run config (one YAML per run)
-
-**The dataset holds the data; one YAML holds the run.** The COCO JSONs carry the images, the instances and each
-attribute's name, type and categories — nothing about training. Everything else is written out in the YAML that
-`--data` points at, the **run config**: the data paths, which attributes get a head and how each learns, the
-augmentation, the `train()` settings and the inference settings saved with the model. One file says how a model was
-made, so a run can be read, repeated and compared from it. Start from the commented template
-[`sample_data/run.yaml`](sample_data/run.yaml):
-
-```yaml
-# --- data
-path: .
-train_images: images/train
-train_json: annotations/instances_train.json
-val_images: images/val
-val_json: annotations/instances_val.json
-
-# --- the heads, and how each learns: flip_aware, crop, min_visible, log, range, applies_to
-#     (an attribute of the data left out gets no head; no section: every attribute as the data declares it)
-attributes:
-  scale:
-  viewpoint:
-  # side: {flip_aware: {left: right}}
-  # price: {log: true, range: [0, 20000], applies_to: [sofa]}
-  # surface_cm2: {log: true, crop: scale}
-
-# --- augmentation: AugConfig fields over its defaults (`train_aug`, the older name, is the same section)
-aug:
-  flip_prob: 0.5
-  min_scale: 0.4
-  max_scale: 1.6
-
-# --- train() keywords: anything train() takes but the data paths (the size: --size, the device: --device)
-train:
-  project: ../runs/train
-  name: sample
-  epochs: 12
-  imgsz: 644
-  batch: 4
-  # init_weights: ../runs/train/eomt-l/weights/best.pt   # warm start from a checkpoint
-
-# --- saved in every checkpoint: the defaults of predict() / track() with that model
-inference:
-  conf_thres: 0.3
-  max_det: 100
-```
-
-```bash
-python scripts/train.py --data sample_data/run.yaml --size s --device 0,1     # the whole run from the file
-python scripts/train.py --data sample_data/run.yaml --size s --epochs 1       # a flag beats the file
-python scripts/predict.py runs/train/sample/weights/best.pt images/           # with the conf_thres it was saved with
-```
-
-- **Precedence:** explicit arguments (command line, `train()` / `EoMT.train()` keywords) beat the YAML, which beats the
-  library's defaults. Relative paths (`path`, `train.init_weights`, `train.project`) are relative to the YAML.
-- **Recorded:** `args.yaml` in the run folder and every checkpoint (`run_config`) hold the resolved run — every
-  hyper-parameter, the augmentation and how each head learned (with its regression statistics); the checkpoint also
-  keeps `inference`, which `predict()` / `track()` (and `scripts/predict.py`) use for any setting the call leaves out.
-- **Errors early:** an attribute the YAML configures but the data does not define, an unknown behavior or inference key,
-  or a data path / size / device inside `train` stops the run before it starts.
-
-## Cross-photo re-identification
-
-Given several photos of one subject, `infer_match()` decides which detections are the same physical instance, with no
-second model and nothing retrained: the per-query embedding that feeds the class head is the fingerprint. Photos are
-matched pairwise with the Hungarian matcher and linked into identities with union-find (at most one instance per photo,
-plus a merge guard against transitive chaining). `group_by` limits which pairs may compete (same class by default; add
-attribute heads to tighten it) and `sim_thres` (cosine, default `0.7`) is the floor for "same instance". Each run
-writes its candidate pairs and similarity diagnostics to JSON, so the threshold can be retuned without re-running
-inference.
-
-```python
-result = EoMT("runs/train/eomt-l/weights/best.pt").infer_match("photos/subject_42/", group_by=("class",))
-```
-
-```bash
-python scripts/match.py weights/best.pt photos/ --each-subdir   # one folder per subject
-```
-
-Every option is documented in [`eomt/engine/match.py`](eomt/engine/match.py) and `python scripts/match.py --help`.
-
-### Predicting the photos together (cross-view)
-
-Re-identification links what each photo found on its own. A **cross-view** model predicts
-the photos of one subject (1–4) in **one** forward pass: after each of the four query
-blocks, the queries of every photo attend to the patches and queries of the *other*
-photos (plus a null token to abstain). An instance that is tiny or covered in one photo
-can be found because another shows it clearly, and an ambiguous close-up can take its
-class and attributes from the wide shot. Each photo's masks still cover only what that
-photo shows, and a photo alone is predicted bit for bit as before. A small matching head
-embeds every instance for the cross-photo links.
-
-It is a post-training of an existing checkpoint, and it needs no multi-photo annotations:
-each set is made from one annotated photo — a hard view (shrunken, degraded, occluded or a
-close-up), a view that clears it up, and optionally a distractor photo and a mirrored copy
-— and every instance keeps its annotation id across the views:
-
-```bash
-# post-train a trained model -> runs/train/multiview/weights/best.pt
-python scripts/train_multiview.py --data my/data.yaml --weights runs/train/eomt-l/weights/best.pt --device 0,1
-
-# predict the photos of each subject together: photos/ holds one subject's photos, or a subfolder per subject
-python scripts/predict.py runs/train/multiview photos/ --subject
-```
-
-`scripts/train_multiview.py` is `scripts/train.py` with the recipe as defaults (`--multiview configs/xview.yaml
---batch 1 --epochs 2 --val-interval 1 --name multiview`); any other flag of `scripts/train.py` can be added and wins.
-In Python, `EoMT(path).predict("photos/", subject=True)`.
-
-The default config is stage A: only the new modules train (about 18 M parameters on `l`),
-the checkpoint stays frozen; stage B adds `query_blocks: 0.1` to `trainable`. A `trainable` key
-may also be a parameter-name prefix, which wins over the groups: `{heads: 0.2, aux_heads.<head>: 1.0}`
-moves one attribute head faster, `{aux_heads.<head>: 1.0}` with `sets: {p_single: 1.0}` fine-tunes
-that head alone on single photos. A warm start lists the modules that start fresh. `best.pt` is
-chosen on fixed synthetic validation sets: the hard photo's segm mAP predicted with its set
-(`val/sets/segm/mAP_set`, next to `_alone`), its attributes, and the link F1 of the
-matching head against re-ID (`val/sets/match/*` vs `val/sets/reid_set/*` and `val/sets/reid/*`, see
-[Linking the photos](#linking-the-photos)). Synthetic sets
-show neither real viewpoint changes nor real reflections: measure on real multi-photo sets
-before trusting a gain. `infer_match()` and `scripts/match.py` predict a cross-view
-checkpoint jointly (`joint=False` for one pass per photo), with its calibrated embedding,
-threshold and gate; `eomt.engine.predict.predict_set` returns the per-photo results alone.
-
-For a subject with more photos than a set holds, `eomt.engine.predict.predict_subject` groups
-them (`subject_sets`) and returns one result per photo: `mode="order"` (the default) predicts
-them `max_views` at a time in the given order, every photo once (about the cost of predicting
-them one by one); `"partition"` groups similar photos (mean patch token of a small pass);
-`"anchor"` predicts each photo with its `k` most similar others. On real multi-photo sets
-(close-ups plus overviews of each subject) the three gave the same gain: what helps is seeing
-other photos of the subject, not a particular one. `scripts/predict.py --subject [MODE]` and
-`predict(subject=MODE)` take the mode (`--subject` alone is `"order"`).
-
-### Real multi-photo datasets
-
-Synthetic sets need no multi-photo annotations, but they show no real viewpoint change. With
-annotated photos of the same subjects, the post-training also draws **real sets**: several
-photos of one subject, each predicted with the others, the instances linked across them. The
-data is a COCO instance-segmentation file like any other, with four optional additions
-([`eomt/data/subjects.py`](eomt/data/subjects.py)):
+**2. A per-annotation `attributes` map**, `{attribute: value}`:
 
 ```jsonc
-"images": [
-  {"id": 1, "file_name": "subject_42/front.jpg", "subject_id": "subject_42"},     // a photo of subject_42
-  {"id": 2, "file_name": "subject_42/closeup.jpg", "subject_id": "subject_42", "supervision": "positives"},
-  {"id": 3, "file_name": "subject_42/side.jpg", "subject_id": "subject_42", "supervision": "none"}
-],
-"annotations": [
-  {"id": 10, "image_id": 1, "category_id": 3, "instance_id": 7, ...},   // the same physical instance ...
-  {"id": 11, "image_id": 2, "category_id": 3, "instance_id": 7, ...},   // ... in another photo of subject_42
-  {"id": 12, "image_id": 1, "category_id": 5, ...},                     // not linked to the other photos
-  {"id": 13, "image_id": 3, "category_id": 3, "iscrowd": 1, ...}        // a region to leave out of the loss
-]
+{"id": 1, "image_id": 42, "category_id": 1, "segmentation": [...], "bbox": [...], "attributes": {"scale": 3, "price": 812.5}}
 ```
+
+Raw ids are remapped to `0..n-1` per attribute. A **missing or unknown value is ignored** by that attribute's loss, never
+trained as class 0, so a partly tagged dataset is fine; a JSON without `attributes` is plain instance segmentation.
+The attributes can also live beside a plain COCO file: an `attributes.yaml` schema in the dataset root plus
+`attributes/<split>.json` values keyed by annotation id. [`sample_data/`](sample_data/) holds a tiny example.
+
+**Photos of one subject** (for `multiview`) add to the same file:
 
 | key | meaning |
 |-----|---------|
-| image `subject_id` | photos with the same id show the same subject; photos without one take no part in the real sets |
-| image `supervision` | `full` (default): every instance is annotated, the rest is background. `positives`: only some are; nothing unannotated is taught as background (the photo's unmatched queries take no "no object" loss). `none`: input only for the other photos of its set |
-| annotation `instance_id` | the same physical instance in every photo of the subject that shows it (a number or string); the matching head learns those links. Absent: linked to nothing |
-| annotation `iscrowd: 1` | unsure pixels: a query whose mask lies mostly inside takes no "no object" loss, and validation drops detections there (single-photo training already skips these annotations) |
-| image `view_type` | optional: what kind of photo it is (a number or string, e.g. which side of the subject it shows, or a close-up); with `view_types: true` the cross-view attention is told each photo's type |
+| image `subject_id` | photos with the same id show the same subject; photos without one take no part in the sets |
+| annotation `instance_id` | the same physical instance in every photo of the subject that shows it (a number or a string); the matching head learns these links |
+| image `supervision` | `full` (default): every instance is annotated. `positives`: only some are, so nothing unannotated is taught as background. `none`: the photo is only input for the others |
+| annotation `iscrowd: 1` | a region left out of the loss: detections there are neither right nor wrong |
 
-Partly annotated photos are what pseudo-labelling gives: labels that list some instances per
-photo, or say which photos show an instance but not where. The loss then trains on what is
-known and leaves the rest out, instead of teaching it as background.
+`eomt.data.subjects_from_file_names` sets `subject_id` from file names that start with the subject (`<subject>_...`).
 
-Real sets join the post-training through the `real` section of the multiview config. A share
-`p` of the sets are real, the rest synthetic sets from the run's own train data:
+---
+
+## The run config
+
+**The dataset holds the data; one YAML holds the run.** Its sections are the settings of `train()`, each with the
+reference recipe as its default, so a run config only says what differs. Start from the commented template
+[`sample_data/run.yaml`](sample_data/run.yaml):
 
 ```yaml
-# in the multiview config (a copy of configs/xview.yaml), next to its other keys
-real:
-  json: datasets/my_subjects/annotations/train.json     # default: the run's train data
-  images: datasets/my_subjects/images
-  val_json: datasets/my_subjects/annotations/val.json   # real validation sets; best.pt is chosen on them
-  val_images: datasets/my_subjects/images               # default: images
-  p: 0.5                    # share of the training sets that are real (1 = real only)
-  sets:                     # eomt.data.subjects.SubjectSetConfig
-    max_views: 4
-    sizes: {2: 0.2, 3: 0.2, 4: 0.6}   # set sizes (capped by the subject's photos)
-    p_single: 0.0           # sets of the anchor photo alone
-    p_shared: 0.5           # companions sharing a linked instance with the anchor first
-    p_hard: 0.0             # sets whose anchor is made hard (shrunk, degraded, close-up, occluded); companions stay real
-    # hard: {small: 1.0, degraded: 1.0, closeup: 1.0, occluded: 1.0}
-  # val_sets: runs/train/other/real_val_sets.json   # fixed validation sets (every run writes its own)
+path: datasets/garments                  # data: paths relative to this file
+train_images: images/train
+train_json: annotations/train.json
+val_images: images/val
+val_json: annotations/val.json
+
+attributes:                              # which attributes get a head, and how each learns
+  scale:
+  side: {flip_aware: {left: right}}      # swapped when the augmentation mirrors the photo
+  price: {log: true, range: [0, 20000], applies_to: [sofa]}
+
+train: {epochs: 12, batch: 4, imgsz: 644}
+aug: {min_scale: 0.4, max_scale: 1.6}
+inference: {conf_thres: 0.3}             # saved with the model: the defaults of predict() / match()
 ```
 
-Every photo of a subject that trains is the first photo of one set per epoch, with companions
-from the same subject. Each photo is augmented on its own, but the horizontal flip is drawn
-once per set, so left and right never mix within a subject. With real validation sets
-(`val_json`; without `json`, the run's val data when its images have a `subject_id`),
-`best.pt` is chosen on `val/real/segm/mAP_set`: every fully annotated photo of each fixed set,
-unaugmented (fitted to the input) and predicted with its set (`_alone` next to it), and the
-links are scored against the annotated instance ids (`val/real/match/*`; a detection that is no
-annotated instance in a photo not fully annotated, or lies in a crowd region, has no known link
-and is left out). The synthetic sets can also take other photos of the same
-subject as companions (`sets.fill: {subject: 1.0}`, `p_subject`); their instances are then not
-linked. `eomt.data.subjects_from_file_names` sets `subject_id` from file names that start with
-the subject (`<subject>_...`).
+| section | what it holds (`eomt.engine.train`) |
+|---------|--------------------------------------|
+| `train` | the keywords of `train()`: `epochs`, `batch` (per GPU), `nominal_batch` (16: the rest is accumulated), `imgsz`, `workers`, `seed`, `init_weights`, `project` / `name`, `stop_after_epochs` |
+| `model` | the architecture and loss weights of a new model (`ModelConfig`): `fpn_scales`, `num_upscale_blocks`, `iou_aware_cls`, `quality_weight`, the attribute heads' shape |
+| `optim` | `OptimConfig`: `lr0`, `llrd`, `warmup_steps`, `poly_power`, `clip_norm`, `ema_decay`, `mask_anneal` |
+| `aux` | how the attribute heads train (`AuxConfig`): `w`, `per_head`, `class_weights`, `iou_gate`, `class_gate` |
+| `aug` | the augmentation (`AugConfig`) |
+| `val` | `ValConfig`: `interval`, `imgsz`, `group_by` (metrics per value of an image field), `best_key` |
+| `multiview` | a post-training on photos of one subject (`MultiviewConfig`, below) |
+| `attributes`, `inference` | the heads and how each learns; the predict defaults saved in the checkpoint |
 
-Most of what a model must find can be found in one photo, so the cross-view path gets little
-pull from ordinary sets. Three options give it work that needs the other photos:
-
-| `multiview` key | what it does |
-|---|---|
-| `real.sets.p_hard` | the anchor of a real set is made hard as in a synthetic case (shrunk, degraded, a close-up, occluded) while its companions stay real photos, so the evidence must come from them |
-| `linked_w` | weighs the detection and attribute losses of the **linked** instances, those another photo of the set shows |
-| `consistency_w` | the views of one instance agree on their attributes: symmetric KL of the categorical heads' distributions (and, for a regression head listed in `consistency_heads`, the distance of its predictions) between the queries matched to one `instance_id` in two photos. No label needed: a photo whose annotation lacks an attribute is pulled towards what its other views predict |
-| `view_types` | each photo's `view_type` is embedded and added to its tokens in the cross-view attention (zero at start), so a query knows what kind of photo each other photo is; the vocabulary is stored in the checkpoint and `predict_set(view_types=[...])` takes the types at inference |
-| `xview.keys` | what a query reads in the other photos: `both` (their queries and patches, the default), `queries` (far cheaper) or `patches` |
-| `trainable.xview_scale` | the cross-view LayerScales get their own LR multiplier (they open slowly) |
-
-A regression head that measures something physical (a surface, a length) can be listed in
-`consistency_heads` so that one instance gets one value across its views; a head trained with
-`crop: scale` predicts what is in view, so only list it when the photos show whole instances.
-
-### Linking the photos
-
-The links between photos are scored with three embeddings, on the same Hungarian-per-photo-pair
-linking as inference (`eomt.reid`): `match` (the matching head, in the joint forward),
-`reid_set` (the per-query embedding of the same joint forward: re-identification's fingerprint,
-same detections) and `reid` (the photos predicted alone, the baseline without cross-view). Every
-validation stores in the checkpoint the threshold of each embedding, their F1s and the one that
-linked best (`link_embed`); `predict_set`, `predict_subject` and `infer_match()` link with that
-one by default (`embed="match"` or `"reid"` picks one). `link_group_by` (gate keys: `class` and
-categorical heads) also scores the links within each gate group (`<embed>_gated/*`), and the
-calibration and the default linking then use the gate. `<embed>/f1_stored` is the F1 at the
-threshold stored before the validation, not the best one of the same data (an optimistic number).
-
-The matching head's training can look more like inference:
-
-| `multiview` key | what it does |
-|---|---|
-| `match_loss: sigmoid` | a binary "same instance?" per pair of queries of two photos, with a learned scale and bias (SigLIP): calibrates absolute similarities, so one global threshold separates the links |
-| `match_loss: dustbin` | an optimal-transport assignment of each photo pair's similarities with a learned "no partner" score (SuperGlue): every instance is an anchor, its target its partner or the dustbin |
-| `match_residual: true` | the head starts as re-ID's fingerprint plus a residual whose last layer is 0, so it starts at re-ID's F1 (exactly when `match_dim` is the hidden size) |
-| `match_neg_conf: 0.3` | the queries no target matched that score at least that much (false detections and duplicates, outside ignore regions of fully annotated photos) become negatives |
-| `match_hard_w`, `match_hard_by` | weigh the negatives that agree on the class and the listed attributes, the confusions that remain |
-
-Each epoch prints what the loss sees (`train/match/pos_cos`, `hardneg_cos`, `unpaired`: the mean
-cosine of the pairs of one instance, of each query's hardest other, and the share of instances
-with no partner in their set).
-
-### Identities over a whole subject
-
-A subject often has more photos than a set takes. `predict_subject(..., identities=True)` links
-the detections of every photo with those of every other (across the groups too), clusters them
-transitively with the merge guard, and returns one identity per detection and one record per
-identity, with its attributes voted by mean probability and its regression values fused (the
-score-weighted mean, in log space for a `log` head):
-
-```python
-from eomt.engine.predict import predict_subject
-
-out = predict_subject(model, photos, device="cuda", imgsz=644, groups=[[0, 3, 4], [1, 2]], identities=True)
-out["images"][0]["identity_ids"]       # an identity per detection of photo 0
-out["identities"][0]["attributes"]     # the identity's fused attributes and "values"
-```
-
-`groups` gives the groups (photo indices) instead of `mode`; the photos no group lists are
-predicted alone. Validation scores the same thing per subject on the real sets:
-`real/<embed>/cluster_{f1,precision,recall}` (B-cubed), where a transitive error costs more than
-a pair.
-
-### Validating a post-training
-
-Besides the metrics above, a set validation reports `segm/{mAP,AR100}_linked_{alone,set}`: the
-instances another photo of the set shows, where cross-view can help (`_unlinked_` the rest), so a
-gain is not diluted by the instances only one photo shows. On real sets, `aux_agree/<head>_{alone,set}`
-measures what `consistency_w` asks for: of every two photos of a set whose detections match one
-linked instance, the share that predict the same value of a categorical head (no label needed); the
-epoch log gives the consistency loss's share of the total. `train(val_group_by="<image field>")`
-adds the mAP and the link F1 per value of that field, and `best_key` chooses `best.pt` on another
-metric or a weighted sum (`{"real/segm/mAP_linked_set": 1.0, "real/match/f1": 0.1}`). In the
-`multiview` config, `val_synthetic: false` skips the synthetic sets when there are real ones and
-`val_interval: {real: 1, synthetic: 2, photos: 2}` validates each part at its own pace.
-
-The validation runs standalone, with the same keys as `metrics.csv` (without `val/`):
-
-```python
-EoMT("runs/train/multiview").val(multiview=True)                       # the run's own validation, from its checkpoint
-EoMT("other/best.pt").val(multiview=True, run="runs/train/multiview",  # another model, validated as that run did,
-                          sets_file="runs/train/multiview/real_val_sets.json")  # on the same fixed sets
-```
+Arguments beat the file: a keyword of `EoMT.train()` replaces a `train` value, and a section given as a mapping is merged
+over the YAML's key by key (`model.train(data="run.yaml", optim={"lr0": 5e-5})`). An unknown key stops the run before it
+starts. The resolved run is written to `args.yaml` in the run folder and into every checkpoint.
 
 ```bash
-python scripts/val.py other/best.pt --multiview --run runs/train/multiview --sets-file runs/train/multiview/real_val_sets.json
+python scripts/train.py --data run.yaml --size l --device 0,1                    # the run as its YAML says, two GPUs
+python scripts/train.py --data run.yaml --epochs 1 --set optim.lr0=5e-5          # any setting: --set SECTION.KEY=VALUE
+python scripts/train.py --data run.yaml --weights best.pt --set optim.mask_anneal=false   # warm start
+python scripts/train.py --data run.yaml --resume runs/train/my-run                # continue a run exactly
 ```
-
-Every run writes its fixed real validation sets (`real_val_sets.json`, the photos' file names);
-read back (`--sets-file`, or `real.val_sets` in a training), two models or two versions of a
-dataset are scored on the same sets of the photos they share. Every checkpoint (`best.pt` too)
-records its epoch, the `metrics.csv` row it was saved with, `best_key`, and the run with the
-warm-start weights and the data files and their SHA-256 (`run_config.provenance`);
-`scripts/info.py` prints them. Each epoch prints its peak GPU memory in training and in validation
-and the share of the epoch spent waiting for data; validation frees its cache afterwards. In a log
-file (stderr not a terminal) progress is one plain line per 10 % or 5 minutes instead of a
-carriage-return bar.
 
 ---
 
-## Install
+## Attributes
 
-```bash
-pip install attr-eomt                  # from PyPI
-pip install "attr-eomt[logging]"       # + tensorboard/wandb
-pip install -e ".[dev]"                # from source (editable; [dev] adds pytest/build/twine)
-```
+- **Categorical** heads train with cross-entropy, **regression** heads with a Huber loss on the standardized value
+  (`log1p` first with `log: true`, for heavy-tailed positives); predictions come back in real units (`aux_values`),
+  clipped to `range`.
+- **`applies_to`** (class names) scopes a head to some classes: it trains only on them and reports `ids = -1` ("not
+  applicable") for the others. Different attributes can attach to different classes in one model.
+- **`flip_aware`** (`{left: right}`) swaps an attribute that encodes a side when the augmentation mirrors the photo,
+  and test-time augmentation swaps it back. Keep `vflip_prob` / `rot90_prob` off for such an attribute.
+- **`crop`** (regression): `scale` makes the value follow the share of the instance the augmentation keeps in view (an
+  extensive quantity such as a surface), `ignore` drops it below `min_visible` (a property of the whole instance).
+- **`bins`** (regression) reports the errors per GT-value bucket too.
 
-## Usage
-
-Everything goes through one class. Initialize from a **size** (fresh model, pretrained
-DINOv2 backbone) or from a **checkpoint / run folder** (family, size, classes, image
-size, normalization and any auxiliary heads are auto-detected from the `.pt`):
-
-```python
-from eomt import EoMT
-
-# Train on COCO 2017 (auto-downloaded on first run):
-EoMT("l").train(data="coco", batch=4)   # 12 epochs, validated every 2: the official recipe
-
-# ...or any COCO-format dataset, the run written out in its run config (see "Run config"):
-EoMT("s").train(data="sample_data/run.yaml")
-EoMT("s").train(data="sample_data/run.yaml", epochs=1)   # a keyword beats the file
-
-# Validate and predict from a trained run:
-EoMT("runs/train/eomt-l").val(data="coco")
-EoMT("runs/train/eomt-l").predict("images/", plot=True)   # writes annotated images
-```
-
-**Several GPUs.** `device="0,1"` trains on both GPUs, one process each (DistributedDataParallel); `"auto"` is GPU 0.
-`batch` is per GPU and `nominal_batch` (16) stays the global effective batch, so the optimizer steps, LR schedule and
-masked-attention annealing are exactly those of one GPU. Validation splits the val images between the GPUs; the main process scores them and alone logs and writes checkpoints. The processes are spawned, so every `train()`
-argument must be picklable. `ddp={...}` overrides the `DistributedDataParallel` settings (default
-`find_unused_parameters=True`), e.g. `{"gradient_as_bucket_view": True}`, to measure their speed.
-
-```python
-EoMT("l", device="0,1").train(data="coco", batch=2)   # 2 per GPU x accum 4 x 2 GPUs = effective 16
-```
-
-**Test-time augmentation and tiled inference** (instance family). `predict()` and `val()` take `augment=True` (the
-image at `imgsz` and zoomed to 1.5x `imgsz`) and `tiles=True` (overlapping tiles of `imgsz` px of the original image, i.e. native resolution,
-25 % overlap, plus the whole image: small objects in large images). The views' instances are merged: same class and
-mask IoU >= 0.5 measured where both views can see, so an object cut by a tile border is put back together; the mask
-logits are averaged and the score is the mean over the views that could see the object (one that missed it votes 0).
-Each takes a dict of overrides; see
-[`eomt/tta.py`](eomt/tta.py). `augment={"flip": True}` also merges mirrored views. Attributes marked `flip_aware` are swapped
-back in a mirrored view; left / right *primary classes* are not (a mirrored view predicts them swapped), so keep `flip` off
-for those, and for attributes that encode a side without being flip-aware.
-
-```python
-m = EoMT("runs/train/eomt-l")
-m.predict("images/", augment=True)                                  # + the image at 1.5x imgsz
-m.val(data="data.yaml", tiles=True)                                 # native tiles + the whole image
-m.predict("images/", augment={"flip": True}, tiles=1024)            # 1x / 1.5x and mirrored; 1024 px tiles
-```
-
-`scripts/val.py` and `scripts/predict.py` take `--augment` and `--tiles [SIZE]` (`scripts/val.py` also `--flip`; its arguments are
-in [Command-line scripts](#command-line-scripts-arguments-and-things-to-take-into-account)). Each view is one more forward pass.
-
-For the full training recipe, every `train()` knob, and int8 compression, see the
-**[annotated explainer →](https://imagra93.github.io/attr-eomt)** — it's the deep dive.
-
-### Optimisation recipe
-
-`train()` follows the reference EoMT recipe (checked numerically against the official code: every parameter group's
-LR, every step of the LR schedule, and the masked-attention annealing agree exactly):
-
-| | default |
-|---|---|
-| optimizer | AdamW, `lr0=1e-4`, `weight_decay=0.05` (not applied to norms, biases and embeddings) |
-| head LR | `lr0` |
-| encoder LR | layer-wise decay `llrd=0.8`, `backbone_lr_mult=1.0`: the **top ViT block is at the full `lr0`** and each block below is 0.8× the one above; embeddings follow the first block, the final norm is at `lr0` |
-| schedule | polynomial decay (`poly_power=0.9`) to 0 after a two-stage warmup in optimizer steps `warmup_steps=(500, 1000)`: the head warms up while the ViT LR is held at 0, then the ViT ramps up |
-| masked attention | annealed block by block (`mask_anneal_start/end`, fractions of training: 1/6–2/6, 2/6–3/6, 3/6–4/6, 4/6–5/6, polynomial); the last sixth of training is mask-free |
-| length | `epochs=12`, validated every `val_interval=2` epochs and after the last (official COCO instance recipe, about 89k optimizer steps at batch 16) |
-
-In EoMT the last four transformer blocks are the ones that process the queries and predict the masks, so they must learn at
-close to the head's speed: scaling the whole encoder by 0.1 (as detector-style recipes do for a backbone) starves them. The
-LR decay and the annealing span `epochs`.
-
-**Validation follows the training regime**, as in the official EoMT: masked attention at the annealing probabilities of
-the epoch's end. A model that still masks is far worse without its masks, so a mask-free curve before the last sixth follows the
-annealing and jumps as each block finishes it, not the model. `best.pt` is deployed mask-free, so it is only chosen once every block's annealing is
-over (a run stopped earlier, e.g. with `stop_after_epochs`, has `last.pt` alone), and every checkpoint is saved mask-free.
-Training prints the windows in epochs when it starts.
-
-### Command-line scripts: arguments and things to take into account
-
-**`scripts/train.py`.** Every flag is a keyword of `train()`; a flag left out keeps `train()`'s default.
-
-| flag | `train()` keyword | what it does |
-|---|---|---|
-| `--data` | `data` | dataset YAML, or `coco` (auto-downloads) |
-| `--size` / `--task` | | model size `s` `b` `l`; head family `instance` (masks) or `detect` (boxes) |
-| `--epochs` | `epochs` | total epochs: the LR schedule and the masked-attention annealing span them |
-| `--batch` / `--nominal-batch` | `batch` / `nominal_batch` | micro-batch **per GPU** / global effective batch (16); the difference is gradient accumulation |
-| `--device` | `device` | `auto`, `cpu`, `cuda:N`, or `0,1` for several GPUs (one process each) |
-| `--weights` / `--resume` | `init_weights` / `resume` | warm-start a fresh run from a checkpoint / continue a run. **One of the two, not both** |
-| `--lr`, `--warmup HEAD,VIT` | `lr0`, `warmup_steps` | peak head LR (the encoder follows with layer-wise decay) and the two-stage warmup in optimizer steps |
-| `--ema-decay`, `--ema-tau` | `ema_decay`, `ema_tau` | EMA of the weights (what is validated and exported as `best.pt`) |
-| `--mask-free` | `mask_anneal_start/end` | no masked attention from step 0 (annealing windows 0 -> 0) |
-| `--aux-dropout` | `aux_head_dropout` | dropout in the attribute heads |
-| `--val-interval`, `--workers`, `--seed` | same | validate every N epochs (and after the last); data-loader workers per GPU; seed |
-| `--aug KEY=VALUE`, `--aug-preset` | `aug` | augmentation overrides (see [Augmentation](#augmentation)) |
-| `--fpn-scales`, `--box-head`, `--no-deep-supervision`, `--upscale-blocks`, `--iou-aware-cls`, `--quality-weight`, `--val-imgsz` | same | [architecture options](#architecture-options) |
-
-Things to take into account when training:
-
-- **Resume or warm start.** `--resume` continues a run exactly (epoch, optimizer, schedule, EMA, best metric) and re-reads the
-  architecture from the checkpoint: keep the other flags as they were, and the seed is ignored so the shuffle is not replayed.
-  `--weights` loads the weights only and starts a new run at epoch 0. Start from a `best.pt` (the EMA, saved mask-free); a
-  `last.pt` holds the live weights.
-- **A short fine-tune needs its own recipe.** Lower `--lr`, shorten `--warmup`, and lower `--ema-decay` (at 0.9999 the EMA
-  averages over ~10k steps and barely leaves its starting point in a few epochs). If the model is deployed mask-free, pass
-  `--mask-free`: with the default annealing a warm-started model is trained *masked* for the first sixth of the run, a regime it
-  no longer runs in.
-- **`best.pt` is only chosen mask-free.** With the default annealing that means from 5/6 of the schedule on; with `--mask-free`
-  every validation is eligible.
-- **Validated epochs only.** With `--val-interval N` the other epochs have empty validation cells in `metrics.csv`; the curves in
-  `metrics.png` join the validated points.
-- **Attribute heads follow the run config.** Which attributes train and their `applies_to`, `flip_aware`, `crop`, `log` and
-  `range` come from the YAML's `attributes` section (see *Run config*), else from the dataset's definitions; the training
-  banner lists them. The flip mapping, scope and regression statistics are stored in the checkpoint, and the whole run
-  config in `args.yaml` and the checkpoint's `run_config`.
-
-**`scripts/val.py`.**
-
-| flag | what it does |
-|---|---|
-| `weights` | checkpoint `.pt` or a run / weights folder (`best.pt` preferred) |
-| `--data`, `--batch`, `--workers`, `--device` | dataset YAML (`coco`), batch, data-loader workers, device |
-| `--imgsz` | evaluation input size (default: the trained one; the positional embeddings are interpolated) |
-| `--augment` | add the image at 1.5x `imgsz` |
-| `--tiles [SIZE]` | overlapping tiles (default `imgsz` px, native resolution) plus the whole image |
-| `--flip` | also run every view mirrored (alone: `--augment` with mirrored views) |
-| `--no-attributes` | mAP only |
-| `--ema`, `--mask annealed\|free` | validate the EMA weights of a `last.pt` (see below) |
-| `--group-by FIELD` | the main metrics per value of an image field too |
-| `--multiview [YAML]`, `--run`, `--sets-file`, `--parts`, `--link-group-by` | a multi-photo post-training's validation, rebuilt from the checkpoint's run or another run's (see [Validating a post-training](#validating-a-post-training)) |
-
-**`scripts/export.py`** writes a copy of a checkpoint with its Linear and Conv weights in bf16
-(`--dtype fp16`), about half the file, keeping everything the checkpoint records
-(`EoMT.save(path, dtype="bf16")` in code).
-
-Things to take into account when validating:
-
-- **What is reported.** `segm/*` and `bbox/*` mAP and, for a model with secondary heads, `aux_acc/<head>` (accuracy) and
-  `aux_mae/<head>` (regression heads, mean absolute error in real units). They are scored on the same predictions as the mAP, so
-  they also work with `--augment`, `--tiles` and `--flip`.
-- **The attribute population is the deployed one.** Each GT instance is matched to the kept detection of its class with the
-  highest mask IoU (one to one, IoU >= 0.5). The trainer's `val/aux_*` columns score matched *queries* instead, so the two differ
-  slightly: compare TTA against plain within the script's numbers, not against `metrics.csv`. A regression head's MAE is
-  dominated by its large values, so also look at a relative error before concluding.
-- **Regime.** A model that is still annealing is only meaningful with its masks: `--ema --mask annealed` reproduces the trainer's
-  validation of a `last.pt` (EMA weights, the masked-attention probabilities of that epoch, read from the run's `args.yaml`),
-  `--ema --mask free` is the deployed regime, and `best.pt` is already the EMA, mask-free.
-- **TTA is not free and not uniform.** It costs one forward pass per view and mostly helps small objects and strict-IoU mAP; the
-  classification heads often do not move. A regression head's prediction is *averaged over views at different zoom*, so a value
-  that depends on the object's apparent size can drift under TTA: check it against the plain run before relying on it.
-- **`--flip` and the heads.** Heads the checkpoint stores as flip-aware are swapped back in mirrored views; an older checkpoint
-  takes the mapping from the dataset's JSON, with a warning. Left / right *primary classes* are not handled: keep `--flip` off for
-  them. The val categories of every head must match the model's, or the run stops instead of scoring against the wrong ids.
-- **One process.** `scripts/val.py` runs on one device; the trainer's own validation uses all the GPUs.
-
-### Architecture options
-
-All are keyword arguments of `train()` (and flags of `scripts/train.py`); checkpoints record them, so `EoMT(path)` rebuilds
-the model with the same modules, and checkpoints without them load as before.
-
-| option | what it does |
-|---|---|
-| `fpn_scales=None` | drop the multi-scale FPN (default `(2, 1, 0.5)`) |
-| `box_head=True` | auxiliary box head: L1 + GIoU loss on the matched queries, and the same terms in the matching cost (a localisation signal that does not depend on the mask grid). Predicted boxes are returned as `aux_boxes` / `head_boxes` |
-| `deep_supervision=False` | stop supervising a query block's prediction once that block's masked attention is annealed away (while it masks, the prediction builds its attention mask and stays supervised). Blocks drop out at 2/6, 3/6, 4/6, 5/6 of training |
-| `num_upscale_blocks=3` | finer mask logits (368² at 644 px) for small objects; cannot warm-start a 2-block checkpoint |
-| `iou_aware_cls=True` | train a matched query's class probability towards `(1 + mask IoU) / 2` instead of 1 (IoU-aware targets, as in VarifocalNet / Stable-DINO), so the score ranks loose masks below tight ones; above 0.5, so matched queries keep their class for the attribute gate. Hard targets reduce exactly to the weighted CE |
-| `quality_weight=2` | mask-quality head: a small MLP on the query embedding predicts each matched query's mask IoU (BCE against the measured IoU, final prediction only; Mask Scoring R-CNN), and postprocess scores class probability x predicted IoU instead of the mean mask probability |
-| `val_imgsz=N` | validate (and pick `best.pt`) at another input size than `imgsz`. Scale jitter shows the objects larger, on average, than a val image resized to `imgsz`: validate at `imgsz` × the mean training scale |
-| `stop_after_epochs=N` | stop after N epochs while the LR schedule and mask annealing still span `epochs` (truncated A/B runs) |
-
-Always on (training-side; inference of existing checkpoints is unchanged):
-
-- **Masked attention keeps small objects in view.** A query attends to every patch its predicted mask touches (max-pool of
-  the mask logits onto the patch grid), and a query whose mask touches no patch attends to all of them, as in Mask2Former. The
-  reference EoMT samples the mask bilinearly at patch centres and leaves an empty-mask query blind.
-- **Mask terms that see small objects.** Matching scores every query on every cell of the mask-logit grid instead of on
-  12,544 random points, and dice is computed on every GT pixel, so every instance is supervised however small. BCE keeps the
-  reference's 12,544 points concentrated on the uncertain boundaries.
-- **Attribute IoU gate at full resolution.** The gate that decides which matched queries train the attribute heads compares the
-  upsampled prediction with the GT, so objects of a few pixels are not erased by a "nearest" downscale.
-
-Inference: `predict_image(..., amp=True)` (and `predict(..., amp=True)`) runs the network under bf16 autocast. Off by default.
-
-The accuracy effect of these options depends on the data. Measure it with truncated runs (`stop_after_epochs`), which
-follow the schedule of a full run, against a reference run at equal epochs.
+Validation reports `aux_acc/<head>` (accuracy) and `aux_mae/<head>` (mean absolute error in real units; a `log` head
+also `aux_logmae` and `aux_ratio`, the median of prediction / GT).
 
 ---
 
-## Augmentation
+## Several photos of one subject
 
-Training augmentation is one config, [`AugConfig`](eomt/data/transforms.py), run by one pipeline
-(`TrainAugment`) for both model families. The defaults are a **strong general recipe**: the original
-EoMT/Mask2Former one (horizontal flip, Large-Scale Jitter 0.1–2.0, random crop, colour jitter) **plus** small
-rotation / shear / perspective, gamma, grayscale, Gaussian blur, sensor noise, JPEG recompression, glare and
-"safe" random erasing (a rectangle that never overlaps an instance). Masks are resized by area averaging (soft,
-mass-preserving), so thin objects are not shredded into dots by nearest-neighbour resampling.
+A **multi-view post-training** adds to a trained single-photo model what you have labelled:
 
-| group | knobs (default probability) |
-|---|---|
-| geometry | `flip_prob` 0.5 · `vflip_prob` 0 · `rot90_prob` 0 · LSJ `min_scale`/`max_scale` 0.1–2.0 · `rotate_prob` 0.3 (±10°) · `shear_prob` 0.2 (±5°) · `perspective_prob` 0.15 |
-| optics / sensor | colour jitter 1.0 · `gamma_prob` 0.3 · `grayscale_prob` 0.05 · `blur_prob` 0.2 · `noise_prob` 0.2 · `jpeg_prob` 0.3 · `glare_prob` 0.15 · `erasing_prob` 0.2 |
-| multi-image (instance family) | `mosaic_prob` 0 · `mixup_prob` 0 · `copy_paste_prob` 0 |
-| crop | `instance_crop_prob` 0 (instance-aware crop) · `instance_crop_empty_prob` 0 · `zoom_prob` 0 (close-ups, `zoom_scale` 4–5x) |
-| masks | `mask_resize="area"` (or `"nearest"`) |
-
-Override per run, per dataset, or from the CLI — precedence is explicit keywords (`flip_prob`, `min_scale`,
-`max_scale`) **>** `aug=` **>** the YAML's `aug` (or `train_aug`) block **>** defaults:
-
-```python
-model.train(data="coco", aug={"rotate_prob": 0.5, "blur_prob": 0})   # in code
-model.train(data="coco", aug={"preset": "legacy"})                    # the original recipe (hard masks, no extras)
-model.train(data="coco", train_transform=my_callable)                 # bring your own (image, masks) -> (image, masks)
-```
+- **`xview`** — cross-view attention after each query block: the queries of each photo of a set attend to the tokens of
+  the other photos (plus a null token, to abstain). Each photo's masks still cover only what it shows. It starts as the
+  identity, and a photo alone is predicted exactly as before.
+- **`matching`** — a head that embeds every instance (the per-query embedding plus a learned residual, so it starts as
+  re-identification), trained with a sigmoid loss on the `instance_id` links so that one global threshold separates
+  "same instance" from "another one". It trains with or without `xview`.
 
 ```yaml
-# data.yaml — settings for THIS dataset
-train_aug:
-  min_scale: 0.6                  # thin / tiny objects: keep the effective scale r = imgsz/long_side * s in ~[0.4, 1.0]
-  max_scale: 1.6
-  instance_crop_prob: 0.8         # optional instance-aware crop: window placed around a (rarity-weighted) instance
-  instance_crop_rarity_attr: material
+train: {init_weights: runs/train/my-run/weights/best.pt, epochs: 4, batch: 1}   # batch counts sets of photos
+val: {interval: 1}
+multiview:
+  xview: true
+  matching: true
+  gate: [class]                       # links only between instances of the same class (and listed attributes)
+  trainable: new                      # only the added modules; "query_blocks" also trains the query blocks, slower
+  sets: {max_views: 4, sizes: {2: 0.2, 3: 0.2, 4: 0.6}, p_single: 0.3, p_shared: 0.5, p_hard: 0.25}
 ```
 
-```bash
-python scripts/train.py --data my/data.yaml --aug min_scale=0.6 --aug instance_crop_prob=0.8 --aug-preset default
+Every photo of a subject is the anchor of one set per epoch, with companions from the same subject (`p_shared` of the
+sets first take those that show one of its linked instances). The horizontal flip is drawn once per set, so left and
+right never mix within a subject. `p_hard` makes the anchor hard to read alone (shrunk, degraded, a close-up or
+occluded) while its companions stay as they are, so the evidence has to come from them. `trainable` also takes
+`{group or parameter-name prefix: LR multiplier}` (groups `xview`, `match_head`, `query_blocks`, `heads`; e.g.
+`{xview: 1.0, aux_heads.price: 0.0}`).
+
+**Validation** scores fixed sets of the validation photos of each subject, unaugmented and placed exactly as inference
+places them: `sets/segm/mAP_{alone,set}` (each photo predicted alone and with its set; `_linked_` restricted to the
+instances another photo shows, where the others can help), the attributes alone and with the set, and the links:
+`sets/match/{f1,precision,recall,thres}` (the embedding inference links with), `sets/reid/*` (the baseline:
+re-identification of the photos predicted alone), `_gated` within the gate, `match/f1_stored` at the threshold stored
+before the validation, and `*/cluster_f1` (B-cubed F1 of the identities over each whole subject). The best threshold is
+stored in the checkpoint: inference links with it.
+
+```python
+EoMT("runs/train/mv").val(multiview=True)                                  # the run's own validation, standalone
+EoMT("other.pt").val(multiview=True, run="runs/train/mv",                  # another model, scored as that run did,
+                     sets_file="runs/train/mv/val_sets.json")              # on the same fixed sets
 ```
 
-Things worth knowing:
+**Inference.** `predict(source, subject=True)` predicts the photos of each subject together (`source` holds one
+subject's photos, or a subfolder per subject), `max_views` at a time. `match(folder)` links the detections of every
+photo of a subject — any number of photos — into identities, with the stored threshold and gate:
 
-- **Orientation.** Flips, 90° turns and rotations change the pixels but not the label. If an attribute encodes
-  orientation (e.g. a `viewpoint` head) set `flip_prob=0` and `rotate_prob=0`, or, for a left / right attribute,
-  mark it `flip_aware` (see *Flip-aware attributes*) and keep the horizontal flip; `vflip_prob` / `rot90_prob` stay
-  off unless your scenes have no canonical "up".
-- **Thin or tiny objects.** Large-Scale Jitter at 0.1 shrinks a 5 px wide line to under a pixel; keep the effective
-  scale within ~[0.4, 1.0] (`min_scale = 0.4·long_side/imgsz`, `max_scale = 1.0·long_side/imgsz`). The instance-aware
-  crop pays off when the crop is much smaller than the image (high zoom, small `imgsz`), and
-  `instance_crop_rarity_attr` makes rare attribute values the crop's focus more often.
-- **Close-ups.** `zoom_prob` makes an occasional sample a close-up: scaled by `s ~ U(zoom_scale)` (default 4–5x
-  the whole-image view, past the photo's own resolution) instead of the LSJ range, with the window on one instance
-  (whole when it fits, else a window inside it). `zoom_attr` restricts it to instances with a value of that
-  attribute and to the samples that have one, e.g. `{"zoom_prob": 0.1, "zoom_attr": "surface_cm2"}` so a crop-scaled
-  head also learns that an object filling the frame keeps its real surface, and that a cut object keeps the share in view.
-  It resizes the whole photo first, so keep it occasional.
-- **Multi-image ops** (`mosaic`, `mixup`, `copy_paste`) add instances from other samples and are *off*: they splice or
-  blend long thin structures, so try them deliberately and look at the result.
-- **Negatives.** Images with no annotations are dropped from the train set by default. `train(keep_empty=True)` keeps
-  them as zero-target samples (masks `(0, imgsz, imgsz)`, every query is trained as "no object"); validation already
-  includes them. Instance family only.
-- `args.yaml` of a run records the resolved `aug` dict; the log prints the active ops at start.
-- `build_train_transform(imgsz, aug=...)` returns the same pipeline for use in your own loaders
-  (`tf(image_uint8, masks) -> (image, masks)`).
+```python
+out = EoMT("runs/train/mv").match("photos/subject_42/", groups=[[0, 3, 4], [1, 2]])   # groups: optional
+out["images"][0]["identity_ids"]         # an identity per detection of photo 0
+out["identities"][0]["attributes"]       # the identity's attributes, voted over its photos (regression: fused)
+```
+
+A model without a matching head links by the per-query embedding (re-identification, nothing trained for it), at 0.7
+within the same class unless it was calibrated.
 
 ---
 
-## Roadmap / future work
+## Training recipe
 
-- **Model export.** ONNX / TensorRT (and friends) for deployment — currently out of
-  scope; the inference path is being kept export-friendly.
-- **Keypoints.** A keypoint/pose head family alongside `instance` and `detect` (the code
-  already carries a `family` parameter so new heads slot in without API churn).
-- **Pretrained COCO checkpoints.** None are published yet. COCO-trained `s`/`b`/`l`
-  weights will be released on the Hugging Face Hub (the `from_pretrained` / `hf://`
-  loading plumbing is already in place and waiting for them).
-- **Contrastive re-ID training.** Cross-photo re-identification already works at
-  inference time (see [above](#cross-photo-re-identification)) on the embedding the
-  detector computes anyway. What remains is *training* that embedding for the job: a
-  contrastive objective on the matched queries would make each one a purpose-built
-  re-identification vector rather than a by-product of the class head, which should
-  widen the margin between matches and non-matches and make `sim_thres` transferable
-  across datasets. Feeding those embeddings into the video tracker to re-associate
-  objects across occlusions is the same lever.
+`train()` follows the reference EoMT recipe, checked numerically against the official code: AdamW at `lr0=1e-4` with
+layer-wise LR decay `0.8` (the top ViT block at the full LR: the last blocks process the queries), a two-stage warmup
+(the head first, the ViT held at 0) and polynomial decay to 0, masked attention annealed block by block so the last
+sixth of training is mask-free, and an EMA of the weights. `epochs=12` is the official COCO instance recipe.
+
+Validation runs in the regime the model is trained in (masked attention at the epoch's annealing), so `best.pt` — the
+EMA weights, mask-free — is only chosen once the annealing is over. `last.pt` (the trainer state) is written before
+each validation, so a crash there costs only the validation. Every checkpoint records its epoch, metrics row and the
+resolved run, with the warm-start weights and the data files and their SHA-256.
+
+A **short fine-tune** wants its own recipe: a lower `optim.lr0`, a shorter `optim.warmup_steps`, a lower
+`optim.ema_decay`, and `optim.mask_anneal: false` for a model deployed mask-free.
+
+**Several GPUs**: `device="0,1"` trains with one process per GPU; `batch` is per GPU and `nominal_batch` stays the global
+batch, so the optimizer steps are those of one GPU. Write the training call under `if __name__ == "__main__":` (the
+processes are spawned).
+
+---
+
+## Inference
+
+```python
+m = EoMT("runs/train/my-run")
+for r in m.predict("folder/", batch=16, stream=True):     # a generator: a large folder is never held in memory
+    r["boxes"], r["scores"], r["classes"], r["masks"], r.get("aux"), r.get("aux_values")
+m.predict("big_photo.jpg", tiles=True)                     # native-resolution tiles + the whole image, merged
+m.predict("photo.jpg", augment={"flip": True})             # test-time augmentation (flip-aware heads swapped back)
+m.save("best_bf16.pt", dtype="bf16")                       # half the file, the same scores
+```
+
+`conf_thres`, `max_det` and `mask_thresh` default to the checkpoint's `inference` settings. Masks come back at the
+photo's resolution; the network runs in bf16 on a GPU (`amp=False`: fp32).
+
+## Checkpoints
+
+A checkpoint is a self-describing `torch.save` dict: the weights plus everything needed to rebuild and run the model
+(size, classes, attribute heads, input size and preprocessing, link calibration, inference settings, the run). It loads
+with `weights_only=True`, so loading one never runs code. Checkpoints of earlier versions are upgraded on load
+(`eomt.migrate_checkpoint`). `scripts/info.py <ckpt>` prints one.
+
+---
+
+## Command line
+
+| script | does |
+|--------|------|
+| `scripts/train.py` | train from a run config (`--set SECTION.KEY=VALUE` for any setting) |
+| `scripts/val.py` | validate (`--augment`, `--tiles`, `--flip`, `--multiview`, `--run`, `--sets-file`) |
+| `scripts/predict.py` | predict and render images (`--subject`, `--tiles`, `--batch`) |
+| `scripts/match.py` | link the instances of a subject's photos (`--each-subdir`) |
+| `scripts/export.py` | a bf16 copy of a checkpoint |
+| `scripts/info.py` | a checkpoint's metadata |
+
+---
+
+## Roadmap
+
+- Pretrained COCO weights on the Hugging Face Hub (`EoMT.from_pretrained` is in place), a runnable sample dataset, and a
+  public multi-photo dataset for `multiview` and matching.
+- ONNX / TensorRT export.
+
+## License
+
+Apache-2.0. EoMT and DINOv2-with-registers are Apache-2.0 too.
