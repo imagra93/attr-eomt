@@ -61,6 +61,9 @@ class AuxHeadSpec:
     Ids it does not list stay as they are. Stored in checkpoints: the horizontal-flip test-time augmentation
     (:mod:`eomt.tta`) swaps it back in a mirrored view's prediction. A regression head is flip-invariant (a length
     does not change when the photo is mirrored), so the merge averages it as it is.
+
+    ``bins`` (regression heads, increasing GT values, e.g. ``(10, 35)``) has validation also report the head's errors per
+    GT-value bucket (:func:`eomt.engine.validate.regression_metrics`). Stored in checkpoints.
     """
 
     name: str
@@ -75,6 +78,7 @@ class AuxHeadSpec:
     crop: str | None = None
     min_visible: float = 0.9
     flip_aware: dict[int, int] | None = None
+    bins: tuple[float, ...] | None = None
 
     def flip_perm(self):
         """``(num_classes,)`` long tensor: index it by a mirrored view's class probabilities' columns to get the original
@@ -112,6 +116,8 @@ def aux_specs_to_meta(specs: list[AuxHeadSpec] | None) -> list[dict]:
             d.update(regression=True, log=s.log, mean=float(s.mean), std=float(s.std))
             if s.value_range is not None:
                 d["value_range"] = [float(v) for v in s.value_range]
+            if s.bins:
+                d["bins"] = [float(v) for v in s.bins]
         out.append(d)
     return out
 
@@ -130,6 +136,7 @@ def aux_specs_from_meta(meta: list[dict] | None) -> list[AuxHeadSpec]:
             log=bool(d.get("log", False)), mean=float(d.get("mean", 0.0)), std=float(d.get("std", 1.0)),
             value_range=tuple(float(v) for v in vr) if vr is not None else None,
             flip_aware={int(a): int(b) for a, b in flip.items()} if flip else None,
+            bins=tuple(float(v) for v in d["bins"]) if d.get("bins") else None,
         ))
     return out
 

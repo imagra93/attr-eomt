@@ -34,6 +34,9 @@ def main() -> None:
                         "matching head, else class).")
     p.add_argument("--per-photo", action="store_true",
                    help="One forward per photo even for a cross-view model (default: one joint forward).")
+    p.add_argument("--embed", default=None, choices=("match", "reid"),
+                   help="Joint forward: link on the matching head's embedding or the per-query one (default: the one "
+                        "that linked best at the model's last validation).")
     p.add_argument("--no-group-by", action="store_true",
                    help="Disable gating entirely (use a higher --sim-thres).")
     p.add_argument("--guard", default="mean", choices=("mean", "min", "off"),
@@ -73,7 +76,7 @@ def main() -> None:
             max_det=args.max_det, group_by=group_by, sim_thres=args.sim_thres,
             guard=args.guard, guard_factor=args.guard_factor, center=args.center,
             link_mode=args.links, panel_size=args.panel_size,
-            legend_attr=args.legend_attr, joint=False if args.per_photo else None,
+            legend_attr=args.legend_attr, joint=False if args.per_photo else None, embed=args.embed,
         )
         total += result["num_identities"]
     print(f"[done] {total} identities across {len(sources)} subject(s) -> {args.out}")

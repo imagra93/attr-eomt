@@ -276,7 +276,10 @@ A missing, non-numeric or out-of-range value is ignored. The head is trained on 
 standardized by the train split's mean and std (stored in the checkpoint), validated as the
 mean absolute error in real units (`val/aux_mae/<head>`; `metrics.png` gives each regression
 head its own MAE panel, `aux_per_class.png` its MAE per primary class), and predicted in real units
-(`aux_values`). The value must not change under the augmentations (scale, crop, flip,
+(`aux_values`). The MAE is dominated by the large values: a `log` head also reports the MAE of
+the `log1p` values (`aux_logmae`) and the median of prediction / GT (`aux_ratio`), and `bins`
+in the run config (`area: {log: true, bins: [10, 35]}`) reports them per GT-value bucket too
+(`aux_mae/area@<10`, `@10-35`, `@>=35`). The value must not change under the augmentations (scale, crop, flip,
 rotation): a cost or a score is fine, a pixel area or an angle is not. Tracking votes on the
 categorical heads only, and re-identification cannot gate on a regression head.
 
@@ -425,14 +428,18 @@ python scripts/predict.py runs/train/multiview photos/ --subject
 In Python, `EoMT(path).predict("photos/", subject=True)`.
 
 The default config is stage A: only the new modules train (about 18 M parameters on `l`),
-the checkpoint stays frozen; stage B adds `query_blocks: 0.1` to `trainable`. `best.pt` is
+the checkpoint stays frozen; stage B adds `query_blocks: 0.1` to `trainable`. A `trainable` key
+may also be a parameter-name prefix, which wins over the groups: `{heads: 0.2, aux_heads.<head>: 1.0}`
+moves one attribute head faster, `{aux_heads.<head>: 1.0}` with `sets: {p_single: 1.0}` fine-tunes
+that head alone on single photos. A warm start lists the modules that start fresh. `best.pt` is
 chosen on fixed synthetic validation sets: the hard photo's segm mAP predicted with its set
 (`val/sets/segm/mAP_set`, next to `_alone`), its attributes, and the link F1 of the
-matching head against plain re-ID (`val/sets/match/*` vs `val/sets/reid/*`). Synthetic sets
+matching head against re-ID (`val/sets/match/*` vs `val/sets/reid_set/*` and `val/sets/reid/*`, see
+[Linking the photos](#linking-the-photos)). Synthetic sets
 show neither real viewpoint changes nor real reflections: measure on real multi-photo sets
 before trusting a gain. `infer_match()` and `scripts/match.py` predict a cross-view
-checkpoint jointly (`joint=False` for one pass per photo), with its calibrated threshold
-and no class gate; `eomt.engine.predict.predict_set` returns the per-photo results alone.
+checkpoint jointly (`joint=False` for one pass per photo), with its calibrated embedding,
+threshold and gate; `eomt.engine.predict.predict_set` returns the per-photo results alone.
 
 For a subject with more photos than a set holds, `eomt.engine.predict.predict_subject` groups
 them (`subject_sets`) and returns one result per photo: `mode="order"` (the default) predicts
@@ -471,6 +478,7 @@ data is a COCO instance-segmentation file like any other, with four optional add
 | image `supervision` | `full` (default): every instance is annotated, the rest is background. `positives`: only some are; nothing unannotated is taught as background (the photo's unmatched queries take no "no object" loss). `none`: input only for the other photos of its set |
 | annotation `instance_id` | the same physical instance in every photo of the subject that shows it (a number or string); the matching head learns those links. Absent: linked to nothing |
 | annotation `iscrowd: 1` | unsure pixels: a query whose mask lies mostly inside takes no "no object" loss, and validation drops detections there (single-photo training already skips these annotations) |
+| image `view_type` | optional: what kind of photo it is (a number or string, e.g. which side of the subject it shows, or a close-up); with `view_types: true` the cross-view attention is told each photo's type |
 
 Partly annotated photos are what pseudo-labelling gives: labels that list some instances per
 photo, or say which photos show an instance but not where. The loss then trains on what is
@@ -492,6 +500,9 @@ real:
     sizes: {2: 0.2, 3: 0.2, 4: 0.6}   # set sizes (capped by the subject's photos)
     p_single: 0.0           # sets of the anchor photo alone
     p_shared: 0.5           # companions sharing a linked instance with the anchor first
+    p_hard: 0.0             # sets whose anchor is made hard (shrunk, degraded, close-up, occluded); companions stay real
+    # hard: {small: 1.0, degraded: 1.0, closeup: 1.0, occluded: 1.0}
+  # val_sets: runs/train/other/real_val_sets.json   # fixed validation sets (every run writes its own)
 ```
 
 Every photo of a subject that trains is the first photo of one set per epoch, with companions
@@ -506,6 +517,105 @@ and is left out). The synthetic sets can also take other photos of the same
 subject as companions (`sets.fill: {subject: 1.0}`, `p_subject`); their instances are then not
 linked. `eomt.data.subjects_from_file_names` sets `subject_id` from file names that start with
 the subject (`<subject>_...`).
+
+Most of what a model must find can be found in one photo, so the cross-view path gets little
+pull from ordinary sets. Three options give it work that needs the other photos:
+
+| `multiview` key | what it does |
+|---|---|
+| `real.sets.p_hard` | the anchor of a real set is made hard as in a synthetic case (shrunk, degraded, a close-up, occluded) while its companions stay real photos, so the evidence must come from them |
+| `linked_w` | weighs the detection and attribute losses of the **linked** instances, those another photo of the set shows |
+| `consistency_w` | the views of one instance agree on their attributes: symmetric KL of the categorical heads' distributions (and, for a regression head listed in `consistency_heads`, the distance of its predictions) between the queries matched to one `instance_id` in two photos. No label needed: a photo whose annotation lacks an attribute is pulled towards what its other views predict |
+| `view_types` | each photo's `view_type` is embedded and added to its tokens in the cross-view attention (zero at start), so a query knows what kind of photo each other photo is; the vocabulary is stored in the checkpoint and `predict_set(view_types=[...])` takes the types at inference |
+| `xview.keys` | what a query reads in the other photos: `both` (their queries and patches, the default), `queries` (far cheaper) or `patches` |
+| `trainable.xview_scale` | the cross-view LayerScales get their own LR multiplier (they open slowly) |
+
+A regression head that measures something physical (a surface, a length) can be listed in
+`consistency_heads` so that one instance gets one value across its views; a head trained with
+`crop: scale` predicts what is in view, so only list it when the photos show whole instances.
+
+### Linking the photos
+
+The links between photos are scored with three embeddings, on the same Hungarian-per-photo-pair
+linking as inference (`eomt.reid`): `match` (the matching head, in the joint forward),
+`reid_set` (the per-query embedding of the same joint forward: re-identification's fingerprint,
+same detections) and `reid` (the photos predicted alone, the baseline without cross-view). Every
+validation stores in the checkpoint the threshold of each embedding, their F1s and the one that
+linked best (`link_embed`); `predict_set`, `predict_subject` and `infer_match()` link with that
+one by default (`embed="match"` or `"reid"` picks one). `link_group_by` (gate keys: `class` and
+categorical heads) also scores the links within each gate group (`<embed>_gated/*`), and the
+calibration and the default linking then use the gate. `<embed>/f1_stored` is the F1 at the
+threshold stored before the validation, not the best one of the same data (an optimistic number).
+
+The matching head's training can look more like inference:
+
+| `multiview` key | what it does |
+|---|---|
+| `match_loss: sigmoid` | a binary "same instance?" per pair of queries of two photos, with a learned scale and bias (SigLIP): calibrates absolute similarities, so one global threshold separates the links |
+| `match_loss: dustbin` | an optimal-transport assignment of each photo pair's similarities with a learned "no partner" score (SuperGlue): every instance is an anchor, its target its partner or the dustbin |
+| `match_residual: true` | the head starts as re-ID's fingerprint plus a residual whose last layer is 0, so it starts at re-ID's F1 (exactly when `match_dim` is the hidden size) |
+| `match_neg_conf: 0.3` | the queries no target matched that score at least that much (false detections and duplicates, outside ignore regions of fully annotated photos) become negatives |
+| `match_hard_w`, `match_hard_by` | weigh the negatives that agree on the class and the listed attributes, the confusions that remain |
+
+Each epoch prints what the loss sees (`train/match/pos_cos`, `hardneg_cos`, `unpaired`: the mean
+cosine of the pairs of one instance, of each query's hardest other, and the share of instances
+with no partner in their set).
+
+### Identities over a whole subject
+
+A subject often has more photos than a set takes. `predict_subject(..., identities=True)` links
+the detections of every photo with those of every other (across the groups too), clusters them
+transitively with the merge guard, and returns one identity per detection and one record per
+identity, with its attributes voted by mean probability and its regression values fused (the
+score-weighted mean, in log space for a `log` head):
+
+```python
+from eomt.engine.predict import predict_subject
+
+out = predict_subject(model, photos, device="cuda", imgsz=644, groups=[[0, 3, 4], [1, 2]], identities=True)
+out["images"][0]["identity_ids"]       # an identity per detection of photo 0
+out["identities"][0]["attributes"]     # the identity's fused attributes and "values"
+```
+
+`groups` gives the groups (photo indices) instead of `mode`; the photos no group lists are
+predicted alone. Validation scores the same thing per subject on the real sets:
+`real/<embed>/cluster_{f1,precision,recall}` (B-cubed), where a transitive error costs more than
+a pair.
+
+### Validating a post-training
+
+Besides the metrics above, a set validation reports `segm/{mAP,AR100}_linked_{alone,set}`: the
+instances another photo of the set shows, where cross-view can help (`_unlinked_` the rest), so a
+gain is not diluted by the instances only one photo shows. On real sets, `aux_agree/<head>_{alone,set}`
+measures what `consistency_w` asks for: of every two photos of a set whose detections match one
+linked instance, the share that predict the same value of a categorical head (no label needed); the
+epoch log gives the consistency loss's share of the total. `train(val_group_by="<image field>")`
+adds the mAP and the link F1 per value of that field, and `best_key` chooses `best.pt` on another
+metric or a weighted sum (`{"real/segm/mAP_linked_set": 1.0, "real/match/f1": 0.1}`). In the
+`multiview` config, `val_synthetic: false` skips the synthetic sets when there are real ones and
+`val_interval: {real: 1, synthetic: 2, photos: 2}` validates each part at its own pace.
+
+The validation runs standalone, with the same keys as `metrics.csv` (without `val/`):
+
+```python
+EoMT("runs/train/multiview").val(multiview=True)                       # the run's own validation, from its checkpoint
+EoMT("other/best.pt").val(multiview=True, run="runs/train/multiview",  # another model, validated as that run did,
+                          sets_file="runs/train/multiview/real_val_sets.json")  # on the same fixed sets
+```
+
+```bash
+python scripts/val.py other/best.pt --multiview --run runs/train/multiview --sets-file runs/train/multiview/real_val_sets.json
+```
+
+Every run writes its fixed real validation sets (`real_val_sets.json`, the photos' file names);
+read back (`--sets-file`, or `real.val_sets` in a training), two models or two versions of a
+dataset are scored on the same sets of the photos they share. Every checkpoint (`best.pt` too)
+records its epoch, the `metrics.csv` row it was saved with, `best_key`, and the run with the
+warm-start weights and the data files and their SHA-256 (`run_config.provenance`);
+`scripts/info.py` prints them. Each epoch prints its peak GPU memory in training and in validation
+and the share of the epoch spent waiting for data; validation frees its cache afterwards. In a log
+file (stderr not a terminal) progress is one plain line per 10 % or 5 minutes instead of a
+carriage-return bar.
 
 ---
 
@@ -541,7 +651,8 @@ EoMT("runs/train/eomt-l").predict("images/", plot=True)   # writes annotated ima
 **Several GPUs.** `device="0,1"` trains on both GPUs, one process each (DistributedDataParallel); `"auto"` is GPU 0.
 `batch` is per GPU and `nominal_batch` (16) stays the global effective batch, so the optimizer steps, LR schedule and
 masked-attention annealing are exactly those of one GPU. Validation splits the val images between the GPUs; the main process scores them and alone logs and writes checkpoints. The processes are spawned, so every `train()`
-argument must be picklable.
+argument must be picklable. `ddp={...}` overrides the `DistributedDataParallel` settings (default
+`find_unused_parameters=True`), e.g. `{"gradient_as_bucket_view": True}`, to measure their speed.
 
 ```python
 EoMT("l", device="0,1").train(data="coco", batch=2)   # 2 per GPU x accum 4 x 2 GPUs = effective 16
@@ -645,6 +756,12 @@ Things to take into account when training:
 | `--flip` | also run every view mirrored (alone: `--augment` with mirrored views) |
 | `--no-attributes` | mAP only |
 | `--ema`, `--mask annealed\|free` | validate the EMA weights of a `last.pt` (see below) |
+| `--group-by FIELD` | the main metrics per value of an image field too |
+| `--multiview [YAML]`, `--run`, `--sets-file`, `--parts`, `--link-group-by` | a multi-photo post-training's validation, rebuilt from the checkpoint's run or another run's (see [Validating a post-training](#validating-a-post-training)) |
+
+**`scripts/export.py`** writes a copy of a checkpoint with its Linear and Conv weights in bf16
+(`--dtype fp16`), about half the file, keeping everything the checkpoint records
+(`EoMT.save(path, dtype="bf16")` in code).
 
 Things to take into account when validating:
 

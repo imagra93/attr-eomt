@@ -33,6 +33,8 @@ from .serialization import (
     format_summary,
     is_hf_ref,
     load_model,
+    load_raw,
+    resolve_checkpoint,
     save_checkpoint,
     summarize_checkpoint,
     wrap_checkpoint,
@@ -306,11 +308,13 @@ class EoMT:
         return result
 
     # -------------------------------------------------------------------- val
-    def val(self, data: str | Path = "coco", *, batch: int = 4, workers: int = 4,
+    def val(self, data: str | Path | None = None, *, batch: int = 4, workers: int = 4,
             conf_thres: float = 0.0, max_det: int = 100, letterbox: bool | None = None,
             imgsz: int | None = None, augment: bool | dict = False, tiles: bool | int | dict = False,
-            attributes: bool = True, **kw) -> dict:
-        """Evaluate on a dataset's val split, returning COCO mAP metrics.
+            attributes: bool = True, multiview: bool | dict | str | Path | None = None,
+            run: str | Path | None = None, sets_file: str | Path | None = None, parts: tuple[str, ...] | None = None,
+            link_group_by="auto", group_by: str | list[str] | None = None, **kw) -> dict:
+        """Evaluate on a dataset's val split (default ``"coco"``), returning COCO mAP metrics.
 
         Segmentation models report ``segm/*`` (+ ``bbox/*``); detection
         (``family="detect"``) models report ``bbox/*`` only. ``imgsz`` overrides the
@@ -322,8 +326,24 @@ class EoMT:
         :mod:`eomt.tta`; a head marked ``flip_aware`` is swapped back in mirrored views). For a segmentation model with
         secondary heads, ``attributes`` (default on) adds ``aux_acc/<head>`` (accuracy) and ``aux_mae/<head>`` (regression
         heads, real units), scored on the same predictions as the mAP; see :func:`eomt.engine.validate.evaluate`.
+        ``group_by`` (an image field) adds the mAP per value of the field.
+
+        ``multiview`` runs the validation of a multi-photo post-training, as the trainer does it, with the same keys as
+        its ``metrics.csv`` (without ``val/``): the photos one by one, the real sets and the synthetic sets
+        (``parts``: a subset of ``("photos", "synthetic", "real")``). ``True`` rebuilds them from the checkpoint's own run
+        (its ``run_config``: data, multiview settings, augmentation, validation size); ``run`` (a run folder, its
+        ``args.yaml`` or one of its checkpoints) takes another run's instead, to score this model exactly as that run
+        validated its own; a dict, or a YAML file, of ``multiview`` settings replaces the run's; ``data`` (a run config
+        YAML) replaces its data, e.g. to score one model on another dataset's validation. ``sets_file`` (a run's
+        ``real_val_sets.json``) fixes the real sets, so two models or two dataset versions are scored on the same sets
+        of the photos they share. The links are scored at the checkpoint's stored thresholds too, gated by
+        ``link_group_by`` (``"auto"``: as they were validated).
         """
-        cfg = _resolve_data(data)
+        if multiview:
+            return self._val_sets(data, multiview, run=run, batch=batch, workers=workers, conf_thres=conf_thres,
+                                  max_det=max_det, imgsz=imgsz, sets_file=sets_file, parts=parts,
+                                  link_group_by=link_group_by, group_by=group_by, **kw)
+        cfg = _resolve_data("coco" if data is None else data)
         if not (cfg["val_images"] and cfg["val_json"]):
             raise ValueError(f"dataset {data!r} has no val split (val_images/val_json).")
 
@@ -338,9 +358,74 @@ class EoMT:
         eval_fn = _evaluate_detection if detect else _evaluate
         return eval_fn(
             model, val_ds, device=dev, batch_size=batch, num_workers=workers,
-            conf_thres=conf_thres, max_det=max_det, augment=augment, tiles=tiles,
+            conf_thres=conf_thres, max_det=max_det, augment=augment, tiles=tiles, group_by=group_by,
             **({} if detect else {"attributes": attributes}), **kw,
         )
+
+    def _val_sets(self, data, multiview, *, run, batch, workers, conf_thres, max_det, imgsz, sets_file, parts,
+                  link_group_by, group_by, amp: bool = True) -> dict:
+        """:meth:`val` with ``multiview``: the trainer's validation of a multi-photo post-training, standalone."""
+        import yaml
+
+        from .data import AugConfig, CocoSubjectSets
+        from .engine.train import DEFAULT_MULTIVIEW, _real_val_paths, build_val_parts, validate_parts
+
+        model = self.model
+        if run is not None:  # another run's record: its args.yaml, or the run_config of one of its checkpoints
+            p = Path(run)
+            if p.is_dir() and (p / "args.yaml").is_file():
+                p = p / "args.yaml"
+            run = (yaml.safe_load(p.read_text()) if p.suffix in (".yaml", ".yml")
+                   else load_raw(resolve_checkpoint(p)).get("run_config")) or {}
+        else:
+            run = (load_raw(resolve_checkpoint(self._ckpt)).get("run_config") or {}) if self._ckpt else {}
+        if multiview is True:
+            if not run.get("multiview"):
+                raise ValueError("the checkpoint records no multi-photo run: pass multiview=<settings dict or YAML>")
+            mv = dict(run["multiview"])
+        elif isinstance(multiview, (str, Path)):
+            mv = yaml.safe_load(Path(multiview).read_text()) or {}
+        else:
+            mv = dict(multiview)
+        mv = {**DEFAULT_MULTIVIEW, **mv}
+        if data is not None:
+            cfg = _resolve_data(data)
+            val_images, val_json = cfg["val_images"], cfg["val_json"]
+            aug = cfg.get("train_aug") or (run.get("aug") if isinstance(run.get("aug"), dict) else None)
+        else:
+            val_images, val_json = run.get("val_images"), run.get("val_json")
+            aug = run.get("aug") if isinstance(run.get("aug"), dict) else None
+        if not (val_json or (mv.get("real") or {}).get("val_json")):
+            raise ValueError("no validation data: pass data=<run config YAML> (the checkpoint records none)")
+        # the attribute labels: the model's heads over the val JSON's ids, checked against the model's categories
+        maps_json = val_json or _real_val_paths(mv["real"], val_images, val_json)[1]
+        maps_images = val_images or _real_val_paths(mv["real"], val_images, val_json)[0]
+        probe = CocoValImages(maps_images, maps_json, imgsz=int(model.image_size),
+                              attributes=[s.name for s in model.aux_specs])
+        mine = {s.name: s for s in model.aux_specs}
+        for s in probe.aux_specs:
+            if not s.regression and s.names != mine[s.name].names:
+                raise ValueError(f"attribute {s.name!r}: the data's categories {s.names} differ from the model's "
+                                 f"{mine[s.name].names}")
+        size = imgsz or run.get("val_imgsz") or int(model.image_size)
+        fixed = sets_file or (mv.get("real") or {}).get("val_sets")
+        built = build_val_parts(val_images=val_images, val_json=val_json, imgsz=size,
+                                letterbox=bool(getattr(model, "preprocess_letterbox", True)), aug_cfg=AugConfig.resolve(aug),
+                                aux=(model.aux_specs, probe._attr_id_maps),
+                                is_detect=getattr(model, "family", "instance") == "detect", mv=mv,
+                                view_types=(getattr(model, "xview_cfg", None) or {}).get("view_types"),
+                                fixed=CocoSubjectSets.read_sets(fixed) if fixed else None)
+        if parts is not None:
+            built = {k: v for k, v in built.items() if k in parts or (k == "photos_aux" and "photos" in parts)}
+        gate = getattr(model, "link_group_by", None) if link_group_by == "auto" else link_group_by
+        metrics, _ = validate_parts(
+            model, built, device=next(model.parameters()).device, batch=batch, workers=workers, conf_thres=conf_thres,
+            max_det=max_det, amp=amp, is_detect=getattr(model, "family", "instance") == "detect",
+            aux_iou_gate=float(run.get("aux_iou_gate", 0.5)), aux_class_gate=bool(run.get("aux_class_gate", True)),
+            link_group_by=gate, thres={"match": model.match_thres, "reid_set": getattr(model, "reid_thres", None)},
+            group_by=group_by if group_by is not None else run.get("val_group_by"),
+        )
+        return metrics
 
     # -------------------------------------------------------------- compress
     def compress(self, recipe: str = "int8", *, data: str | Path | None = None,
@@ -513,11 +598,30 @@ class EoMT:
     match = infer_match
 
     # ------------------------------------------------------------------- save
-    def save(self, path: str | Path) -> None:
-        """Write a self-describing checkpoint (reloadable with ``EoMT(path)``)."""
+    def save(self, path: str | Path, *, dtype: str | None = None) -> None:
+        """Write a self-describing checkpoint (reloadable with ``EoMT(path)``), with everything the loaded checkpoint
+        recorded (inference settings, link calibration, the run, the epoch and metrics it was saved at).
+
+        ``dtype="bf16"`` (or ``"fp16"``) stores the weights and biases of the Linear and Conv layers in that precision,
+        about half the file; norms, embeddings and the other parameters stay fp32. ``EoMT(path)`` loads them back into
+        an fp32 model (the rounded values), and a service running in bf16 casts them anyway."""
+        import torch
+        from torch import nn
+
         m = self.model
+        state = m.state_dict()
+        if dtype is not None:
+            casts = {"bf16": torch.bfloat16, "fp16": torch.float16}
+            if dtype not in casts:
+                raise ValueError(f"dtype {dtype!r}: 'bf16' or 'fp16'")
+            if self._compression:
+                raise ValueError("a compressed model keeps its int8 weights: save it without dtype")
+            layers = {f"{name}.{p}" for name, mod in m.named_modules()
+                      if isinstance(mod, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d))
+                      for p in ("weight", "bias") if getattr(mod, p, None) is not None}
+            state = {k: v.to(casts[dtype]) if k in layers and v.is_floating_point() else v for k, v in state.items()}
         ckpt = wrap_checkpoint(
-            m.state_dict(),
+            state,
             size=m.size, nc=m.nc, imgsz=m.image_size, names=m.names,
             task=getattr(m, "family", "instance"),
             aux_heads=m.aux_specs, aux_head_arch=m.aux_head_arch,
@@ -529,7 +633,12 @@ class EoMT:
             patch_size=getattr(m, "patch_size", None),
             compression=self._compression,
             xview=getattr(m, "xview_cfg", None), match_dim=getattr(m, "match_dim", 0) or None,
-            match_thres=getattr(m, "match_thres", None),
+            match_residual=getattr(m, "match_residual", False) or None,
+            match_thres=getattr(m, "match_thres", None), reid_thres=getattr(m, "reid_thres", None),
+            link_embed=getattr(m, "link_embed", None), link_f1=getattr(m, "link_f1", None),
+            link_group_by=list(m.link_group_by) if getattr(m, "link_group_by", None) else None,
+            inference=getattr(m, "inference", None) or None, dtype=dtype,
+            **(getattr(m, "meta", None) or {}),
         )
         save_checkpoint(ckpt, path)
 

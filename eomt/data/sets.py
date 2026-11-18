@@ -139,11 +139,57 @@ class SetConfig:
                                 if "case" in bad else ""))
 
 
-class CocoViewSets(CocoInstanceSeg):
+class _Occluder:
+    """Lays a band cut from another photo of the dataset across part of an instance (the ``occluded`` case). Needs
+    ``coco``, ``ids``, ``img_dir`` and the normalisation ``_mean`` / ``_std`` of the dataset it is mixed into."""
+
+    def _occlude(self, img: torch.Tensor, masks: torch.Tensor, tf: TrainAugment, cover=(0.3, 0.7), n_inst=None):
+        """Lay a band cut from another photo across part of one instance (a pole, an arm): its pixels and
+        its share of every mask are gone, and the crop-aware attributes follow the visible share. Only the first
+        ``n_inst`` masks (default: all) are instances the band may be laid on."""
+        mass = _mass(masks)
+        cand = (mass[:n_inst] >= 16).nonzero().flatten().tolist()
+        if not cand:
+            return img, masks
+        i = cand[_randint(0, len(cand) - 1)]
+        ys, xs = torch.nonzero(masks[i] > 0.05, as_tuple=True)
+        x0, x1, y0, y1 = int(xs.min()), int(xs.max()) + 1, int(ys.min()), int(ys.max()) + 1
+        s, share = img.shape[-1], _uniform(cover)
+        if _coin(0.5):  # vertical band, longer than the instance
+            w = max(2, round((x1 - x0) * share))
+            bx, ext = _randint(x0, max(x0, x1 - w)), round((y1 - y0) * _uniform((0.2, 1.0)))
+            box = (bx, max(0, y0 - ext), min(s, bx + w), min(s, y1 + ext))
+        else:  # horizontal band
+            h = max(2, round((y1 - y0) * share))
+            by, ext = _randint(y0, max(y0, y1 - h)), round((x1 - x0) * _uniform((0.2, 1.0)))
+            box = (max(0, x0 - ext), by, min(s, x1 + ext), min(s, by + h))
+        bx0, by0, bx1, by1 = box
+        img = img.clone()
+        img[:, by0:by1, bx0:bx1] = self._patch(by1 - by0, bx1 - bx0)
+        covered = masks.clone()
+        covered[:, by0:by1, bx0:bx1] = 0.0
+        tf.last_info["visible"] = tf.last_info["visible"] * _fraction(_mass(covered), mass)
+        return img, covered
+
+    def _patch(self, h: int, w: int) -> torch.Tensor:
+        """A normalized ``(3, h, w)`` patch cut from another photo of the dataset, at a random scale."""
+        info = self.coco.loadImgs(self.ids[_randint(0, len(self.ids) - 1)])[0]
+        photo = Image.open(self.img_dir / info["file_name"]).convert("RGB")
+        pw, ph = photo.size
+        k = min(pw / w, ph / h) * _uniform((0.3, 1.0))
+        cw, ch = max(1, int(w * k)), max(1, int(h * k))
+        x0, y0 = _randint(0, pw - cw), _randint(0, ph - ch)
+        crop = photo.crop((x0, y0, x0 + cw, y0 + ch)).resize((w, h), Image.BILINEAR)
+        t = torch.from_numpy(np.asarray(crop).copy()).permute(2, 0, 1).float() / 255.0
+        return (t - self._mean) / self._std
+
+
+class CocoViewSets(_Occluder, CocoInstanceSeg):
     """Synthetic sets of 1..``max_views`` photos from a COCO instance-segmentation dataset (see the module docstring).
 
-    Item: ``{"views": [(image, masks, classes, attrs, inst_ids), ...], "case": str}``, the hard view first. ``seed``
-    fixes every set (validation: the same sets at every evaluation); ``None`` draws new ones each time (training).
+    Item: ``{"views": [(image, masks, classes, attrs, inst_ids), ...], "case": str, "photos": [image id]}``, the hard
+    view first and ``photos`` the annotated photo the set is made from. ``seed`` fixes every set (validation: the same
+    sets at every evaluation); ``None`` draws new ones each time (training).
     """
 
     def __init__(self, img_dir, json_file, imgsz: int = 644, *, aug: AugConfig | dict | None = None,
@@ -212,10 +258,15 @@ class CocoViewSets(CocoInstanceSeg):
             return self._make_set(idx)
 
     def _make_set(self, idx: int) -> dict:
+        item = self._draw_set(idx)
+        item["photos"] = [self.ids[item.pop("idx")]]
+        return item
+
+    def _draw_set(self, idx: int) -> dict:
         c = self.sets
         flip = _coin(self.aug.flip_prob)
         if _coin(c.p_single) or not (c.cases or self._focus_idx):
-            return {"views": [self._view(self._load_raw(idx), "context", flip, need=True)], "case": "single"}
+            return {"views": [self._view(self._load_raw(idx), "context", flip, need=True)], "case": "single", "idx": idx}
         if self._focus_idx and (not c.cases or _coin(c.p_focus)):  # locate: B a close-up of a focus instance
             idx = self._focus_idx[_randint(0, len(self._focus_idx) - 1)]
             raw = self._load_raw(idx)
@@ -235,12 +286,12 @@ class CocoViewSets(CocoInstanceSeg):
             size = _draw(c.sizes)
             while len(views) < size:
                 views.append(self._fill(raw, idx, flip, len(views)))
-            return {"views": views, "case": case}
+            return {"views": views, "case": case, "idx": idx}
         if len(views) < c.max_views and len(self.ids) > 1 and _coin(c.p_distractor):
             views.append(self._view(self._load_raw(self._other(idx)), "context", _coin(self.aug.flip_prob), DISTRACTOR_IDS))
         if len(views) < c.max_views and _coin(c.p_flipped_copy):
             views.append(self._view(raw, "context", not flip, FLIPPED_IDS))
-        return {"views": views, "case": case}
+        return {"views": views, "case": case, "idx": idx}
 
     def _other(self, idx: int) -> int:
         j = _randint(0, len(self.ids) - 2)
@@ -284,7 +335,7 @@ class CocoViewSets(CocoInstanceSeg):
             tf = self._tf[(r, int(flip))]
             img, masks, cls, attrs = tf(image_tv, masks_tv, class_t, attr_t)
             if occlude:
-                img, masks = self._occlude(img, masks, tf)
+                img, masks = self._occlude(img, masks, tf, self.sets.occluder_cover)
             keep = masks.flatten(1).sum(1) >= tf.cfg.min_mask_mass
             if keep.any():
                 break
@@ -292,51 +343,16 @@ class CocoViewSets(CocoInstanceSeg):
         attrs.pop("_focus", None)
         return img, masks[keep], cls[keep], {k: v[keep] for k, v in attrs.items()}, ids[keep]
 
-    def _occlude(self, img: torch.Tensor, masks: torch.Tensor, tf: TrainAugment):
-        """Lay a band cut from another photo across part of one instance (a pole, an arm): its pixels and
-        its share of every mask are gone, and the crop-aware attributes follow the visible share."""
-        mass = _mass(masks)
-        cand = (mass >= 16).nonzero().flatten().tolist()
-        if not cand:
-            return img, masks
-        i = cand[_randint(0, len(cand) - 1)]
-        ys, xs = torch.nonzero(masks[i] > 0.05, as_tuple=True)
-        x0, x1, y0, y1 = int(xs.min()), int(xs.max()) + 1, int(ys.min()), int(ys.max()) + 1
-        s, cover = img.shape[-1], _uniform(self.sets.occluder_cover)
-        if _coin(0.5):  # vertical band, longer than the instance
-            w = max(2, round((x1 - x0) * cover))
-            bx, ext = _randint(x0, max(x0, x1 - w)), round((y1 - y0) * _uniform((0.2, 1.0)))
-            box = (bx, max(0, y0 - ext), min(s, bx + w), min(s, y1 + ext))
-        else:  # horizontal band
-            h = max(2, round((y1 - y0) * cover))
-            by, ext = _randint(y0, max(y0, y1 - h)), round((x1 - x0) * _uniform((0.2, 1.0)))
-            box = (max(0, x0 - ext), by, min(s, x1 + ext), min(s, by + h))
-        bx0, by0, bx1, by1 = box
-        img = img.clone()
-        img[:, by0:by1, bx0:bx1] = self._patch(by1 - by0, bx1 - bx0)
-        covered = masks.clone()
-        covered[:, by0:by1, bx0:bx1] = 0.0
-        tf.last_info["visible"] = tf.last_info["visible"] * _fraction(_mass(covered), mass)
-        return img, covered
-
-    def _patch(self, h: int, w: int) -> torch.Tensor:
-        """A normalized ``(3, h, w)`` patch cut from another photo of the dataset, at a random scale."""
-        info = self.coco.loadImgs(self.ids[_randint(0, len(self.ids) - 1)])[0]
-        photo = Image.open(self.img_dir / info["file_name"]).convert("RGB")
-        pw, ph = photo.size
-        k = min(pw / w, ph / h) * _uniform((0.3, 1.0))
-        cw, ch = max(1, int(w * k)), max(1, int(h * k))
-        x0, y0 = _randint(0, pw - cw), _randint(0, ph - ch)
-        crop = photo.crop((x0, y0, x0 + cw, y0 + ch)).resize((w, h), Image.BILINEAR)
-        t = torch.from_numpy(np.asarray(crop).copy()).permute(2, 0, 1).float() / 255.0
-        return (t - self._mean) / self._std
+    def first_photos(self) -> list:
+        """The image id each set is drawn from by default (a set may redraw its photo, ``p_focus`` / ``p_subject``)."""
+        return list(self.ids)
 
 
 def collate_sets(batch: list[dict]):
     """Flatten a batch of sets into one batch of photos: ``(pixel_values, mask_labels, class_labels, aux_labels,
     set_ids, inst_ids, extras)``, where ``set_ids[b]`` is the set of photo ``b``, ``inst_ids[b]`` the instance ids of
-    its targets and ``extras`` the partial-label inputs of the real sets (:func:`eomt.data.subjects.collate_extras`:
-    ignore maps and "no object" weights), None when no set of the batch has any."""
+    its targets and ``extras`` the inputs of the real sets (:func:`eomt.data.subjects.collate_extras`: ignore maps,
+    "no object" weights and view types), None when no set of the batch has any."""
     from .subjects import collate_extras
 
     views = [(s, v) for s, item in enumerate(batch) for v in item["views"]]

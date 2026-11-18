@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import hashlib
 import math
+import time
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
@@ -24,29 +26,44 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from tqdm import tqdm
 
 from ..aux_cls import (
+    MATCH_LOSSES,
     aux_accuracy,
     aux_accuracy_by_primary,
     aux_loss,
+    consistency_loss,
     gate_indices,
     harm_loss,
     match_loss,
+    match_loss_params,
     match_queries,
 )
 from ..config import INFERENCE_DEFAULTS, aux_specs_from_meta, normalize_loss_weights
 from ..data import (CocoDetection, CocoInstanceSeg, CocoSubjectSets, CocoValImages, CocoViewSets, MixedSets, collate_sets,
                     collate_train)
 from ..data.coco import _attr_label
+from ..data.subjects import view_types_of
 from ..data.transforms import AugConfig, build_val_transform
 from ..ema import ModelEMA, _unwrap
 from ..model import DEFAULT_FPN_SCALES, _interp_pos_grid, build_model, load_dinov2_backbone
 from ..plotting import plot_aux_per_class, plot_metrics_csv
+from ..postprocess import query_scores
+from ..progress import progress
 from ..device import gpu_ids, resolve_device
-from ..serialization import load_raw, resolve_checkpoint, save_checkpoint, wrap_checkpoint
+from ..serialization import load_raw, module_counts, resolve_checkpoint, save_checkpoint, wrap_checkpoint
 from .distributed import is_main, launch, rank, sum_over_processes, world_size
-from .validate import _SEGM_KEYS, aux_evaluate, evaluate, evaluate_detection, evaluate_sets
+from .validate import (
+    _SEGM_KEYS,
+    attr_metric_names,
+    aux_evaluate,
+    evaluate,
+    evaluate_detection,
+    evaluate_sets,
+    group_values,
+    set_group_values,
+    set_metric_keys,
+)
 
 _ENCODER_PREFIXES = ("eomt.embeddings", "eomt.layers", "eomt.layernorm")
 # Parameters excluded from weight decay regardless of group: all 1-D tensors
@@ -131,63 +148,170 @@ def build_optimizer(
 
 
 #: Multi-photo post-training (``train(multiview=...)``): the cross-view modules (``xview``, see
-#: :data:`eomt.model.DEFAULT_XVIEW`), the matching head's width (0 = none), its contrastive loss weight and
-#: temperature, the LR multiplier (of ``lr0``) of each parameter group that trains — every other parameter of the
-#: checkpoint stays frozen — and how the synthetic sets are drawn (:class:`~eomt.data.sets.SetConfig`). ``harm_w``
-#: weighs the do-no-harm loss (:func:`~eomt.aux_cls.harm_loss`: a true instance's class probability with its set never
-#: below the photo alone; 0 = off, and no forward of the photos alone).
+#: :data:`eomt.model.DEFAULT_XVIEW`), the matching head's width (0 = none), its loss weight and temperature, the LR
+#: multiplier (of ``lr0``) of each parameter group that trains — every other parameter of the checkpoint stays frozen
+#: — and how the synthetic sets are drawn (:class:`~eomt.data.sets.SetConfig`). ``harm_w`` weighs the do-no-harm loss
+#: (:func:`~eomt.aux_cls.harm_loss`: a true instance's class probability with its set never below the photo alone; 0 =
+#: off, and no forward of the photos alone).
+#:
+#: The matching head: ``match_loss`` (:data:`~eomt.aux_cls.MATCH_LOSSES`: "infonce", "sigmoid" or "dustbin", see
+#: :func:`~eomt.aux_cls.match_loss`); ``match_residual`` starts it as re-identification's fingerprint plus a learned
+#: residual (:class:`~eomt.model.EoMTModel`); ``match_neg_conf`` (a score, e.g. 0.3; ``None`` = off) adds the queries no
+#: target matched that score at least that much, outside ignore regions of fully annotated photos, as negatives (the
+#: false detections and duplicates that make the false links at inference); ``match_hard_w`` weighs the negatives
+#: whose targets agree on ``match_hard_by`` (``"class"`` and categorical heads). ``link_group_by`` (gate keys, as
+#: ``match(group_by=...)``) also scores the validation links within each gate group, and the links are then calibrated
+#: (and later made, by default) that way. ``view_types`` conditions the cross-view attention on the images'
+#: ``view_type`` (vocabulary from the real train data, or the checkpoint's).
+#:
+#: Cross-view tasks: ``linked_w`` weighs the detection and attribute losses of the instances another photo of the set
+#: shows; ``consistency_w`` adds :func:`~eomt.aux_cls.consistency_loss` (the views of one instance agree on their
+#: attributes) for ``consistency_heads`` (default: every categorical head; a regression head can be listed).
 #:
 #: ``real`` adds real sets, several annotated photos of one subject (:mod:`eomt.data.subjects`): ``images`` / ``json``
 #: (default: the run's train data) and ``val_images`` (default: ``images``) / ``val_json`` (without ``json``, default:
 #: the run's val data, when it has subjects) locate them, ``p`` is their share of the training sets (the rest
-#: synthetic; 1 = real only) and ``sets`` how they are drawn (:class:`~eomt.data.subjects.SubjectSetConfig`). With
-#: real validation sets ``best.pt`` is chosen on them (``real/segm/mAP_set``: every fully annotated photo of each fixed
-#: set, unaugmented, predicted with its set).
+#: synthetic; 1 = real only), ``sets`` how they are drawn (:class:`~eomt.data.subjects.SubjectSetConfig`, hard anchors
+#: included) and ``val_sets`` a file of fixed validation sets (:meth:`~eomt.data.subjects.CocoSubjectSets.write_sets`;
+#: every run writes its own as ``real_val_sets.json``). With real validation sets ``best.pt`` is chosen on them
+#: (``real/segm/mAP_set``: every fully annotated photo of each fixed set, unaugmented, predicted with its set).
+#:
+#: Validation: ``val_synthetic: false`` skips the synthetic sets when there are real ones; ``val_interval``
+#: (``{part: epochs}``, parts ``photos``, ``synthetic``, ``real``) validates a part every so many epochs (default: the
+#: run's ``val_interval``; always after the last epoch).
 DEFAULT_MULTIVIEW: dict = {
     "xview": {"mode": "blocks"},
     "match_dim": 128,
     "match_w": 1.0,
     "match_tau": 0.1,
+    "match_loss": "infonce",
+    "match_residual": False,
+    "match_neg_conf": None,
+    "match_hard_w": 1.0,
+    "match_hard_by": ["class"],
     "harm_w": 0.0,
+    "linked_w": 1.0,
+    "consistency_w": 0.0,
+    "consistency_heads": None,
+    "view_types": False,
+    "link_group_by": None,
     "trainable": {"xview": 1.0, "match_head": 1.0},
     "sets": {},
     "real": None,
+    "val_synthetic": True,
+    "val_interval": None,
 }
 #: Keys of ``multiview["real"]``.
-_REAL_KEYS = ("images", "json", "val_images", "val_json", "p", "sets")
+_REAL_KEYS = ("images", "json", "val_images", "val_json", "p", "sets", "val_sets")
+#: The validation parts of a run: the photos one by one, the synthetic sets, the real sets.
+VAL_PARTS = ("photos", "synthetic", "real")
 #: Parameter groups of the multi-photo post-training -> name prefixes (the query blocks are added per model).
+#: ``xview_scale`` is the cross-view modules' LayerScales (and the refiner's), which ``xview`` covers otherwise.
 _MULTIVIEW_GROUPS = {
     "xview": ("eomt.xview.", "eomt.refiner."),
-    "match_head": ("match_head.",),
+    "match_head": ("match_head.", "match_skip."),
     "query_blocks": ("eomt.cross_blocks.", "eomt.query."),
     "heads": ("eomt.class_predictor.", "eomt.mask_head.", "eomt.upscale_block.", "eomt.quality_head.",
               "eomt.layernorm.", "aux_heads."),
+    "xview_scale": (),
 }
 
 
+def _is_xview_scale(name: str) -> bool:
+    return name.startswith(_MULTIVIEW_GROUPS["xview"]) and name.rsplit(".", 1)[-1] in ("layer_scale", "ls1", "ls2")
+
+
 def build_multiview_optimizer(model, lr: float, weight_decay: float, trainable: dict[str, float]):
-    """Freeze every parameter outside the ``trainable`` groups (:data:`_MULTIVIEW_GROUPS`; the embeddings, the layers
-    before the queries and the FPN always stay frozen) and give each group ``lr`` times its multiplier (AdamW, no decay
-    on 1-D tensors). The query blocks warm up with the ViT (``is_backbone``), the others with the head."""
-    unknown = set(trainable) - set(_MULTIVIEW_GROUPS)
-    if unknown:
-        raise ValueError(f"multiview trainable groups {sorted(unknown)}: choose from {sorted(_MULTIVIEW_GROUPS)}")
+    """Freeze every parameter outside the ``trainable`` groups and give each group ``lr`` times its multiplier (AdamW, no
+    decay on 1-D tensors). A group is one of :data:`_MULTIVIEW_GROUPS` (the embeddings, the layers before the queries
+    and the FPN always stay frozen) or a parameter-name prefix (e.g. ``aux_heads.area`` for one attribute head, or
+    ``eomt.class_predictor``), which wins over the named groups (the longest prefix first): ``{heads: 0.2,
+    aux_heads.area: 1.0}`` moves one head faster than the others, ``{aux_heads.area: 1.0}`` that head alone.
+    ``xview_scale`` takes the cross-view LayerScales out of ``xview`` (a faster LR for their opening). The query blocks
+    warm up with the ViT (``is_backbone``), the others with the head."""
     n, nb = model.config.num_hidden_layers, model.config.num_blocks
-    prefixes = {**_MULTIVIEW_GROUPS, "query_blocks": _MULTIVIEW_GROUPS["query_blocks"]
-                + tuple(f"eomt.layers.{i}." for i in range(n - nb, n))}
+    named = {**_MULTIVIEW_GROUPS, "query_blocks": _MULTIVIEW_GROUPS["query_blocks"]
+             + tuple(f"eomt.layers.{i}." for i in range(n - nb, n))}
+    names = [name for name, _ in model.named_parameters()]
+    explicit = sorted((k for k in trainable if k not in named), key=len, reverse=True)
+    unknown = [k for k in explicit if not any(nm == k or nm.startswith(k + ".") for nm in names)]
+    if unknown:
+        raise ValueError(f"multiview trainable {unknown}: neither a group ({sorted(named)}) nor a parameter-name prefix")
+
+    def group_of(name: str):
+        hit = next((k for k in explicit if name == k or name.startswith(k + ".")), None)
+        if hit is not None:
+            return hit
+        if "xview_scale" in trainable and _is_xview_scale(name):
+            return "xview_scale"
+        return next((g for g, pre in named.items() if pre and name.startswith(pre)), None)
+
     groups: dict[tuple, dict] = {}
     for name, p in model.named_parameters():
-        g = next((g for g, pre in prefixes.items() if name.startswith(pre)), None)
+        g = group_of(name)
         p.requires_grad_(g in trainable)
         if g not in trainable:
             continue
         wd = 0.0 if p.ndim <= 1 else weight_decay
         groups.setdefault((g, wd), {"params": [], "lr": lr * float(trainable[g]), "weight_decay": wd,
-                                    "is_backbone": g == "query_blocks"})["params"].append(p)
+                                    "is_backbone": name.startswith(named["query_blocks"])})["params"].append(p)
     opt = torch.optim.AdamW(list(groups.values()), lr=lr, weight_decay=weight_decay)
     for g in opt.param_groups:
         g["initial_lr"] = g["lr"]
     return opt
+
+
+def _sha256(path) -> str | None:
+    """The SHA-256 of a file (``None`` when it does not exist)."""
+    p = Path(path) if path else None
+    if p is None or not p.is_file():
+        return None
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _linked_weights(inst_ids: list[torch.Tensor], set_ids: torch.Tensor, w: float) -> list[torch.Tensor]:
+    """Per target of each photo: ``w`` when another photo of its set shows the same instance (the same known id), else
+    1 (the instance weights of ``linked_w``)."""
+    out = []
+    for b, ids in enumerate(inst_ids):
+        mates = [inst_ids[j] for j in range(len(inst_ids)) if j != b and int(set_ids[j]) == int(set_ids[b])]
+        linked = (ids >= 0) & torch.isin(ids, torch.cat(mates)) if mates else torch.zeros_like(ids, dtype=torch.bool)
+        out.append(torch.where(linked, float(w), 1.0))
+    return out
+
+
+def _hard_keys(class_labels: list[torch.Tensor], aux_labels: dict, by: list[str]) -> list[torch.Tensor]:
+    """Per target of each photo, one int key of its class and the categorical attributes named in ``by`` (-1 when one of
+    them is unknown): the negatives of the matching loss that share a key are its hard ones."""
+    keys = []
+    for b, cls in enumerate(class_labels):
+        cols = torch.stack([(cls if k == "class" else aux_labels[k][b]).long().to(cls.device) for k in by], 1)
+        key = torch.zeros_like(cls)
+        for j in range(cols.shape[1]):
+            key = key * 100_003 + cols[:, j]
+        keys.append(torch.where((cols >= 0).all(1), key, torch.full_like(key, -1)))
+    return keys
+
+
+@torch.no_grad()
+def _extra_negatives(model, out: dict, indices, extras: dict | None, conf: float) -> torch.Tensor:
+    """``(B, Q)`` bool: the queries no target matched that score at least ``conf`` (as postprocess scores them), in a
+    fully annotated photo and outside its ignore regions: false detections and duplicates, the negatives of
+    ``match_neg_conf``."""
+    cls, masks, quality = out["class_queries_logits"], out["masks_queries_logits"], out.get("quality_logits")
+    unmatched = torch.ones(cls.shape[:2], dtype=torch.bool, device=cls.device)
+    for b, (src, _) in enumerate(indices):
+        unmatched[b, src.to(cls.device)] = False
+    scores = torch.stack([query_scores(cls[b], masks[b], None if quality is None else quality[b])[0]
+                          for b in range(cls.shape[0])])
+    if extras is not None:
+        w = model.eomt.criterion.negative_weights(masks, extras["ignore"], extras["neg_weight"])
+        unmatched &= w >= 1.0
+    return unmatched & (scores >= conf)
 
 
 def _adopt_checkpoint_aux(ds, ckpt: dict) -> None:
@@ -204,15 +328,147 @@ def _adopt_checkpoint_aux(ds, ckpt: dict) -> None:
             raise ValueError(f"attribute {s.name!r}: the dataset's categories {s.names} differ from the checkpoint's {ck.names}")
         s.mean, s.std, s.value_range, s.flip_aware = ck.mean, ck.std, ck.value_range, ck.flip_aware
         s.log, s.applies_to = ck.log, ck.applies_to  # a data-only dataset leaves these to the run config
+        s.bins = s.bins or ck.bins  # reporting only: the run config's when it sets them
 
 
-def _sets_fields(cases, aux_specs, prefix: str = "sets") -> list[str]:
-    """The ``metrics.csv`` columns of :func:`~eomt.engine.validate.evaluate_sets` (``prefix`` "real" for real sets)."""
-    keys = [f"segm/{k}_{m}" for k in ("mAP", "mAP50", "mAP_small", "AR100") for m in ("alone", "set")]
-    keys += [f"{c}/mAP_{m}" for c in cases for m in ("alone", "set")]
-    keys += [f"{_aux_metric(s)}/{s.name}_{m}" for s in aux_specs for m in ("alone", "set")]
-    keys += [f"{k}/{n}" for k in ("match", "reid") for n in ("f1", "precision", "recall", "thres")]
-    return [f"val/{prefix}/{k}" for k in keys]
+def _real_val_paths(real_cfg: dict, val_images, val_json):
+    """``(images, json, explicit)`` of the real validation sets: ``val_json`` / ``val_images`` of the ``real`` section, or,
+    without its own ``json``, the run's val data (when it has subjects; ``explicit`` False)."""
+    explicit = bool(real_cfg.get("val_json"))
+    rv_json = real_cfg["val_json"] if explicit else val_json if real_cfg.get("json") is None else None
+    rv_images = real_cfg.get("val_images") or (real_cfg.get("images") if explicit else None) or val_images
+    return rv_images, rv_json, explicit
+
+
+def build_val_parts(*, val_images, val_json, imgsz: int, letterbox: bool, aug_cfg, aux, is_detect: bool = False,
+                    mv: dict | None = None, view_types=None, fixed=None, photos: bool = True) -> dict:
+    """The validation data of a run, by part (:data:`VAL_PARTS`): ``photos`` (the val images one by one, COCO mAP) with
+    ``photos_aux`` (a deterministic view of them for the matched-query attribute metrics, when there are heads); and
+    for a multi-photo post-training (``mv``) ``real`` (fixed real sets, unaugmented: ``fixed`` file names, else drawn
+    with seed 0) and ``synthetic`` (fixed synthetic sets, none of a single photo; left out with ``val_synthetic: false``
+    when there are real ones). ``aux`` is the ``(specs, id maps)`` the attribute labels are read with."""
+    parts: dict = {}
+    if not (val_images and val_json) and mv is None:
+        return parts
+    if photos and val_images and val_json:
+        parts["photos"] = CocoValImages(val_images, val_json, imgsz=imgsz, letterbox=letterbox)
+        if aux[0]:
+            parts["photos_aux"] = (CocoDetection if is_detect else CocoInstanceSeg)(
+                val_images, val_json, imgsz=imgsz, transform=build_val_transform(imgsz, letterbox=letterbox),
+                shared_aux=aux)
+    if mv is None:
+        return parts
+    real_cfg = dict(mv.get("real") or {})
+    if mv.get("real"):
+        rv_images, rv_json, explicit = _real_val_paths(real_cfg, val_images, val_json)
+        if rv_json:
+            try:  # no augmentation: each photo only fitted to the input
+                parts["real"] = CocoSubjectSets(rv_images, rv_json, imgsz=imgsz, aug=aug_cfg, seed=0, augment=False,
+                                                sets={**(real_cfg.get("sets") or {}), "p_single": 0.0, "p_hard": 0.0},
+                                                shared_aux=aux, view_types=view_types, fixed=fixed)
+            except ValueError as e:
+                if explicit or fixed is not None:  # a val_json (or fixed sets) that was asked for must load
+                    raise
+                print(f"[data] no real val sets ({e})")  # the run's val data has no subjects: no real validation
+    if val_images and val_json and (mv.get("val_synthetic", True) or "real" not in parts):
+        parts["synthetic"] = CocoViewSets(val_images, val_json, imgsz=imgsz, aug=aug_cfg,
+                                          sets={**(mv.get("sets") or {}), "p_single": 0.0}, seed=0, shared_aux=aux)
+    return parts
+
+
+def _set_cases(ds) -> list[str]:
+    """The cases the synthetic sets of ``ds`` can draw (the per-case validation columns)."""
+    return list(ds.sets.cases) + (["locate"] if ds.sets.p_focus > 0 else []) or ["single"]
+
+
+def val_metric_keys(parts: dict, specs, *, is_detect: bool = False, link_group_by=None, group_by=None) -> list[str]:
+    """The keys :func:`validate_parts` returns for ``parts`` (the ``metrics.csv`` validation columns, without ``val/``)."""
+    keys: list[str] = []
+    if "photos" in parts:
+        ds = parts["photos"]
+        if not is_detect:
+            keys += [f"segm/{k}" for k in _SEGM_KEYS]
+        keys += [f"bbox/{k}" for k in _SEGM_KEYS]
+        if "photos_aux" in parts:
+            keys += [n for s in specs for n in attr_metric_names(s)]
+        for f, values in group_values(ds.coco, ds.ids, group_by).items():
+            keys += [f"{f}={v}/{t}/mAP" for v in values for t in (("bbox",) if is_detect else ("segm", "bbox"))]
+    for part, prefix in (("real", "real"), ("synthetic", "sets")):
+        if part in parts:
+            ds = parts[part]
+            keys += set_metric_keys(prefix, specs, cases=_set_cases(ds) if part == "synthetic" else (),
+                                    all_views=part == "real", gated=bool(link_group_by),
+                                    groups=set_group_values(ds, group_by))
+    return keys
+
+
+def _fmt(x: float, nd: int = 3) -> str:
+    return "-" if x is None or x != x else f"{x:.{nd}f}"
+
+
+def validate_parts(model, parts: dict, *, device, due=None, batch: int = 4, workers: int = 4, conf_thres: float = 0.0,
+                   max_det: int = 100, amp: bool = True, verbose: bool = True, is_detect: bool = False,
+                   aux_iou_gate: float = 0.5, aux_class_gate: bool = True, link_group_by=None, thres: dict | None = None,
+                   group_by=None, tag: str = "[val]") -> tuple[dict, dict | None]:
+    """Validate ``model`` on the ``parts`` of :func:`build_val_parts` that are ``due`` (default: all), as the trainer
+    does at the end of an epoch: ``(metrics, per-class attribute counts)``, the metrics keyed as in ``metrics.csv``
+    without ``val/`` (:func:`val_metric_keys`). The model is run as given (the trainer sets its masked-attention
+    regime). ``thres`` (``{"match": t, "reid_set": t}``) are the stored link thresholds the links are also scored at;
+    ``link_group_by`` and ``group_by`` as in :func:`~eomt.engine.validate.evaluate_sets`. On several GPUs every process
+    runs its share and the main process gets the metrics."""
+    due = set(VAL_PARTS) if due is None else set(due)
+    main = is_main()
+    metrics: dict = {}
+    aux_pc = None
+    if "photos" in parts and "photos" in due:
+        fn = evaluate_detection if is_detect else evaluate
+        metrics.update(fn(model, parts["photos"], device=device, batch_size=batch, num_workers=workers,
+                          conf_thres=conf_thres, max_det=max_det, amp=amp, verbose=verbose and main, group_by=group_by))
+        if main:
+            t = "bbox" if is_detect else "segm"
+            print(f"{tag} {t} mAP {metrics.get(f'{t}/mAP', 0):.4f} mAP50 {metrics.get(f'{t}/mAP50', 0):.4f}"
+                  + ("" if is_detect else f" bbox mAP {metrics.get('bbox/mAP', 0):.4f}"))
+        if "photos_aux" in parts:  # held-out matched-query accuracy per head
+            val_aux, aux_pc = aux_evaluate(model, parts["photos_aux"], device=device, batch_size=batch,
+                                           num_workers=workers, amp=amp, verbose=verbose and main,
+                                           iou_gate=aux_iou_gate, class_gate=aux_class_gate)
+            metrics.update(val_aux)
+            if main:
+                print(f"{tag} val aux: " + "  ".join(
+                    f"{k.split('/', 1)[1]} {k.split('/', 1)[0][4:]}={v:.3f}" for k, v in val_aux.items()
+                    if k.startswith(("aux_acc/", "aux_mae/")) and "@" not in k))
+    gsuf = "_gated" if link_group_by else ""
+    for part, prefix, label in (("real", "real", "real sets: every photo"), ("synthetic", "sets", "sets: hard photo")):
+        if part not in parts or part not in due:
+            continue
+        metrics.update(evaluate_sets(model, parts[part], device=device, num_workers=workers, amp=amp,
+                                     verbose=verbose and main, all_views=part == "real", prefix=prefix,
+                                     link_group_by=link_group_by, thres=thres, group_by=group_by))
+        if main:
+            m = lambda k: metrics.get(f"{prefix}/{k}", float("nan"))  # noqa: E731
+            line = (f"{tag} val {label} segm mAP {_fmt(m('segm/mAP_alone'), 4)} alone -> {_fmt(m('segm/mAP_set'), 4)} "
+                    f"with the set (linked instances {_fmt(m('segm/mAP_linked_alone'), 4)} -> "
+                    f"{_fmt(m('segm/mAP_linked_set'), 4)}); links F1 match {_fmt(m(f'match{gsuf}/f1'))} at "
+                    f"{_fmt(m(f'match{gsuf}/thres'), 2)}, re-ID in the set {_fmt(m(f'reid_set{gsuf}/f1'))}, re-ID of the "
+                    f"photos alone {_fmt(m(f'reid{gsuf}/f1'))}")
+            if thres and any(v is not None for v in thres.values()):
+                line += (f"; at the stored thresholds match {_fmt(m('match/f1_stored'))}, "
+                         f"re-ID {_fmt(m('reid_set/f1_stored'))}")
+            if part == "real":
+                line += (f"; identities per subject (B-cubed F1) match {_fmt(m('match/cluster_f1'))}, re-ID "
+                         f"{_fmt(m('reid_set/cluster_f1'))}")
+            print(line)
+    return metrics, aux_pc
+
+
+def _best_value(metrics: dict, best_key) -> float | None:
+    """The value ``best.pt`` is chosen on: the metric ``best_key``, or the weighted sum ``{key: weight}`` (``None`` when
+    a key has no finite value this epoch)."""
+    keys = best_key if isinstance(best_key, dict) else {best_key: 1.0}
+    vals = [metrics.get(k) for k in keys]
+    if any(v is None or not math.isfinite(v) for v in vals):
+        return None
+    return sum(float(w) * v for w, v in zip(keys.values(), vals))
 
 
 def _same_categories(a, b, what: str) -> None:
@@ -411,6 +667,7 @@ def _head_record(spec, class_names: dict) -> dict:
     if spec.regression:
         rec = {"type": "regression", "log": spec.log, "range": list(spec.value_range) if spec.value_range else None,
                "crop": spec.crop, "min_visible": spec.min_visible if spec.crop == "ignore" else None,
+               "bins": list(spec.bins) if spec.bins else None,
                "mean": round(float(spec.mean), 6), "std": round(float(spec.std), 6)}
     else:
         rec = {"type": "categorical", "categories": [spec.names.get(i, str(i)) for i in range(spec.num_classes)],
@@ -491,10 +748,20 @@ class _CsvLogger:
     def __init__(self, path: Path, fields: list[str]):
         self.path = path
         self.fields = fields
-        # write the header on a fresh run; keep prior rows when resuming
+        # write the header on a fresh run; keep prior rows when resuming (rewritten under the new header when the
+        # columns changed, e.g. a run resumed with a newer version: a missing value is nan)
         if not path.exists() or path.stat().st_size == 0:
             with path.open("w", newline="") as f:
                 csv.writer(f).writerow(fields)
+            return
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            old, rows = reader.fieldnames or [], list(reader)
+        if old != fields:
+            with path.open("w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(fields)
+                w.writerows([[r.get(k) if r.get(k) not in (None, "") else float("nan") for k in fields] for r in rows])
 
     def append(self, row: dict):
         with self.path.open("a", newline="") as f:
@@ -509,7 +776,9 @@ class _Forward(torch.nn.Module):
     def __init__(self, model, fn, extra=None):
         super().__init__()
         self.model, self.fn = model, fn
-        self.extra = extra  # parameters used by ``fn`` outside the model (the attribute heads' learned log-variances)
+        # parameters used by ``fn`` outside the model (the attribute heads' learned log-variances, the matching loss's
+        # learned scalars)
+        self.extra = extra
 
     def forward(self, *args):
         return self.fn(self.model, *args)
@@ -626,6 +895,9 @@ def train(
     resume: str | None = None,
     init_weights: str | None = None,
     multiview: dict | None = None,
+    best_key: str | dict | None = None,
+    val_group_by: str | list[str] | None = None,
+    ddp: dict | None = None,
 ) -> dict:
     """Fine-tune an EoMT instance-segmentation model on a COCO-format dataset.
 
@@ -746,6 +1018,18 @@ def train(
     (``sets/segm/mAP_set``, see :func:`~eomt.engine.validate.evaluate_sets`). ``multiview["real"]`` adds real sets of
     several annotated photos of one subject, with partial labels (:mod:`eomt.data.subjects`); with real validation
     sets ``best.pt`` is chosen on those (``real/segm/mAP_set``).
+
+    **Choosing and describing ``best.pt``.** ``best_key`` is the metric it is chosen on (a ``metrics.csv`` validation
+    column without ``val/``, e.g. ``real/segm/mAP_linked_set``) or a weighted sum of several (``{key: weight}``); by
+    default the one above. ``val_group_by`` (an image field, or a list) adds the main validation metrics per value of
+    that field. Every checkpoint records its epoch, the metrics row of that epoch, ``best_key`` and the resolved run
+    (``run_config``, with the warm-start weights and the data files and their SHA-256 under ``provenance``);
+    ``scripts/info.py`` prints them.
+
+    ``ddp`` overrides the ``DistributedDataParallel`` settings on several GPUs (default ``broadcast_buffers=False,
+    find_unused_parameters=True``), e.g. ``{"gradient_as_bucket_view": True}`` or ``{"static_graph": True}`` when every
+    step uses the same parameters, to measure their speed. Each epoch prints its peak GPU memory in training and in
+    validation and the share of its time spent waiting for data.
     """
     if len(warmup_steps) != 2:
         raise ValueError("warmup_steps must be (head_steps, vit_steps)")
@@ -906,10 +1190,22 @@ def train(
     # the new FPN/cross-attn modules init random (shape-mismatched/missing tensors are
     # skipped by the warm-start loader below) while the ViT + heads load 1:1.
 
+    if resume_ckpt is not None and "optimizer" not in resume_ckpt:
+        raise ValueError("resume continues a run from its last.pt (it holds the trainer state); to fine-tune from a best.pt "
+                         "pass it as init_weights (--weights).")
+
     # Multi-photo post-training: the architecture of the checkpoint it starts from, kept as trained.
     mv = src_ckpt = None
     if multiview is not None:
+        unknown = set(multiview) - set(DEFAULT_MULTIVIEW)
+        if unknown:
+            raise ValueError(f"multiview keys {sorted(unknown)}: choose from {sorted(DEFAULT_MULTIVIEW)}")
         mv = {**DEFAULT_MULTIVIEW, **multiview}
+        if mv["match_loss"] not in MATCH_LOSSES:
+            raise ValueError(f"multiview match_loss {mv['match_loss']!r}: choose from {MATCH_LOSSES}")
+        bad = set(mv["val_interval"] or {}) - set(VAL_PARTS)
+        if bad:
+            raise ValueError(f"multiview val_interval parts {sorted(bad)}: choose from {VAL_PARTS}")
         src_ckpt = resume_ckpt if resume_ckpt is not None else init_ckpt
         if src_ckpt is None or is_detect:
             raise ValueError("multiview post-trains an instance-segmentation checkpoint: pass init_weights (or resume).")
@@ -917,7 +1213,16 @@ def train(
         box_head = bool(src_ckpt.get("aux_box_head"))
         loss_weights = normalize_loss_weights(src_ckpt.get("loss_weights"), family=family)
         if src_ckpt.get("xview"):  # post-training a post-trained checkpoint (stage B): its modules load 1:1
-            mv["xview"], mv["match_dim"] = src_ckpt["xview"], int(src_ckpt.get("match_dim") or 0)
+            asked = dict(multiview.get("xview") or {})
+            if asked.get("mode", src_ckpt["xview"]["mode"]) != src_ckpt["xview"]["mode"]:
+                raise ValueError(f"multiview xview mode {asked['mode']!r}: the checkpoint's is {src_ckpt['xview']['mode']!r}")
+            # what changes no weight's shape may change (the keys a query reads); the rest is the checkpoint's
+            mv["xview"] = {**src_ckpt["xview"], **{k: v for k, v in asked.items() if k == "keys"}}
+            mv["match_dim"] = int(src_ckpt.get("match_dim") or 0)
+            mv["match_residual"] = bool(src_ckpt.get("match_residual"))
+        if mv.get("real"):  # absolute paths, so that the run (args.yaml, run_config) can be validated from anywhere
+            mv["real"] = {k: (str(Path(v).resolve()) if k in ("images", "json", "val_images", "val_json", "val_sets")
+                              and isinstance(v, str) else v) for k, v in mv["real"].items()}
         if mask_anneal:
             print("[xview] masked attention stays off: the checkpoint runs mask-free")
             mask_anneal = False
@@ -939,7 +1244,7 @@ def train(
     Dataset = CocoDetection if is_detect else CocoInstanceSeg
     if keep_empty and is_detect:
         raise ValueError("keep_empty=True is only supported for family='instance'.")
-    real_ds = real_cfg = None
+    real_ds = real_cfg = vocab = None
     if mv is not None:  # sets of photos made from single photos, with the checkpoint's attribute heads only
         ck_heads = [h["name"] for h in src_ckpt.get("aux_heads") or []]
         # how each head learns (crop, ...): the run config's `attributes` where it sets it, else the data's
@@ -952,12 +1257,38 @@ def train(
             unknown = set(real_cfg) - set(_REAL_KEYS)
             if unknown:
                 raise ValueError(f"multiview real keys {sorted(unknown)}: choose from {_REAL_KEYS}")
+        # the view types: the checkpoint's vocabulary, else (view_types: true) the real train data's
+        vocab = (mv["xview"] or {}).get("view_types")
+        if mv["view_types"] and not vocab:
+            if real_cfg is None:
+                raise ValueError("multiview view_types needs real sets (the images' view_type)")
+            vocab = view_types_of(real_cfg.get("json") or train_json)
+            if not vocab:
+                raise ValueError("multiview view_types: no image of a subject in the real train data has a view_type")
+            mv["xview"] = {**(mv["xview"] or {}), "view_types": vocab}
+        if real_cfg is not None:
             real_ds = CocoSubjectSets(real_cfg.get("images") or train_images, real_cfg.get("json") or train_json,
                                       imgsz=imgsz, aug=aug_cfg, sets=real_cfg.get("sets"),
-                                      shared_aux=(train_ds.aux_specs, train_ds._attr_id_maps))
+                                      shared_aux=(train_ds.aux_specs, train_ds._attr_id_maps), view_types=vocab)
             _same_categories(train_ds, real_ds, "multiview real")
             print(f"[data] real sets: {len(real_ds)} photos of {real_ds.num_subjects} subjects, {real_ds.sets}; "
                   f"{100 * float(real_cfg.get('p', 0.5)):.0f} % of the sets")
+        if vocab:
+            print(f"[xview] view types: {', '.join(vocab)} (0 = unknown)")
+        from ..reid import validate_group_by
+
+        # gate keys as lists of names (a YAML may give one name as a string); a typo or a regression head stops here
+        for key in ("match_hard_by", "link_group_by"):
+            mv[key] = list(validate_group_by(mv[key], train_ds.aux_specs)) or None
+        if mv["match_hard_w"] != 1.0 and not mv["match_hard_by"]:
+            raise ValueError("multiview match_hard_w needs match_hard_by (e.g. [class])")
+        if mv["consistency_w"]:
+            heads = mv["consistency_heads"] or [s.name for s in train_ds.aux_specs if not s.regression]
+            heads = [heads] if isinstance(heads, str) else heads
+            missing = set(heads) - {s.name for s in train_ds.aux_specs}
+            if missing or not heads:
+                raise ValueError(f"multiview consistency_heads {sorted(missing) or heads}: not attribute heads of the model")
+            mv["consistency_heads"] = list(heads)
     else:
         train_ds = Dataset(
             train_images,
@@ -998,51 +1329,37 @@ def train(
             prefetch_factor=prefetch if workers > 0 else None,
         )
 
-    def make_val(size: int):
-        if not (val_images and val_json):
-            return None, None
-        vds = CocoValImages(val_images, val_json, imgsz=size, letterbox=letterbox)
-        print(f"[data] val:   {len(vds)} images" + (f" at {size} px" if size != imgsz else ""))
-        # Held-out aux accuracy needs GT geometry/attrs in the train id space: a
-        # deterministic (no-crop) view of the val split, sharing train's maps.
-        vseg = Dataset(
-            val_images,
-            val_json,
-            imgsz=size,
-            transform=build_val_transform(size, letterbox=letterbox),
-            shared_aux=(aux_specs, train_ds._attr_id_maps),
-        ) if aux_specs else None
-        return vds, vseg
+    def make_val(size: int) -> dict:
+        """The photo parts of the validation at ``size`` px (held-out attribute metrics need the GT in the train id
+        space: a deterministic view of the val split, sharing train's maps)."""
+        parts = build_val_parts(val_images=val_images, val_json=val_json, imgsz=size, letterbox=letterbox,
+                                aug_cfg=aug_cfg, aux=(aux_specs, train_ds._attr_id_maps), is_detect=is_detect)
+        if "photos" in parts:
+            print(f"[data] val:   {len(parts['photos'])} images" + (f" at {size} px" if size != imgsz else ""))
+        return parts
 
     loader_ds = train_ds
     if mv is not None and real_ds is not None:  # real and synthetic sets in one epoch
         loader_ds = MixedSets(real_ds, train_ds, float(real_cfg.get("p", 0.5)))
     sampler, train_loader = make_loader(loader_ds, batch)
     val_size = val_imgsz or imgsz
-    val_ds, val_seg_ds = make_val(val_size)
-    val_sets_ds = None
-    if mv is not None and val_ds is not None:  # the same sets at every validation, none of a single photo
-        val_sets_ds = CocoViewSets(val_images, val_json, imgsz=val_size, aug=aug_cfg,
-                                   sets={**mv["sets"], "p_single": 0.0}, seed=0,
-                                   shared_aux=(aux_specs, train_ds._attr_id_maps))
-        print(f"[data] val sets: {len(val_sets_ds)} fixed sets (one per val image)")
-    real_val_ds = None
-    if mv is not None and real_ds is not None:
-        explicit = bool(real_cfg.get("val_json"))
-        rv_json = real_cfg["val_json"] if explicit else val_json if real_cfg.get("json") is None else None
-        rv_images = real_cfg.get("val_images") or (real_cfg.get("images") if explicit else None) or val_images
-        if rv_json:
-            try:  # no augmentation: each photo only fitted to the input
-                real_val_ds = CocoSubjectSets(rv_images, rv_json, imgsz=val_size, aug=aug_cfg, seed=0, augment=False,
-                                              sets={**(real_cfg.get("sets") or {}), "p_single": 0.0},
-                                              shared_aux=(train_ds.aux_specs, train_ds._attr_id_maps))
-            except ValueError as e:
-                if explicit:  # a val_json that was asked for must load
-                    raise
-                print(f"[data] no real val sets ({e})")  # the run's val data has no subjects: no real validation
-        if real_val_ds is not None:
-            _same_categories(train_ds, real_val_ds, "multiview real val")
-            print(f"[data] real val sets: {len(real_val_ds)} fixed sets of {real_val_ds.num_subjects} subjects")
+    val_parts = make_val(val_size)
+    if mv is not None:  # the same sets at every validation, none of a single photo
+        fixed = CocoSubjectSets.read_sets(real_cfg["val_sets"]) if real_cfg and real_cfg.get("val_sets") else None
+        val_parts.update(build_val_parts(val_images=val_images, val_json=val_json, imgsz=val_size, letterbox=letterbox,
+                                         aug_cfg=aug_cfg, aux=(aux_specs, train_ds._attr_id_maps), mv=mv,
+                                         view_types=vocab, fixed=fixed, photos=False))
+        if "real" in val_parts:
+            rv = val_parts["real"]
+            _same_categories(train_ds, rv, "multiview real val")
+            got = f" from {real_cfg['val_sets']} ({rv.fixed_report})" if fixed is not None else ""
+            print(f"[data] real val sets: {len(rv)} fixed sets of {rv.num_subjects} subjects{got}")
+            if main:  # the sets, so that another run or model can be scored on the same ones (real.val_sets)
+                rv.write_sets(run_dir / "real_val_sets.json")
+        if "synthetic" in val_parts:
+            print(f"[data] val sets: {len(val_parts['synthetic'])} fixed sets (one per val image)")
+        elif mv["val_synthetic"] is False:
+            print("[data] no synthetic val sets (val_synthetic: false)")
 
     # Optional per-class CE weights for imbalanced attributes (computed once).
     aux_class_weight = _compute_aux_class_weights(train_ds) if (aux_specs and aux_class_weights) else None
@@ -1113,7 +1430,22 @@ def train(
         "multiview": mv,
         "attributes": {s.name: _head_record(s, names) for s in aux_specs},
         "inference": inference,
+        "best_key": best_key,
+        "val_group_by": val_group_by,
+        "ddp": ddp,
     }
+    if main:  # where the run started from and what it read: the files and their SHA-256
+        data_files = {"train_json": train_json, "val_json": val_json}
+        if real_cfg is not None:
+            rv_json = _real_val_paths(real_cfg, val_images, val_json)[1]
+            data_files.update(real_json=real_cfg.get("json") or train_json, real_val_json=rv_json,
+                              real_val_sets=real_cfg.get("val_sets"))
+        init_src = resume_path if resume else init_path if init_weights else None
+        run_cfg["provenance"] = {
+            "init_weights": str(Path(init_src).resolve()) if init_src else None,
+            "init_sha256": _sha256(init_src) if init_src else None,
+            "data": {k: {"path": str(Path(v).resolve()), "sha256": _sha256(v)} for k, v in data_files.items() if v},
+        }
     _write_run_config(run_dir / "args.yaml", run_cfg)
 
     # --- model ---
@@ -1131,6 +1463,7 @@ def train(
         aux_box_head=box_head,
         xview=mv["xview"] if mv is not None else None,
         match_dim=mv["match_dim"] if mv is not None else 0,
+        match_residual=bool(mv["match_residual"]) if mv is not None else False,
     ).to(dev)
     model.eomt.deep_supervision = bool(deep_supervision)
     print(f"[model] loss weights: {loss_weights}; upscale blocks: {model.num_upscale_blocks}")
@@ -1146,22 +1479,29 @@ def train(
         print("[model] deep supervision off: a query block is supervised only while it uses masked attention")
     if aux_specs:
         print(f"[model] aux head arch: {model.aux_head_arch}")
-    start_epoch, best_metric, phase_best = 0, -1.0, -1.0
+    # -inf: best_key may be any metric, or a weighted sum (e.g. minus an error), so any first value is a best
+    start_epoch, best_metric, phase_best = 0, float("-inf"), float("-inf")
     # Uncertainty weighting: one learned log-variance per attribute head, outside the model so that inference
     # checkpoints stay as they are (saved with the trainer state in last.pt). Its own group: head LR, no decay.
     aux_log_vars = None
     if aux_balance == "uncertainty" and aux_specs:
         aux_log_vars = torch.nn.ParameterDict({s.name: torch.nn.Parameter(torch.zeros((), device=dev)) for s in aux_specs})
+    # The matching loss's learned scalars (a sigmoid loss's temperature and bias, a dustbin's score): outside the model
+    # like the log-variances, saved with the trainer state.
+    match_params = None
+    if mv is not None and model.match_dim and mv["match_loss"] != "infonce":
+        match_params = match_loss_params(mv["match_loss"], mv["match_tau"]).to(dev)
 
     def make_optimizer(lr: float):
         if mv is not None:
             opt = build_multiview_optimizer(model, lr, weight_decay, mv["trainable"])
         else:
             opt = build_optimizer(model, lr, weight_decay, backbone_lr_mult, llrd)
-        if aux_log_vars is not None:
-            opt.add_param_group(
-                {"params": list(aux_log_vars.values()), "lr": lr, "initial_lr": lr, "weight_decay": 0.0, "is_backbone": False}
-            )
+        for extra in (aux_log_vars, match_params):
+            if extra is not None and len(extra):
+                opt.add_param_group(
+                    {"params": list(extra.values()), "lr": lr, "initial_lr": lr, "weight_decay": 0.0, "is_backbone": False}
+                )
         return opt
 
     optimizer = make_optimizer(lr0)
@@ -1174,6 +1514,8 @@ def train(
         model.load_state_dict(resume_ckpt["model"], strict=False)
         if aux_log_vars is not None and resume_ckpt.get("aux_log_vars"):
             aux_log_vars.load_state_dict(resume_ckpt["aux_log_vars"])
+        if match_params is not None and resume_ckpt.get("match_params"):
+            match_params.load_state_dict(resume_ckpt["match_params"])
         if "optimizer" in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt["optimizer"])
         start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
@@ -1195,11 +1537,15 @@ def train(
         skipped = [k for k, v in ckpt_sd.items() if k in cur and cur[k].shape != v.shape]
         missing, unexpected = model.load_state_dict(filtered, strict=False)
         if skipped:
-            print(f"[finetune] re-initialized {len(skipped)} shape-mismatched tensors: {skipped}")
+            print(f"[finetune] re-initialized {len(skipped)} shape-mismatched tensors: {module_counts(skipped)}")
         print(
             f"[finetune] loaded warm-start weights ({len(missing)} missing / "
             f"{len(unexpected)} unexpected keys); training from epoch 0."
         )
+        if missing:  # the modules that start fresh: only the new ones, for a warm start that adds modules
+            print(f"[finetune] fresh (not in the checkpoint): {module_counts(missing)}")
+        if unexpected:
+            print(f"[finetune] in the checkpoint, not in the model: {module_counts(unexpected)}")
         if mv is not None and not any(k.startswith("eomt.xview.") for k in ckpt_sd):
             model.init_xview()  # each cross-view sublayer starts as a copy of its query block's attention
     elif pretrained:
@@ -1213,11 +1559,18 @@ def train(
     def micro_step(m, pixel_values, geom_labels, class_labels, aux_labels, aux_w_eff, probe=False, set_ids=None,
                    inst_ids=None, extras=None):
         """One micro-batch's loss: the segmentation loss computed in the model plus the attribute heads' loss (and,
-        for sets of photos, the matching head's, kept in ``out["match_loss"]``). With ``probe``, also each head's pull
-        on the shared queries (see :func:`_aux_grad_ratios`). ``extras`` (real sets) carries the photos' ignore maps
-        and "no object" weights (:mod:`eomt.data.subjects`)."""
+        for sets of photos, the matching head's, kept in ``out["match_loss"]`` with what it saw in
+        ``out["match_stats"]``, and the consistency and do-no-harm losses when configured). With ``probe``, also each
+        head's pull on the shared queries (see :func:`_aux_grad_ratios`). ``extras`` (real sets) carries the photos'
+        ignore maps, "no object" weights and view types (:mod:`eomt.data.subjects`)."""
         partial = {} if extras is None else {"ignore_masks": extras["ignore"], "neg_weight": extras["neg_weight"]}
-        out = m(pixel_values, class_labels=class_labels, set_ids=set_ids, **{geom_key: geom_labels}, **partial)
+        view_types = None if extras is None else extras.get("view_types")
+        # linked_w: the instances another photo of the set shows weigh more in the detection and attribute losses
+        target_w = None
+        if set_ids is not None and mv["linked_w"] != 1.0:
+            target_w = _linked_weights(inst_ids, set_ids, mv["linked_w"])
+        out = m(pixel_values, class_labels=class_labels, set_ids=set_ids, view_types=view_types,
+                target_weights=target_w, **{geom_key: geom_labels}, **partial)
         loss, aux_indices, aux_gated, grads = out["loss"], None, None, None
         if aux_specs or "match_embed" in out:
             # Match once per step, then gate to well-localized (IoU) and
@@ -1229,8 +1582,22 @@ def train(
                 iou_thr=aux_iou_gate, require_class=aux_class_gate,
             )
         if "match_embed" in out and set_ids is not None:
-            out["match_loss"] = match_loss(out, aux_gated, inst_ids, set_ids, mv["match_tau"])
+            negatives = None
+            if mv["match_neg_conf"] is not None:
+                negatives = _extra_negatives(m, out, aux_indices, extras, float(mv["match_neg_conf"]))
+            hard = _hard_keys(class_labels, aux_labels, mv["match_hard_by"]) if mv["match_hard_w"] != 1.0 else None
+            incomplete = None  # photos that may show an instance unannotated: partly annotated, or ignore regions
+            if extras is not None:
+                incomplete = (extras["neg_weight"] < 1.0).cpu() | torch.tensor([t is not None for t in extras["ignore"]])
+            out["match_stats"] = {}
+            out["match_loss"] = match_loss(out, aux_gated, inst_ids, set_ids, mv["match_tau"], kind=mv["match_loss"],
+                                           negatives=negatives, hard_keys=hard, hard_w=float(mv["match_hard_w"]),
+                                           params=match_params, stats=out["match_stats"], incomplete=incomplete)
             loss = loss + mv["match_w"] * out["match_loss"]
+        if set_ids is not None and mv["consistency_w"] and len(set_ids.unique()) < len(set_ids):
+            out["consistency_loss"] = consistency_loss(m, out, aux_gated, inst_ids, set_ids, mv["consistency_heads"],
+                                                       class_labels)
+            loss = loss + mv["consistency_w"] * out["consistency_loss"]
         if set_ids is not None and mv["harm_w"] and len(set_ids.unique()) < len(set_ids):
             if aux_indices is None:
                 aux_indices = match_queries(m, out, geom_labels, class_labels)
@@ -1242,7 +1609,7 @@ def train(
             a_loss, per_head = aux_loss(
                 m, out, geom_labels, class_labels, aux_labels,
                 weights=aux_w_per_head, indices=aux_gated,
-                class_weights=aux_class_weight, log_vars=aux_log_vars,
+                class_weights=aux_class_weight, log_vars=aux_log_vars, target_weights=target_w,
             )
             if probe and out["last_hidden_state"].requires_grad:  # frozen queries (a photo alone, stage A): no pull
                 grads = _aux_grad_ratios(out, per_head, aux_w_eff, aux_w_per_head, aux_log_vars)
@@ -1330,10 +1697,11 @@ def train(
 
     # Several GPUs: DDP copies process 0's weights to the others here and averages the gradients in backward. The
     # buffers (the annealed masked-attention probabilities) are set identically on every process, not broadcast.
-    step_model = _Forward(model, micro_step, aux_log_vars)
+    extras_mod = torch.nn.ModuleDict({k: v for k, v in (("aux", aux_log_vars), ("match", match_params)) if v is not None})
+    step_model = _Forward(model, micro_step, extras_mod)
     if world > 1:
         step_model = DistributedDataParallel(
-            step_model, device_ids=[dev.index], broadcast_buffers=False, find_unused_parameters=True
+            step_model, device_ids=[dev.index], **{"broadcast_buffers": False, "find_unused_parameters": True, **(ddp or {})}
         )
 
     # EMA of the weights, built after init/resume (and DDP's copy) so it starts from real weights.
@@ -1360,7 +1728,7 @@ def train(
     n_q_blocks = int(core.eomt.attn_mask_probs.numel())
     anneal_starts = _per_block(mask_anneal_start, n_q_blocks, "mask_anneal_start")
     anneal_ends = _per_block(mask_anneal_end, n_q_blocks, "mask_anneal_end")
-    if main and val_ds is not None and mask_anneal:
+    if main and "photos" in val_parts and mask_anneal:
         mask_free_epoch = max(anneal_ends) * lo_epochs
         windows = ", ".join(f"{a * lo_epochs:.1f}-{b * lo_epochs:.1f}" for a, b in zip(anneal_starts, anneal_ends))
         print(
@@ -1386,20 +1754,22 @@ def train(
 
     tb = _Logger(logger, run_dir, name) if logger != "none" and main else None
 
-    def _save(path: Path, *, state_dict, with_trainer_state: bool, at_imgsz: int = imgsz):
+    def _save(path: Path, *, state_dict, with_trainer_state: bool, at_imgsz: int = imgsz, row: dict | None = None,
+              best: float | None = None):
         """``at_imgsz``: save as a model of that input size (inference checkpoints of the high-resolution phase); the
-        trainer state stays at ``imgsz``, the size the model is rebuilt at to resume."""
-        extra = {}
+        trainer state stays at ``imgsz``, the size the model is rebuilt at to resume. Every checkpoint records the epoch,
+        its ``metrics.csv`` row (``row``), the key ``best.pt`` is chosen on and the best value so far (``best``, default
+        the run's)."""
+        extra = {"epoch": epoch, "best_metric": best_metric if best is None else best, "best_key": best_key_used,
+                 "metrics": row}
         if with_trainer_state:
-            extra = {
-                "epoch": epoch,
-                "best_metric": best_metric,
-                "optimizer": optimizer.state_dict(),
-            }
+            extra["optimizer"] = optimizer.state_dict()
             if ema_model is not None:
                 extra["ema"] = ema_model.state_dict()
             if aux_log_vars is not None:
                 extra["aux_log_vars"] = aux_log_vars.state_dict()
+            if match_params is not None:
+                extra["match_params"] = match_params.state_dict()
             if hires_epochs:
                 extra.update(phase_best=phase_best, hires_batch=hires_b)
         ckpt = wrap_checkpoint(
@@ -1423,13 +1793,18 @@ def train(
             run_config=run_cfg,
             xview=core.xview_cfg,
             match_dim=core.match_dim or None,
-            match_thres=match_thres,
+            match_residual=core.match_residual or None,
+            **link,
             **extra,
         )
         save_checkpoint(ckpt, path)
 
-    # The matching head's similarity threshold for "same instance": the best-F1 one of the last validation sets.
-    match_thres = None
+    # How the links are made: the thresholds of the matching head's and of the per-query (re-ID) embedding, the one that
+    # linked best and both F1s, and the gate keys, from the last validation of the sets (real ones when the run has
+    # them); a post-trained or resumed checkpoint's until then.
+    link = {k: (src_ckpt or {}).get(k) for k in ("match_thres", "reid_thres", "link_embed", "link_f1")}
+    link["link_group_by"] = list(mv["link_group_by"]) if mv is not None and mv["link_group_by"] else None
+    link_part = "real" if "real" in val_parts else "sets"
 
     # Per-epoch metrics CSV (segmentation always; per aux head if present: its matched-query accuracy or MAE, and its
     # pull on the shared queries).
@@ -1437,27 +1812,32 @@ def train(
     csv_fields = ["epoch", "train/loss"]
     csv_fields += [f"train/{metric_of[s.name]}/{s.name}" for s in aux_specs]
     csv_fields += [f"train/aux_grad/{s.name}" for s in aux_specs]
-    if val_ds is not None:
-        if not is_detect:
-            csv_fields += [f"val/segm/{k}" for k in _SEGM_KEYS]
-        csv_fields += [f"val/bbox/{k}" for k in _SEGM_KEYS]
-        csv_fields += [f"val/{metric_of[s.name]}/{s.name}" for s in aux_specs]
+    csv_fields.append("train/data_wait")
+    val_keys = val_metric_keys(val_parts, aux_specs, is_detect=is_detect, group_by=val_group_by,
+                               link_group_by=mv["link_group_by"] if mv is not None else None)
+    csv_fields += [f"val/{k}" for k in val_keys]
     if hires_epochs:
         csv_fields.append("imgsz")
     if mv is not None:
-        csv_fields.insert(2, "train/match_loss")
-        if mv["harm_w"]:
-            csv_fields.insert(3, "train/harm_loss")
-        if real_val_ds is not None:
-            csv_fields += _sets_fields([], aux_specs, prefix="real")
-        if val_sets_ds is not None:
-            csv_fields += _sets_fields(list(val_sets_ds.sets.cases) + (["locate"] if val_sets_ds.sets.p_focus > 0 else []),
-                                       aux_specs)
+        extra_train = ["train/match_loss"] + (["train/harm_loss"] if mv["harm_w"] else [])
+        extra_train += ["train/consistency_loss"] if mv["consistency_w"] else []
+        extra_train += [f"train/match/{k}" for k in ("pos_cos", "hardneg_cos", "unpaired")] if model.match_dim else []
+        csv_fields[2:2] = extra_train
     csv_log = _CsvLogger(run_dir / "metrics.csv", csv_fields) if main else None
+
+    # The metric best.pt is chosen on (a key of the validation, or a weighted sum of several), checked before training.
+    best_key_used = best_key or ("real/segm/mAP_set" if "real" in val_parts else "sets/segm/mAP_set"
+                                 if "synthetic" in val_parts else "bbox/mAP" if is_detect else "segm/mAP")
+    if best_key is not None:
+        wanted = best_key if isinstance(best_key, dict) else {best_key: 1.0}
+        missing = [k for k in wanted if k not in val_keys]
+        if missing:
+            raise ValueError(f"best_key {missing}: not a validation metric of this run (e.g. {val_keys[:3]} ...)")
+    best_name = best_key_used if isinstance(best_key_used, str) else " + ".join(f"{w:g} x {k}" for k, w in best_key_used.items())
 
     # Per-primary aux accuracy is computed held-out in aux_evaluate when a val split
     # exists; otherwise fall back to accumulating it over the train epoch.
-    track_pc_train = bool(aux_specs) and val_seg_ds is None
+    track_pc_train = bool(aux_specs) and "photos_aux" not in val_parts
 
     # --- epochs ---
     for epoch in range(start_epoch, epochs):
@@ -1473,7 +1853,7 @@ def train(
             iters_per_epoch = max(1, len(train_loader))
             total_opt_steps = max(1, math.ceil(hires_epochs * iters_per_epoch / accum_steps))
             sched_warmup = HIRES_WARMUP_STEPS
-            val_ds, val_seg_ds = make_val(hires_imgsz)
+            val_parts.update(make_val(hires_imgsz))
             core.eomt.attn_mask_probs.zero_()
             if fresh:
                 if ema_model is not None:
@@ -1490,7 +1870,8 @@ def train(
         step_model.train()
         if sampler is not None:
             sampler.set_epoch(epoch)
-        running = running_match = running_harm = 0.0
+        running = running_match = running_harm = running_cons = 0.0
+        match_stats = {k: [0.0, 0] for k in ("pos_cos", "hardneg_cos", "unpaired")}  # sum and count of the finite values
         # matched-query accuracy per aux head, accumulated over the epoch
         aux_hits = {s.name: 0 for s in aux_specs}
         aux_tot = {s.name: 0 for s in aux_specs}
@@ -1498,8 +1879,13 @@ def train(
         aux_pc: dict[str, dict[int, list[int]]] = {s.name: {} for s in aux_specs}
         aux_grad: dict[str, list[float]] = {s.name: [] for s in aux_specs}  # the heads' pull, measured on the main process
         desc = f"epoch {epoch}/{epochs - 1}" + (f" @{cur_imgsz}" if hires_epochs else "")
-        pbar = tqdm(train_loader, desc=desc, unit="batch", disable=not main)
+        if dev.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(dev)
+        epoch_t0 = data_t = time.perf_counter()
+        data_wait = 0.0  # the time the loop waited for the next batch
+        pbar = progress(train_loader, desc=desc, unit="batch", disable=not main)
         for step, batch_data in enumerate(pbar):
+            data_wait += time.perf_counter() - data_t
             # sets of photos also carry the set of each photo and the instance ids of its targets
             pixel_values, geom_labels, class_labels, aux_labels = batch_data[:4]
             set_ids, inst_ids, extras = batch_data[4:7] if mv is not None else (None, None, None)
@@ -1518,7 +1904,8 @@ def train(
             aux_labels = {k: [t.to(dev) for t in v] for k, v in aux_labels.items()}
             if extras is not None:
                 extras = {"ignore": [None if t is None else t.to(dev) for t in extras["ignore"]],
-                          "neg_weight": extras["neg_weight"].to(dev)}
+                          "neg_weight": extras["neg_weight"].to(dev),
+                          **({"view_types": extras["view_types"].to(dev)} if "view_types" in extras else {})}
 
             # Gradient accumulation: zero grads at the start of each window, divide
             # the loss by ``accum_steps`` (so summed micro-batch grads average), and
@@ -1543,6 +1930,12 @@ def train(
                     running_match += float(out["match_loss"].detach())
                 if "harm_loss" in out:
                     running_harm += float(out["harm_loss"].detach())
+                if "consistency_loss" in out:
+                    running_cons += float(out["consistency_loss"].detach())
+                for k, v in (out.get("match_stats") or {}).items():
+                    if v == v:  # not NaN
+                        match_stats[k][0] += v
+                        match_stats[k][1] += 1
                 scaler.scale(loss / accum_steps).backward()
             if boundary:
                 scaler.unscale_(optimizer)
@@ -1578,9 +1971,9 @@ def train(
                 "avg": f"{avg:.3f}",
                 "lr": f"{head_group['lr']:.2e}",
             }
-            if aux_specs:  # running matched-query accuracy (MAE for a regression head) per head
+            if aux_specs:  # running matched-query accuracy (MAE for a regression head) per head; "-" before any match
                 postfix["aux"] = " ".join(
-                    f"{n}={_safe_acc(aux_hits[n], aux_tot[n]):.2f}" for n in aux_hits
+                    f"{n}={_fmt(_safe_acc(aux_hits[n], aux_tot[n]), 2)}" for n in aux_hits
                 )
             if mv is not None:
                 postfix["match"] = f"{running_match / (step + 1):.3f}"
@@ -1592,17 +1985,32 @@ def train(
                 if mask_anneal:
                     scalars["train/attn_mask_prob"] = float(core.eomt.attn_mask_probs[0])
                 tb.log(scalars, it)
+            data_t = time.perf_counter()
 
         # Several GPUs: the epoch's loss and accuracy counts summed over all of them, on the main process.
-        totals = sum_over_processes((running, running_match, running_harm, aux_hits, aux_tot, aux_pc))
+        epoch_s = time.perf_counter() - epoch_t0
+        totals = sum_over_processes((running, running_match, running_harm, running_cons, match_stats, data_wait,
+                                     aux_hits, aux_tot, aux_pc))
         if main:
-            running, running_match, running_harm, aux_hits, aux_tot, aux_pc = totals
+            running, running_match, running_harm, running_cons, match_stats, data_wait, aux_hits, aux_tot, aux_pc = totals
             epoch_loss = running / (iters_per_epoch * world)
             epoch_match = running_match / (iters_per_epoch * world)
             epoch_harm = running_harm / (iters_per_epoch * world)
+            epoch_cons = running_cons / (iters_per_epoch * world)
+            wait_share = data_wait / world / max(epoch_s, 1e-9)
+            seen = {k: s / n if n else float("nan") for k, (s, n) in match_stats.items()}
             print(f"[epoch {epoch}] mean loss {epoch_loss:.4f}"
                   + (f" (matching head {epoch_match:.4f})" if mv is not None else "")
-                  + (f" (do-no-harm {epoch_harm:.4f})" if mv is not None and mv["harm_w"] else ""))
+                  + (f" (do-no-harm {epoch_harm:.4f})" if mv is not None and mv["harm_w"] else "")
+                  + (f" (consistency {epoch_cons:.4f}, weighted "
+                     f"{100 * mv['consistency_w'] * epoch_cons / max(epoch_loss, 1e-12):.1f} % of the loss)"
+                     if mv is not None and mv["consistency_w"] else ""))
+            print(f"[epoch {epoch}] waited for data {100 * wait_share:.0f} % of the epoch "
+                  f"({data_wait / world:.0f} of {epoch_s:.0f} s)")
+            if mv is not None and model.match_dim:
+                print(f"[epoch {epoch}] what the matching loss sees: same instance cos {_fmt(seen['pos_cos'])}, hardest "
+                      f"other cos {_fmt(seen['hardneg_cos'])}, {_fmt(100 * seen['unpaired'], 0)} % of the instances "
+                      "without a partner in their set")
             aux_acc = {n: _safe_acc(aux_hits[n], aux_tot[n]) for n in aux_hits}
             aux_pull = {n: sum(v) / len(v) if v else float("nan") for n, v in aux_grad.items()}
             if aux_specs:
@@ -1638,67 +2046,42 @@ def train(
         last_epoch = epoch + 1 in (epochs, stop_after_epochs)
         # A block mid-window unmasks a random share of its queries: seed it so every validation draws the same
         # queries, without touching the training RNG. The high-resolution phase is short: every epoch of it, and the
-        # last one before it, are validated.
-        if val_ds is not None and ((epoch + 1) % val_interval == 0 or last_epoch or hires_on or epoch + 1 == lo_epochs):
+        # last one before it, are validated. A multi-photo post-training may validate each part at its own interval.
+        always = last_epoch or hires_on or epoch + 1 == lo_epochs
+        intervals = (mv or {}).get("val_interval") or {}
+        due = {p for p in VAL_PARTS if p in val_parts
+               and (always or (epoch + 1) % max(1, int(intervals.get(p, val_interval))) == 0)}
+        if due:
+            if dev.type == "cuda":
+                train_peak = torch.cuda.max_memory_allocated(dev)
+                torch.cuda.reset_peak_memory_stats(dev)
             with torch.random.fork_rng(devices=[dev] if dev.type == "cuda" else []):
                 torch.manual_seed(0)
-                if is_detect:
-                    metrics = evaluate_detection(
-                        eval_model, val_ds, device=dev, batch_size=cur_batch,
-                        num_workers=workers, conf_thres=conf_thres, max_det=max_det,
-                        amp=amp, verbose=main,
-                    )
-                    print(
-                        f"[epoch {epoch}] bbox mAP {metrics.get('bbox/mAP', 0):.4f} "
-                        f"mAP50 {metrics.get('bbox/mAP50', 0):.4f}"
-                    )
-                else:
-                    metrics = evaluate(
-                        eval_model, val_ds, device=dev, batch_size=cur_batch,
-                        num_workers=workers, conf_thres=conf_thres, max_det=max_det,
-                        amp=amp, verbose=main,
-                    )
-                    print(
-                        f"[epoch {epoch}] segm mAP {metrics.get('segm/mAP', 0):.4f} "
-                        f"mAP50 {metrics.get('segm/mAP50', 0):.4f} "
-                        f"bbox mAP {metrics.get('bbox/mAP', 0):.4f}"
-                    )
-                if val_seg_ds is not None:  # held-out matched-query accuracy per head
-                    val_aux, epoch_aux_pc = aux_evaluate(
-                        eval_model, val_seg_ds, device=dev, batch_size=cur_batch,
-                        num_workers=workers, amp=amp, verbose=main,
-                        iou_gate=aux_iou_gate, class_gate=aux_class_gate,
-                    )
-                    metrics.update({f"{metric_of[n]}/{n}": v for n, v in val_aux.items()})
-                    print(
-                        f"[epoch {epoch}] val aux: "
-                        + "  ".join(f"{n} {metric_of[n][4:]}={v:.3f}" for n, v in val_aux.items())
-                    )
-                if real_val_ds is not None:  # every fully annotated photo of each fixed real set, alone and with it
-                    metrics.update(evaluate_sets(eval_model, real_val_ds, device=dev, num_workers=workers, amp=amp,
-                                                 verbose=main, all_views=True, prefix="real"))
-                    if main:
-                        print(
-                            f"[epoch {epoch}] val real sets: segm mAP {metrics['real/segm/mAP_alone']:.4f} alone -> "
-                            f"{metrics['real/segm/mAP_set']:.4f} with their set; links F1 "
-                            f"{metrics['real/match/f1']:.3f} (re-ID of the photos alone {metrics['real/reid/f1']:.3f})"
-                        )
-                        if math.isfinite(metrics["real/match/thres"]):  # the links' threshold, calibrated on real sets
-                            match_thres = metrics["real/match/thres"]
-                if val_sets_ds is not None:  # the hard photo of each fixed set, alone and with its set
-                    metrics.update(evaluate_sets(eval_model, val_sets_ds, device=dev, num_workers=workers, amp=amp,
-                                                 verbose=main))
-                    if main:
-                        print(
-                            f"[epoch {epoch}] val sets: hard photo segm mAP {metrics['sets/segm/mAP_alone']:.4f} alone"
-                            f" -> {metrics['sets/segm/mAP_set']:.4f} with its set; links F1 "
-                            f"{metrics['sets/match/f1']:.3f} at {metrics['sets/match/thres']:.2f} "
-                            f"(re-ID of the photos alone {metrics['sets/reid/f1']:.3f})"
-                        )
-                        if math.isfinite(metrics["sets/match/thres"]) and real_val_ds is None:
-                            match_thres = metrics["sets/match/thres"]
+                metrics, epoch_aux_pc = validate_parts(
+                    eval_model, val_parts, device=dev, due=due, batch=cur_batch, workers=workers, conf_thres=conf_thres,
+                    max_det=max_det, amp=amp, verbose=main, is_detect=is_detect, aux_iou_gate=aux_iou_gate,
+                    aux_class_gate=aux_class_gate, link_group_by=link["link_group_by"],
+                    thres={"match": link["match_thres"], "reid_set": link["reid_thres"]} if mv is not None else None,
+                    group_by=val_group_by, tag=f"[epoch {epoch}]",
+                )
+                gs = "_gated" if link["link_group_by"] else ""
+                if main and f"{link_part}/match{gs}/f1" in metrics:  # the links' calibration (real sets when any)
+                    for src, key in (("match", "match_thres"), ("reid_set", "reid_thres")):
+                        t = metrics[f"{link_part}/{src}{gs}/thres"]
+                        if math.isfinite(t):
+                            link[key] = t
+                    link["link_f1"] = {"match": metrics[f"{link_part}/match{gs}/f1"],
+                                       "reid": metrics[f"{link_part}/reid_set{gs}/f1"]}
+                    link["link_embed"] = ("match" if model.match_dim and link["link_f1"]["match"] >= link["link_f1"]["reid"]
+                                          else "reid")
                 if tb is not None:
                     tb.log({f"val/{k}": v for k, v in metrics.items()}, epoch)
+            if dev.type == "cuda":  # validation's peak, then its cache back to training
+                val_peak = torch.cuda.max_memory_allocated(dev)
+                torch.cuda.empty_cache()
+                if main:
+                    print(f"[epoch {epoch}] peak GPU memory: training {train_peak / 2**30:.1f} GiB, validation "
+                          f"{val_peak / 2**30:.1f} GiB")
 
         # Checkpoints are saved mask-free, as predict/val run them; the next step sets the training probabilities again.
         if mask_anneal:
@@ -1706,14 +2089,22 @@ def train(
             eval_model.eomt.attn_mask_probs.zero_()
 
         if main:  # the main process alone writes the checkpoints, the metrics row and the plots
+            # --- per-epoch metrics row (missing values -> nan), also recorded in the checkpoints ---
+            row = {"epoch": epoch, "train/loss": epoch_loss, "train/match_loss": epoch_match,
+                   "train/harm_loss": epoch_harm, "train/consistency_loss": epoch_cons, "train/data_wait": wait_share,
+                   "imgsz": cur_imgsz}
+            row.update({f"train/match/{k}": v for k, v in seen.items()})
+            row.update({f"train/{metric_of[n]}/{n}": aux_acc[n] for n in aux_acc})
+            row.update({f"train/aux_grad/{n}": g for n, g in aux_pull.items()})
+            row.update({f"val/{k}": v for k, v in metrics.items()})
+            row = {k: v for k, v in row.items() if k in csv_log.fields}
+
             # --- checkpoints ---
             # last.pt holds the live weights + trainer state (optimizer/EMA) for resume;
             # best.pt holds the eval weights (EMA when enabled) for inference.
             # The best metric is updated BEFORE last.pt is written, so a resumed run starts from the right value
             # (it used to lag one epoch and could overwrite a better best.pt).
-            best_key = ("real/segm/mAP_set" if real_val_ds is not None else "sets/segm/mAP_set" if val_sets_ds is not None
-                        else "bbox/mAP" if is_detect else "segm/mAP")
-            cur = metrics.get(best_key, None)
+            cur = _best_value(metrics, best_key_used)
             improved = deployable and cur is not None and cur > best_metric
             # with a high-resolution phase, each phase also keeps its own best (best_<imgsz>.pt)
             phase_improved = bool(hires_epochs) and deployable and cur is not None and cur > phase_best
@@ -1721,21 +2112,15 @@ def train(
                 best_metric = cur
             if phase_improved:
                 phase_best = cur
-            _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True)
+            _save(weights_dir / "last.pt", state_dict=core.state_dict(), with_trainer_state=True, row=row)
             if improved:
-                _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False, at_imgsz=cur_imgsz)
-                print(f"[epoch {epoch}] new best {best_key} {best_metric:.4f} -> best.pt")
+                _save(weights_dir / "best.pt", state_dict=eval_model.state_dict(), with_trainer_state=False,
+                      at_imgsz=cur_imgsz, row=row)
+                print(f"[epoch {epoch}] new best {best_name} {best_metric:.4f} -> best.pt")
             if phase_improved:
                 _save(weights_dir / f"best_{cur_imgsz}.pt", state_dict=eval_model.state_dict(), with_trainer_state=False,
-                      at_imgsz=cur_imgsz)
-                print(f"[epoch {epoch}] new best {best_key} at {cur_imgsz} px {phase_best:.4f} -> best_{cur_imgsz}.pt")
-
-            # --- per-epoch metrics row (missing values -> nan) ---
-            row = {"epoch": epoch, "train/loss": epoch_loss, "train/match_loss": epoch_match,
-                   "train/harm_loss": epoch_harm, "imgsz": cur_imgsz}
-            row.update({f"train/{metric_of[n]}/{n}": aux_acc[n] for n in aux_acc})
-            row.update({f"train/aux_grad/{n}": g for n, g in aux_pull.items()})
-            row.update({f"val/{k}": v for k, v in metrics.items()})
+                      at_imgsz=cur_imgsz, row=row, best=phase_best)
+                print(f"[epoch {epoch}] new best {best_name} at {cur_imgsz} px {phase_best:.4f} -> best_{cur_imgsz}.pt")
             csv_log.append(row)
 
             # --- per-epoch plots (overwrite each round; never fatal) ---
@@ -1767,6 +2152,7 @@ def train(
 
     return {
         "best_metric": best_metric,
+        "best_key": best_key_used,
         "last": str(weights_dir / "last.pt"),
         "best": str(weights_dir / "best.pt") if (weights_dir / "best.pt").exists() else None,
         "weights_dir": str(weights_dir),

@@ -240,3 +240,116 @@ def test_a_real_val_json_asked_for_must_load(tmp_path):
     bad.write_text(json.dumps(other))
     with pytest.raises(ValueError, match="categories differ"):  # not a silent fallback to the synthetic sets
         _post_train(tmp_path, img_dir, jf, init, {"val_json": str(bad)})
+
+
+# --- 2.2.0: hard anchors, view types, fixed sets, identities per subject, standalone validation -----------------------
+
+
+def _with_view_types(jf):
+    """The subjects' photos get a view_type (photo 6 has no subject; photo 2 none)."""
+    data = json.loads(jf.read_text())
+    for im in data["images"]:
+        if im["id"] in (1, 3, 4):
+            im["view_type"] = "wide"
+        elif im["id"] == 5:
+            im["view_type"] = 7  # a number reads as its text
+        im["split"] = "x" if im["id"] <= 3 else "y"
+    jf.write_text(json.dumps(data))
+
+
+def test_real_sets_make_the_anchor_hard_and_carry_the_view_types(tmp_path):
+    from eomt.data.subjects import collate_extras, view_types_of
+
+    img_dir, jf = _subject_coco(tmp_path)
+    _with_view_types(jf)
+    vocab = view_types_of(jf)
+    assert vocab == ["7", "wide"]
+    ds = CocoSubjectSets(img_dir, jf, imgsz=112, aug=AUG, seed=0, view_types=vocab,
+                         sets={"max_views": 3, "p_hard": 1.0, "hard": {"small": 1.0, "occluded": 1.0}})
+    cases = {ds[i]["case"] for i in range(len(ds))}
+    assert cases <= {"real_small", "real_occluded", "real"} and cases & {"real_small", "real_occluded"}
+    item = ds[0]  # anchor im1 ("wide") with im2 (no type) and im3 ("wide")
+    types = dict(zip(item["photos"], item["view_types"].tolist()))
+    assert types == {1: 2, 2: 0, 3: 2}
+    synthetic = {"views": [None, None]}  # a synthetic set in the same batch: unknown types
+    ex = collate_extras([item, synthetic])
+    assert ex["view_types"].tolist() == [types[p] for p in item["photos"]] + [0, 0]
+    val = CocoSubjectSets(img_dir, jf, imgsz=112, aug=AUG, seed=0, augment=False, sets={"p_hard": 1.0})
+    assert {val[i]["case"] for i in range(len(val))} == {"real"}  # validation sets are never made hard
+
+
+def test_fixed_sets_round_trip_and_keep_what_a_new_dataset_shares(tmp_path):
+    img_dir, jf = _subject_coco(tmp_path)
+    ds = CocoSubjectSets(img_dir, jf, imgsz=112, aug=AUG, seed=0, augment=False, sets={"max_views": 3})
+    path = tmp_path / "sets.json"
+    assert ds.write_sets(path) == len(ds)
+    back = CocoSubjectSets(img_dir, jf, imgsz=112, aug=AUG, augment=False, fixed=CocoSubjectSets.read_sets(path))
+    assert [back[i]["photos"] for i in range(len(back))] == [ds[i]["photos"] for i in range(len(ds))]
+    data = json.loads(jf.read_text())  # a new version of the data: photo 2 gone
+    data["images"] = [im for im in data["images"] if im["id"] != 2]
+    data["annotations"] = [a for a in data["annotations"] if a["image_id"] != 2]
+    jf2 = tmp_path / "v2.json"
+    jf2.write_text(json.dumps(data))
+    v2 = CocoSubjectSets(img_dir, jf2, imgsz=112, aug=AUG, augment=False, fixed=CocoSubjectSets.read_sets(path))
+    assert v2.fixed_report["dropped"] == 1 and v2.fixed_report["photos_left_out"] >= 1  # its set, and its place in others
+    assert all(2 not in v2[i]["photos"] for i in range(len(v2)))
+
+
+def test_bcubed_scores_identities_per_detection():
+    from eomt.engine.validate import _bcubed
+
+    ids = np.array([5, 5, 7, 7, -1, -2])  # two instances in two photos each, a false detection, an unknown one
+    perfect = _bcubed(np.array([0, 0, 1, 1, 2, 3]), ids)
+    assert perfect == (4.0, 4.0, 4)
+    merged = _bcubed(np.array([0, 0, 0, 0, 2, 3]), ids)  # 5 and 7 merged: half of each identity is wrong
+    assert merged[0] == pytest.approx(2.0) and merged[1] == 4.0
+    false_in = _bcubed(np.array([0, 0, 1, 1, 0, 0]), ids)  # the false detection joins 5 (the unknown one does not count)
+    assert false_in[0] == pytest.approx(2 * 2 / 3 + 2) and false_in[1] == 4.0
+
+
+def test_agreement_counts_every_two_views_of_one_instance_per_head():
+    from eomt.engine.validate import _count_agreement
+
+    counts = {"side": [0, 0], "kind": [0, 0]}
+    seen = {0: {7: {"side": 1, "kind": 2}, 8: {"side": 0, "kind": -1}},
+            1: {7: {"side": 1, "kind": 3}, 8: {"side": 2, "kind": 4}},
+            2: {7: {"side": 0, "kind": 2}, 9: {"side": 1, "kind": 1}}}  # 9: in one view only, no pair
+    _count_agreement(seen, counts)
+    # 7: views 0-1, 0-2, 1-2 (side agrees once, kind once); 8: views 0-1 (side differs, kind -1 takes no part)
+    assert counts == {"side": [1, 4], "kind": [1, 3]}
+
+
+def test_post_training_on_real_sets_with_the_new_options_and_its_standalone_validation(tmp_path):
+    import csv
+
+    from eomt import EoMT
+    from eomt.serialization import load_raw
+
+    img_dir, jf = _subject_coco(tmp_path)
+    _with_view_types(jf)
+    _, init = _init_checkpoint(tmp_path, img_dir, jf)
+    from eomt.engine.train import train
+
+    res = train(train_images=str(img_dir), train_json=str(jf), val_images=str(img_dir), val_json=str(jf), size="s",
+                imgsz=112, epochs=1, batch=2, accum=1, workers=0, device="cpu", amp=False, ema=False, seed=0,
+                project=str(tmp_path / "runs"), name="real", init_weights=str(init), val_group_by="split",
+                best_key={"real/segm/mAP_set": 1.0, "real/match/f1": -2.0},  # a weighted sum, possibly negative
+                multiview={"match_dim": 16, "view_types": True, "link_group_by": ["class"], "val_synthetic": False,
+                           "match_loss": "sigmoid", "match_neg_conf": 0.3, "linked_w": 2.0, "consistency_w": 0.5,
+                           "match_hard_w": 2.0, "match_hard_by": "class", "sets": {"p_single": 0.0},
+                           "real": {"p": 0.5, "sets": {"max_views": 3, "p_hard": 0.5}}})
+    assert res["best"] is not None and res["best_key"] == {"real/segm/mAP_set": 1.0, "real/match/f1": -2.0}
+    run = tmp_path / "runs" / "real"
+    header = next(csv.reader(open(run / "metrics.csv")))
+    assert "val/real/match/cluster_f1" in header and "val/real/segm/mAP_linked_set" in header
+    assert "val/real/split=x/match/f1" in header and "val/real/reid_set_gated/f1" in header
+    assert "val/real/aux_agree/side_set" in header and "val/real/aux_agree/area_set" not in header
+    assert not any(k.startswith("val/sets/") for k in header)  # val_synthetic: false
+    raw = load_raw(res["best"])
+    assert raw["xview"]["view_types"] == ["7", "wide"] and (run / "real_val_sets.json").is_file()
+    assert raw["run_config"]["multiview"]["real"] is not None
+    # standalone, on the run's own fixed sets: the same keys as metrics.csv
+    metrics = EoMT(res["best"], device="cpu").val(multiview=True, workers=0, sets_file=run / "real_val_sets.json")
+    assert set(metrics) == {k[4:] for k in header if k.startswith("val/")}
+    only_real = EoMT(res["best"], device="cpu").val(multiview=True, workers=0, parts=("real",))
+    assert only_real and all(k.startswith("real/") for k in only_real)

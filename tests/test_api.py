@@ -177,3 +177,27 @@ def test_infer_match_single_photo_and_empty_source(tmp_path):
     empty.mkdir()
     with pytest.raises(FileNotFoundError, match="No images found"):
         model.infer_match(empty, plot=False, save=None)
+
+
+def test_save_in_bf16_halves_the_weights_and_keeps_what_the_checkpoint_records(tmp_path):
+    from eomt import save_checkpoint, wrap_checkpoint
+
+    torch.manual_seed(0)
+    m = EoMT("s", device="cpu", pretrained=False, nc=NC, imgsz=IMGSZ)
+    src = tmp_path / "src.pt"
+    save_checkpoint(wrap_checkpoint(m.model.state_dict(), size="s", nc=NC, imgsz=IMGSZ, inference={"conf_thres": 0.4},
+                                    run_config={"epochs": 3}, epoch=2, metrics={"val/segm/mAP": 0.5},
+                                    best_key="segm/mAP"), src)
+    loaded = EoMT(src, device="cpu")
+    out = tmp_path / "bf16.pt"
+    loaded.save(out, dtype="bf16")
+    raw = load_raw(out)
+    assert raw["model"]["eomt.class_predictor.weight"].dtype == torch.bfloat16
+    assert raw["model"]["eomt.layernorm.weight"].dtype == torch.float32  # norms stay fp32
+    assert raw["dtype"] == "bf16" and raw["inference"] == {"conf_thres": 0.4} and raw["epoch"] == 2
+    assert raw["run_config"] == {"epochs": 3} and raw["best_key"] == "segm/mAP"
+    assert out.stat().st_size < 0.6 * src.stat().st_size
+    back = EoMT(out, device="cpu").model
+    w = loaded.model.state_dict()["eomt.class_predictor.weight"]
+    assert back.state_dict()["eomt.class_predictor.weight"].dtype == torch.float32
+    assert torch.allclose(back.state_dict()["eomt.class_predictor.weight"], w, rtol=1e-2, atol=1e-3)

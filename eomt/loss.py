@@ -17,6 +17,9 @@ A reimplementation of ``transformers.models.eomt.modeling_eomt``'s loss stack (`
   unmatched queries whose mask lies mostly inside an ignore region the "no object" class loss, and ``neg_weight`` (one
   value per photo) scales that loss for every unmatched query of the photo: 0 for a photo whose annotations list only
   some of its instances, so nothing unannotated is taught as background. Matched queries are untouched.
+* **Instance weights.** ``target_weights`` (one weight per target of each photo) weighs each instance's class, mask and
+  dice terms; the class and mask losses become weighted means, so their scale does not change with the weights. The
+  box and mask-quality terms are not weighted.
 
 The matcher is exposed as ``EoMTLoss.matcher`` with the exact
 ``(masks_queries_logits, class_queries_logits, mask_labels, class_labels)`` -> list-of-(src, tgt) signature that
@@ -86,18 +89,18 @@ def pair_wise_sigmoid_cross_entropy_loss(inputs: Tensor, labels: Tensor) -> Tens
     return loss_pos + loss_neg
 
 
-def dice_loss(inputs: Tensor, labels: Tensor, num_masks: int) -> Tensor:
+def dice_loss(inputs: Tensor, labels: Tensor, num_masks, weights: Tensor | None = None) -> Tensor:
     probs = inputs.sigmoid().flatten(1)
     numerator = 2 * (probs * labels).sum(-1)
     denominator = probs.sum(-1) + labels.sum(-1)
     loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss.sum() / num_masks
+    return (loss if weights is None else loss * weights).sum() / num_masks
 
 
-def sigmoid_cross_entropy_loss(inputs: Tensor, labels: Tensor, num_masks: int) -> Tensor:
+def sigmoid_cross_entropy_loss(inputs: Tensor, labels: Tensor, num_masks, weights: Tensor | None = None) -> Tensor:
     criterion = nn.BCEWithLogitsLoss(reduction="none")
-    cross_entropy_loss = criterion(inputs, labels)
-    return cross_entropy_loss.mean(1).sum() / num_masks
+    loss = criterion(inputs, labels).mean(1)
+    return (loss if weights is None else loss * weights).sum() / num_masks
 
 
 class HungarianMatcher(nn.Module):
@@ -197,12 +200,13 @@ class EoMTLoss(nn.Module):
         self.iou_aware_cls = bool(getattr(config, "iou_aware_cls", False))
 
     def loss_labels(self, class_queries_logits, class_labels, indices, quality: Tensor | None = None,
-                    negatives: Tensor | None = None) -> dict[str, Tensor]:
+                    negatives: Tensor | None = None, target_w: Tensor | None = None) -> dict[str, Tensor]:
         """Class CE. ``quality`` (IoU of each matched query, in permutation order) softens the matched targets to
         ``(1 + IoU) / 2`` for the GT class and the rest for "no object"; every query keeps its weight (1 matched,
         ``no_object_weight`` unmatched), so hard targets give exactly the weighted CE. ``negatives`` ``(B, Q)`` scales
         the "no object" term of each unmatched query (:meth:`negative_weights`); the normalisation stays that of the
-        full loss, so a left-out query only removes its term."""
+        full loss, so a left-out query only removes its term. ``target_w`` (permutation order) multiplies the weight of
+        each matched query, normalisation included (a weighted mean)."""
         pred_logits = class_queries_logits
         batch_size, num_queries, _ = pred_logits.shape
         idx = self._get_predictions_permutation_indices(indices)
@@ -211,7 +215,7 @@ class EoMTLoss(nn.Module):
             (batch_size, num_queries), fill_value=self.num_labels, dtype=torch.int64, device=pred_logits.device
         )
         target_classes[idx] = target_classes_o
-        if quality is None and negatives is None:
+        if quality is None and negatives is None and target_w is None:
             criterion = nn.CrossEntropyLoss(weight=self.empty_weight)
             return {"loss_cross_entropy": criterion(pred_logits.transpose(1, 2), target_classes)}
         target = F.one_hot(target_classes, self.num_labels + 1).float()
@@ -220,6 +224,9 @@ class EoMTLoss(nn.Module):
             target[idx] = target[idx] * q[:, None]
             target[idx[0], idx[1], -1] = 1 - q
         weight = self.empty_weight[target_classes]
+        if target_w is not None:
+            weight = weight.clone()
+            weight[idx] = weight[idx] * target_w.to(weight)
         kept = weight
         if negatives is not None:
             unmatched = torch.ones_like(weight, dtype=torch.bool)
@@ -265,10 +272,12 @@ class EoMTLoss(nn.Module):
         inter = (pred & gt).flatten(1).sum(1).float()
         return inter / (pred | gt).flatten(1).sum(1).float().clamp(min=1)
 
-    def loss_masks(self, masks_queries_logits, mask_labels, indices, num_masks) -> dict[str, Tensor]:
+    def loss_masks(self, masks_queries_logits, mask_labels, indices, num_masks,
+                   target_w: Tensor | None = None) -> dict[str, Tensor]:
         """Mask loss of the matched queries: dice on every GT pixel (see :func:`upsample_logits`), so every instance is
         supervised however small; BCE on 12,544 points, three quarters of them where the prediction is least certain
-        (:func:`uncertain_points`), which concentrates it on the boundaries."""
+        (:func:`uncertain_points`), which concentrates it on the boundaries. ``target_w`` (permutation order) makes
+        both a weighted mean over the matched queries."""
         targets = [t[j.to(t.device)] for t, (_, j) in zip(mask_labels, indices) if len(j)]
         if not targets:  # no matched query this batch: keep the graph alive
             zero = masks_queries_logits.sum() * 0.0
@@ -280,9 +289,13 @@ class EoMTLoss(nn.Module):
         coords = uncertain_points(logits[:, None])
         point_labels = sample_point(target_masks[:, None], coords)[:, 0]
         point_logits = sample_point(logits[:, None], coords)[:, 0]
+        w = None
+        if target_w is not None:
+            w = target_w.to(logits)
+            num_masks = w.sum().clamp(min=1e-6)
         return {
-            "loss_mask": sigmoid_cross_entropy_loss(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss(pred_masks, target_masks.flatten(1).to(pred_masks), num_masks),
+            "loss_mask": sigmoid_cross_entropy_loss(point_logits, point_labels, num_masks, w),
+            "loss_dice": dice_loss(pred_masks, target_masks.flatten(1).to(pred_masks), num_masks, w),
         }
 
     def loss_boxes(self, pred_boxes, box_labels, indices, num_boxes) -> dict[str, Tensor]:
@@ -316,12 +329,13 @@ class EoMTLoss(nn.Module):
         pred_quality: Tensor | None = None,
         ignore_masks: list[Tensor | None] | None = None,
         neg_weight: Tensor | None = None,
+        target_weights: list[Tensor] | None = None,
     ) -> dict[str, Tensor]:
         """``pred_boxes`` (with the model built with ``aux_box_head``) adds the box terms to the matching and the loss.
         ``pred_quality`` ``(B, Q)`` (mask-quality logits) adds ``loss_quality``: BCE of the matched queries' predicted
         against their measured mask IoU (Mask Scoring R-CNN); it does not enter the matching. ``ignore_masks`` and
-        ``neg_weight`` leave unannotated regions and partly annotated photos out of the "no object" loss (see the
-        module docstring).
+        ``neg_weight`` leave unannotated regions and partly annotated photos out of the "no object" loss, and
+        ``target_weights`` weighs each instance's class and mask terms (see the module docstring).
         """
         use_boxes = self.use_boxes and pred_boxes is not None
         if use_boxes and box_labels is None:
@@ -333,9 +347,13 @@ class EoMTLoss(nn.Module):
         num_masks = self.get_num_masks(class_labels, device=class_labels[0].device)
         quality = self.matched_iou(masks_queries_logits, mask_labels, indices) if self.iou_aware_cls else None
         negatives = self.negative_weights(masks_queries_logits, ignore_masks, neg_weight)
+        target_w = None
+        if target_weights is not None:  # each matched query's instance weight, in permutation order
+            target_w = torch.cat([w.to(masks_queries_logits.device)[j.to(masks_queries_logits.device)]
+                                  for w, (_, j) in zip(target_weights, indices)]).float()
         losses: dict[str, Tensor] = {
-            **self.loss_masks(masks_queries_logits, mask_labels, indices, num_masks),
-            **self.loss_labels(class_queries_logits, class_labels, indices, quality, negatives),
+            **self.loss_masks(masks_queries_logits, mask_labels, indices, num_masks, target_w),
+            **self.loss_labels(class_queries_logits, class_labels, indices, quality, negatives, target_w),
         }
         if use_boxes:
             losses.update(self.loss_boxes(pred_boxes, box_labels, indices, num_masks))

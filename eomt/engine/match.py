@@ -24,19 +24,10 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..reid import (
-    cluster,
-    flatten_instances,
-    gate_mask,
-    pairwise_matches,
-    similarity_diagnostics,
-    similarity_matrix,
-    summarize_identities,
-    validate_group_by,
-)
+from ..reid import link_identities, validate_group_by
 from ..serialization import load_model
 from ..visualize import draw_identity_grid
-from .predict import _IMAGE_EXTS, _iter_sources, predict_image, predict_set
+from .predict import _IMAGE_EXTS, _iter_sources, link_defaults, predict_image, predict_set
 
 
 def _panelize(image: Image.Image, result: dict, panel_size: int) -> tuple[Image.Image, dict]:
@@ -97,6 +88,7 @@ def match(
     group_by: tuple[str, ...] | str | None = "auto",
     sim_thres: float | None = None,
     joint: bool | None = None,
+    embed: str | None = None,
     center: bool = False,
     guard: str = "mean",
     guard_factor: float = 1.0,
@@ -120,13 +112,19 @@ def match(
             about (e.g. ``("class", "position")`` so instances at different places on
             the subject never match, however alike they look). ``None`` disables
             gating, which needs a stricter ``sim_thres`` since far more pairs then
-            compete. ``"auto"``: ``None`` for a model with a matching head (its
-            embedding was trained to tell instances apart across photos, and a
-            close-up's class is what the other photos may correct), else ``("class",)``.
+            compete. ``"auto"``: predicted jointly by a model whose links were
+            validated (a matching head, or a recorded calibration), the gate they were
+            validated with (none by default: the embedding was trained to tell instances
+            apart across photos, and a close-up's class is what the other photos may
+            correct), else ``("class",)``.
         joint: predict all the photos in ONE forward pass, so that a cross-view model's
             queries of each photo take what the others show (at most the model's
-            ``max_views`` photos), and match on its matching head's embedding.
+            ``max_views`` photos), and match on its calibrated embedding.
             ``None`` = joint for a cross-view model, one pass per photo otherwise.
+        embed: with ``joint``, the embedding to link on: ``"match"`` (the matching
+            head's) or ``"reid"`` (the per-query embedding of the joint forward);
+            ``None`` = the one that linked best at the model's last validation
+            (:func:`eomt.engine.predict.link_defaults`).
         center: mean-center embeddings before normalizing (transductive; see
             :func:`eomt.reid.similarity_matrix`).
         guard / guard_factor: merge guard against transitive chaining
@@ -136,9 +134,9 @@ def match(
             The masks are released as each photo is processed, not at the end, so
             leaving this off caps peak memory rather than only trimming the result.
         sim_thres: cosine floor for "same instance"; also the low end of the link
-            width scale, so it changes what a hairline link means. ``None``: the
-            matching head's calibrated threshold (``model.match_thres``) when joint
-            and available, else 0.7.
+            width scale, so it changes what a hairline link means. ``None``: when
+            joint, the threshold calibrated for the embedding (``match_thres`` /
+            ``reid_thres``), else 0.7.
         link_mode: ``"chain"`` draws one link between panel-consecutive members of
             each identity (same connectivity, far fewer lines), ``"all"`` draws every
             accepted pair, ``"none"`` draws none. Links are plain lines — the "same
@@ -158,11 +156,11 @@ def match(
         model = load_model(model, device=device)
 
     joint = bool(getattr(model, "xview_cfg", None)) if joint is None else joint
-    learned = joint and getattr(model, "match_head", None) is not None
+    embed, stored_thres, stored_gate = link_defaults(model, embed) if joint else ("reid", 0.7, ("class",))
     if group_by == "auto":
-        group_by = None if learned else ("class",)
+        group_by = stored_gate
     if sim_thres is None:
-        sim_thres = float(model.match_thres) if learned and model.match_thres is not None else 0.7
+        sim_thres = stored_thres
     # Validate the gate before the first forward: a typo should cost milliseconds,
     # not N ViT passes.
     group_by = validate_group_by(group_by, getattr(model, "aux_specs", []))
@@ -199,7 +197,7 @@ def match(
             photos = [Image.open(p).convert("RGB") for p in paths]
             it0 = time.perf_counter()
             joint_res = predict_set(model, photos, device=dev, imgsz=imgsz, conf_thres=conf_thres,
-                                    max_det=max_det, mask_thresh=mask_thresh, letterbox=letterbox)
+                                    max_det=max_det, mask_thresh=mask_thresh, letterbox=letterbox, embed=embed)
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
             ms = (time.perf_counter() - it0) * 1e3 / len(paths)
@@ -238,29 +236,15 @@ def match(
         print(f"[match] {path.name}: {res['num_detections']} instances "
               f"({res['elapsed_ms']:.1f} ms)")
 
-    # --- 2. fingerprints, gate, Hungarian, link --------------------------
+    # --- 2. fingerprints, gate, Hungarian, link (each detection stamped with its identity) --------------------
     dim = int(getattr(model.config, "hidden_size", 0))
-    embed, photo, keys, origin = flatten_instances(results, group_by=group_by, dim=dim)
-    sim = similarity_matrix(embed, center=center)
-    gate = gate_mask(photo, keys)
-    pairs = pairwise_matches(sim, photo, keys, sim_thres=sim_thres)
-    identity, pairs = cluster(
-        pairs, sim, photo, num_instances=len(origin), sim_thres=sim_thres,
-        guard=guard, guard_factor=guard_factor, gate=gate,
+    linked = link_identities(
+        results, sim_thres=sim_thres, group_by=group_by, dim=dim, center=center, guard=guard,
+        guard_factor=guard_factor, names=names, aux_specs=getattr(model, "aux_specs", []),
+        paths=[str(p) for p in paths],
     )
-    identities = summarize_identities(
-        identity, origin, results, sim, names=names,
-        aux_specs=getattr(model, "aux_specs", []), paths=[str(p) for p in paths],
-    )
-    diagnostics = similarity_diagnostics(sim, gate, identity)
-
-    # Stamp each detection with its identity, and drop heavy masks unless asked.
-    flat_of = {o: m for m, o in enumerate(origin)}
-    for i, res in enumerate(results):
-        n = int(res["num_detections"])
-        res["identity_ids"] = torch.tensor(
-            [int(identity[flat_of[(i, j)]]) for j in range(n)], dtype=torch.long
-        )
+    identity, identities, pairs = linked["identity"], linked["identities"], linked["pairs"]
+    origin, sim, diagnostics = linked["origin"], linked["sim"], linked["diagnostics"]
 
     accepted = [p for p in pairs if p["accepted"]]
     if not accepted and len(paths) > 1:
@@ -286,7 +270,8 @@ def match(
         "imgsz": imgsz,
         "letterbox": letterbox,
         "conf_thres": conf_thres, "max_det": max_det, "mask_thresh": mask_thresh,
-        "group_by": list(group_by), "sim_thres": sim_thres, "joint": joint, "center": center,
+        "group_by": list(group_by), "sim_thres": sim_thres, "joint": joint, "embed": embed if joint else "reid",
+        "center": center,
         "guard": guard, "guard_factor": guard_factor,
     }
 

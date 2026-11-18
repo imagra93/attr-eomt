@@ -138,9 +138,8 @@ def main(argv: list[str] | None = None) -> None:
     # Init from a checkpoint (fine-tune / resume), else from the run config's init_weights or a size (fresh, DINOv2).
     model = EoMT(args.weights or args.resume or args.size, device=args.device)
     result = model.train(data=args.data, resume=bool(args.resume), **overrides)
-    if result["best_metric"] >= 0:
-        metric = "bbox mAP" if args.task == "detect" else "segm mAP"
-        print(f"[done] best {metric}={result['best_metric']:.4f}; weights in {result['weights_dir']}")
+    if result.get("best"):
+        print(f"[done] best {result['best_key']}={result['best_metric']:.4f}; weights in {result['weights_dir']}")
     else:
         print(f"[done] weights in {result['weights_dir']}")
 

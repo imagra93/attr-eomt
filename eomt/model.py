@@ -421,38 +421,64 @@ def _set_groups(set_ids, device) -> list[torch.Tensor]:
     return [torch.tensor(g, device=device) for g in groups.values() if len(g) > 1]
 
 
+#: What the queries of a photo read in the other photos of its set (``xview["keys"]``): every token ("both": their
+#: queries and the rest, patches and class / register tokens), their queries only, or all but their queries.
+XVIEW_KEYS = ("both", "queries", "patches")
+
+
 class CrossViewAttention(nn.Module):
     """Cross-view sublayer (level 2), applied after a query block: the queries of each photo attend to
     every token of the OTHER photos of its set — their patches (local evidence: a clearer view of an instance) and
     their queries (the instances forming there) — plus a null token with a zero value, so that a query with nothing
-    to take from the others abstains.
+    to take from the others abstains. ``keys`` restricts what is read (:data:`XVIEW_KEYS`).
 
     The patches of a photo never look outside it, so its masks still cover only what it shows; the evidence from the
     other photos enters through the queries and reaches the patches in the next block's self-attention. Starts as a
     copy of the block's own attention (:meth:`init_from`: from the first step a query looks in another photo for what
     it looks for in its own) behind a LayerScale of ``init_scale``, so it starts as the identity.
+
+    ``view_types > 0`` adds a learned embedding of each photo's view type (``0`` = unknown, then one per type) to the
+    photo's tokens before the projections, so a query knows what kind of photo each other photo is (e.g. which side of
+    the subject it shows). Zero at init, so it starts as the identity too.
+
+    ponytail: one attention call per photo. A batched call over the set (each photo's own keys left out) gave the same
+    output but ran slower on the CPU; the cost here is the key / value projection of every token, which ``keys:
+    queries`` cuts. Batch it only if a GPU profile shows these calls in the step's hot path.
     """
 
-    def __init__(self, config, init_scale: float = 1e-5, null_logit: float = 4.0):
+    def __init__(self, config, init_scale: float = 1e-5, null_logit: float = 4.0, keys: str = "both",
+                 view_types: int = 0):
         super().__init__()
+        if keys not in XVIEW_KEYS:
+            raise ValueError(f"xview keys {keys!r}: choose from {XVIEW_KEYS}")
+        self.keys = keys
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = Attention(config)
         self.null_key = nn.Parameter(torch.zeros(config.hidden_size))  # in key space (after k_proj)
         self.null_logit = nn.Parameter(torch.full((config.num_attention_heads,), float(null_logit)))
         self.layer_scale = nn.Parameter(torch.full((config.hidden_size,), float(init_scale)))
+        self.view_embed = None
+        if view_types:
+            self.view_embed = nn.Embedding(int(view_types) + 1, config.hidden_size)
+            nn.init.zeros_(self.view_embed.weight)
 
     @torch.no_grad()
     def init_from(self, block: "Layer") -> None:
         self.norm.load_state_dict(block.norm1.state_dict())
         self.attention.load_state_dict(block.attention.state_dict())
 
-    def forward(self, hidden_states: torch.Tensor, groups: list[torch.Tensor], num_queries: int) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, groups: list[torch.Tensor], num_queries: int,
+                view_types: torch.Tensor | None = None) -> torch.Tensor:
         a = self.attention
         h, dh, d = a.num_heads, a.head_dim, a.embed_dim
         rows = list(hidden_states[:, :num_queries].unbind(0))
         for idx in groups:
             x = self.norm(hidden_states[idx])  # [V, N, D]: every token of the set's photos
-            q, k, v = a.q_proj(x[:, :num_queries]), a.k_proj(x), a.v_proj(x)
+            if self.view_embed is not None:
+                vt = view_types.to(x.device)[idx] if view_types is not None else idx.new_zeros(len(idx))
+                x = x + self.view_embed(vt)[:, None].to(x.dtype)
+            kv = x if self.keys == "both" else x[:, :num_queries] if self.keys == "queries" else x[:, num_queries:]
+            q, k, v = a.q_proj(x[:, :num_queries]), a.k_proj(kv), a.v_proj(kv)
             for i in range(len(idx)):
                 others = [j for j in range(len(idx)) if j != i]
                 kk = torch.cat([k[others].reshape(-1, d), self.null_key.to(k.dtype)[None]])
@@ -526,8 +552,11 @@ class CrossViewRefiner(nn.Module):
 
 
 #: Cross-view settings (``EoMTModel(xview=...)``, saved in the checkpoint): ``mode`` "blocks" (level 2) or "refiner"
-#: (level 1), the starting LayerScale and null-token logit, the refiner's depth / heads, and the most photos per set.
-DEFAULT_XVIEW: dict = {"mode": "blocks", "init_scale": 1e-5, "null_logit": 4.0, "layers": 2, "heads": 8, "max_views": 4}
+#: (level 1), the starting LayerScale and null-token logit, the refiner's depth / heads, the most photos per set, what
+#: a query reads in the other photos (``keys``, :data:`XVIEW_KEYS`, "blocks" only) and the names of the photos' view
+#: types (``view_types``, the images' ``view_type``; ``None`` = no view conditioning, "blocks" only).
+DEFAULT_XVIEW: dict = {"mode": "blocks", "init_scale": 1e-5, "null_logit": 4.0, "layers": 2, "heads": 8, "max_views": 4,
+                       "keys": "both", "view_types": None}
 
 
 class EoMTEncoder(nn.Module):
@@ -621,10 +650,14 @@ class EoMTEncoder(nn.Module):
         xv = getattr(config, "xview", None)
         self.xview = self.refiner = None
         if xv and xv["mode"] == "blocks":
+            n_types = len(xv.get("view_types") or [])
             self.xview = nn.ModuleList(
-                [CrossViewAttention(config, xv["init_scale"], xv["null_logit"]) for _ in range(config.num_blocks)]
+                [CrossViewAttention(config, xv["init_scale"], xv["null_logit"], xv.get("keys", "both"), n_types)
+                 for _ in range(config.num_blocks)]
             )
         elif xv and xv["mode"] == "refiner":
+            if xv.get("view_types") or xv.get("keys", "both") != "both":
+                raise ValueError("xview keys / view_types apply to mode 'blocks' only")
             self.refiner = CrossViewRefiner(config.hidden_size, xv["layers"], xv["heads"], xv["init_scale"], xv["null_logit"])
         elif xv:
             raise ValueError(f"xview mode {xv['mode']!r}: 'blocks' or 'refiner'")
@@ -632,12 +665,17 @@ class EoMTEncoder(nn.Module):
     # --- loss plumbing (mirrors HF get_loss_dict / get_loss) ----------------
 
     def get_loss_dict(self, masks_queries_logits, class_queries_logits, mask_labels, class_labels,
-                      pred_boxes=None, box_labels=None, pred_quality=None, ignore_masks=None, neg_weight=None):
+                      pred_boxes=None, box_labels=None, pred_quality=None, ignore_masks=None, neg_weight=None,
+                      target_weights=None):
         extra = {"pred_boxes": pred_boxes, "box_labels": box_labels} if pred_boxes is not None else {}
         if pred_quality is not None:
             extra["pred_quality"] = pred_quality
         if self.family != "detect" and (ignore_masks is not None or neg_weight is not None):
             extra.update(ignore_masks=ignore_masks, neg_weight=neg_weight)  # partial labels (eomt.data.subjects)
+        if target_weights is not None:
+            if self.family == "detect":
+                raise ValueError("target_weights apply to the instance family only")
+            extra["target_weights"] = target_weights
         loss_dict = self.criterion(
             masks_queries_logits=masks_queries_logits,
             class_queries_logits=class_queries_logits,
@@ -730,10 +768,14 @@ class EoMTEncoder(nn.Module):
         set_ids: torch.Tensor | None = None,
         ignore_masks: list[torch.Tensor | None] | None = None,
         neg_weight: torch.Tensor | None = None,
+        view_types: torch.Tensor | None = None,
+        target_weights: list[torch.Tensor] | None = None,
     ) -> EoMTOutput:
         """``set_ids`` ``[B]`` groups the photos into sets of the same subject predicted together (equal ids = one set)
-        for the cross-view modules; ``None``, or a photo alone in its set, is the single-photo model. ``ignore_masks``
-        and ``neg_weight`` (training only) leave regions and partly annotated photos out of the "no object" loss
+        for the cross-view modules; ``None``, or a photo alone in its set, is the single-photo model. ``view_types``
+        ``[B]`` (0 = unknown) is each photo's view type for a model with view conditioning. ``ignore_masks`` and
+        ``neg_weight`` (training only) leave regions and partly annotated photos out of the "no object" loss, and
+        ``target_weights`` (one weight per target of each photo) weighs each instance's class and mask loss
         (:class:`~eomt.loss.EoMTLoss`)."""
         cross_view = self.xview is not None or self.refiner is not None
         groups = _set_groups(set_ids, pixel_values.device) if cross_view else []
@@ -819,7 +861,7 @@ class EoMTEncoder(nn.Module):
                 hidden_states = torch.cat((refined, hidden_states[:, nq:]), dim=1)
             # Cross-view (level 2): the queries of each photo of a set take what the other photos show.
             if groups and self.xview is not None and in_query_blocks:
-                hidden_states = self.xview[block_idx](hidden_states, groups, nq)
+                hidden_states = self.xview[block_idx](hidden_states, groups, nq, view_types)
 
         sequence_output = self.layernorm(hidden_states)
         geom_final, class_queries_logits = self.predict(sequence_output, grid)
@@ -849,7 +891,7 @@ class EoMTEncoder(nn.Module):
                 pb = box_per_layer[i] if box_per_layer else None
                 pq = quality_logits if i == last else None
                 loss = loss + self.get_loss(self.get_loss_dict(g, c, geom_labels, class_labels, pb, gt_boxes, pq,
-                                                               ignore_masks, neg_weight))
+                                                               ignore_masks, neg_weight, target_weights))
 
         return EoMTOutput(
             loss=loss,
@@ -920,6 +962,7 @@ def build_model(
     aux_box_head: bool = False,
     xview: dict | None = None,
     match_dim: int = 0,
+    match_residual: bool = False,
 ) -> "EoMTModel":
     """Build an :class:`EoMTModel`.
 
@@ -934,7 +977,8 @@ def build_model(
     cross-attention); ``None`` = the original single-scale model. ``aux_box_head`` adds an
     auxiliary box head (L1 + GIoU loss and a box term in the matching cost) to the instance family.
     ``xview`` (see :data:`DEFAULT_XVIEW`) adds the cross-view modules that let several photos of one subject be
-    predicted together, and ``match_dim > 0`` a head embedding each query for matching instances across photos.
+    predicted together, and ``match_dim > 0`` a head embedding each query for matching instances across photos
+    (``match_residual``: as re-identification's fingerprint plus a learned residual, see :class:`EoMTModel`).
     """
     if family not in FAMILIES:
         raise ValueError(f"family={family!r} is not one of {FAMILIES}.")
@@ -957,6 +1001,7 @@ def build_model(
         aux_box_head=aux_box_head,
         xview=xview,
         match_dim=match_dim,
+        match_residual=match_residual,
     )
 
 
@@ -983,6 +1028,7 @@ class EoMTModel(nn.Module):
         aux_box_head: bool = False,
         xview: dict | None = None,
         match_dim: int = 0,
+        match_residual: bool = False,
     ):
         super().__init__()
         self.size = size
@@ -1061,12 +1107,29 @@ class EoMTModel(nn.Module):
         # Cross-photo matching head: one L2-normalized ``match_dim`` vector per query, trained so that the same
         # instance in two photos of a set lands close (``eomt.aux_cls.match_loss``). ``match_thres`` is the cosine
         # floor for "same instance", calibrated on the validation sets and restored from the checkpoint.
+        # ``match_residual``: the embedding is re-identification's fingerprint (the query embedding; projected
+        # orthogonally when ``match_dim`` is not the hidden size) plus the head's output, whose last layer starts at 0,
+        # so the head starts exactly as re-ID (approximately, when projected) and learns a correction.
         self.match_dim = int(match_dim)
-        self.match_head = None
+        self.match_residual = bool(match_residual) and self.match_dim > 0
+        self.match_head = self.match_skip = None
         if self.match_dim > 0:
             h = config.hidden_size
             self.match_head = nn.Sequential(nn.Linear(h, h), nn.GELU(), nn.Linear(h, self.match_dim))
+            if self.match_residual:
+                nn.init.zeros_(self.match_head[-1].weight)
+                nn.init.zeros_(self.match_head[-1].bias)
+                if self.match_dim != h:
+                    self.match_skip = nn.Linear(h, self.match_dim, bias=False)
+                    nn.init.orthogonal_(self.match_skip.weight)
         self.match_thres: float | None = None
+        # The links' calibration (restored from the checkpoint by load_model): the threshold of the per-query
+        # embedding of a joint forward (re-ID), the embedding that linked best at the last validation ("match" or
+        # "reid"), the gate keys the links were validated with, and both link F1s.
+        self.reid_thres: float | None = None
+        self.link_embed: str | None = None
+        self.link_group_by: tuple[str, ...] | None = None
+        self.link_f1: dict | None = None
 
     @torch.no_grad()
     def init_xview(self) -> None:
@@ -1086,6 +1149,8 @@ class EoMTModel(nn.Module):
         set_ids: torch.Tensor | None = None,
         ignore_masks: list[torch.Tensor | None] | None = None,
         neg_weight: torch.Tensor | None = None,
+        view_types: torch.Tensor | None = None,
+        target_weights: list[torch.Tensor] | None = None,
     ):
         out = self.eomt(
             pixel_values=pixel_values,
@@ -1095,6 +1160,8 @@ class EoMTModel(nn.Module):
             set_ids=set_ids,
             ignore_masks=ignore_masks,
             neg_weight=neg_weight,
+            view_types=view_types,
+            target_weights=target_weights,
         )
         geom_labels = box_labels if self.family == "detect" else mask_labels
         training = geom_labels is not None and class_labels is not None
@@ -1119,7 +1186,10 @@ class EoMTModel(nn.Module):
         q = out.last_hidden_state[:, : self.config.num_queries, :]
         result["query_embed"] = q
         if self.match_head is not None:
-            result["match_embed"] = F.normalize(self.match_head(q).float(), dim=-1)
+            m = self.match_head(q)
+            if self.match_residual:
+                m = m + (q if self.match_skip is None else self.match_skip(q))
+            result["match_embed"] = F.normalize(m.float(), dim=-1)
         if self.aux_heads:
             # Per-query logits over ALL queries are only consumed by postprocess at
             # inference; in training the aux loss applies each head to the matched

@@ -21,6 +21,21 @@ from .preprocess import IMAGENET_MEAN, IMAGENET_STD
 
 SCHEMA_VERSION = "1.0"
 
+#: Checkpoint metadata about where the weights come from, kept on a loaded model (``model.meta``) so that a re-save
+#: (:meth:`eomt.EoMT.save`) carries it over: the run that made them, the epoch and the metrics row it was saved at, and
+#: the key ``best.pt`` was chosen on.
+CARRIED_KEYS = ("run_config", "epoch", "metrics", "best_key", "best_metric")
+
+
+def module_counts(keys) -> str:
+    """``"eomt.xview (52), match_head (4)"``: state-dict keys counted per module (two levels under ``eomt.``)."""
+    counts: dict[str, int] = {}
+    for k in keys:
+        parts = k.split(".")
+        mod = ".".join(parts[:2]) if parts[0] == "eomt" and len(parts) > 2 else parts[0]
+        counts[mod] = counts.get(mod, 0) + 1
+    return ", ".join(f"{m} ({c})" for m, c in sorted(counts.items(), key=lambda kv: -kv[1]))
+
 
 def get_version() -> str:
     """Return the installed package version, with an editable-install fallback."""
@@ -249,8 +264,15 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
         aux_box_head=aux_box_head,
         xview=ckpt.get("xview"),
         match_dim=int(ckpt.get("match_dim") or 0),
+        match_residual=bool(ckpt.get("match_residual")),
     )
+    # How its links were calibrated (eomt.engine.predict.link_defaults)
     model.match_thres = ckpt.get("match_thres")
+    model.reid_thres = ckpt.get("reid_thres")
+    model.link_embed = ckpt.get("link_embed")
+    model.link_group_by = tuple(ckpt["link_group_by"]) if ckpt.get("link_group_by") else None
+    model.link_f1 = ckpt.get("link_f1")
+    model.meta = {k: ckpt[k] for k in CARRIED_KEYS if ckpt.get(k) is not None}
     # Compressed checkpoints carry int8 tensor subclasses (torchao). Re-create the
     # quantized layout, then load with ``assign=True`` so the saved subclassed
     # tensors *replace* the module weights directly — copying into freshly built
@@ -270,7 +292,8 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
         missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         warnings.warn(
-            f"load_state_dict: {len(missing)} missing / {len(unexpected)} unexpected keys.",
+            f"load_state_dict: {len(missing)} missing ({module_counts(missing) or '-'}) / {len(unexpected)} unexpected "
+            f"({module_counts(unexpected) or '-'}) keys.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -436,10 +459,19 @@ def summarize_checkpoint(path: str | Path) -> dict[str, Any]:
         "aux_box_head": bool(ckpt.get("aux_box_head")) or bool(_try(lambda: _infer_aux_box_head(state))),
         "xview": ckpt.get("xview"),
         "match_dim": ckpt.get("match_dim"),
+        "match_residual": bool(ckpt.get("match_residual")),
         "match_thres": ckpt.get("match_thres"),
-        # Training state (only present in last.pt).
+        "reid_thres": ckpt.get("reid_thres"),
+        "link_embed": ckpt.get("link_embed"),
+        "link_f1": ckpt.get("link_f1"),
+        "link_group_by": ckpt.get("link_group_by"),
+        "dtype": ckpt.get("dtype"),
+        # Where the weights come from: the epoch and metrics row they were saved at, best.pt's key, the run.
         "epoch": ckpt.get("epoch"),
         "best_metric": ckpt.get("best_metric"),
+        "best_key": ckpt.get("best_key"),
+        "metrics": ckpt.get("metrics"),
+        "provenance": (ckpt.get("run_config") or {}).get("provenance"),
         "has_optimizer": "optimizer" in ckpt,
         "has_ema": "ema" in ckpt,
     }
@@ -495,14 +527,44 @@ def format_summary(summary: dict[str, Any]) -> str:
         arch.append(f"cross-view {xv.get('mode')} (<= {xv.get('max_views')} photos)")
     if summary.get("match_dim"):
         thr = summary.get("match_thres")
-        arch.append(f"match head {summary['match_dim']}-d" + (f" (thres {thr:.2f})" if thr is not None else ""))
+        arch.append(f"match head {summary['match_dim']}-d" + (" residual on re-ID" if summary.get("match_residual") else "")
+                    + (f" (thres {thr:.2f})" if thr is not None else ""))
+    if summary.get("dtype"):
+        arch.append(f"{summary['dtype']} Linear / Conv weights")
     if arch:
         lines.insert(5, "  extras   : " + ", ".join(arch))
+    if summary.get("link_embed"):
+        f1 = summary.get("link_f1") or {}
+        thr = {"match": summary.get("match_thres"), "reid": summary.get("reid_thres")}
+        lines.append("  links    : " + f"{summary['link_embed']} embedding by default; "
+                     + ", ".join(f"{k} F1 {_num(f1.get(k), 3)} at {_num(thr[k], 2)}" for k in ("match", "reid"))
+                     + (f"; gated by {', '.join(summary['link_group_by'])}" if summary.get("link_group_by") else ""))
     if summary.get("epoch") is not None or summary.get("has_optimizer"):
         bm = summary.get("best_metric")
         bm_str = f"{bm:.4f}" if isinstance(bm, (int, float)) else str(bm)
+        key = summary.get("best_key")
+        key = key if isinstance(key, str) or key is None else " + ".join(f"{w:g} x {k}" for k, w in key.items())
         lines.append(
-            f"  training : epoch={summary.get('epoch')}  best_metric={bm_str}"
-            f"  optimizer={summary.get('has_optimizer')}  ema={summary.get('has_ema')}"
+            f"  training : epoch={summary.get('epoch')}  best_metric={bm_str}" + (f" ({key})" if key else "")
+            + f"  optimizer={summary.get('has_optimizer')}  ema={summary.get('has_ema')}"
         )
+    metrics = summary.get("metrics") or {}
+    shown = [k for k in _HEADLINE if isinstance(metrics.get(k), (int, float)) and metrics[k] == metrics[k]]
+    if shown:
+        lines.append("  metrics  : " + ", ".join(f"{k[4:] if k.startswith('val/') else k}={metrics[k]:.4f}" for k in shown))
+    prov = summary.get("provenance") or {}
+    if prov.get("init_weights"):
+        lines.append(f"  started  : {prov['init_weights']} (sha256 {str(prov.get('init_sha256'))[:12]})")
+    for name, rec in (prov.get("data") or {}).items():
+        lines.append(f"  data     : {name} {rec.get('path')} (sha256 {str(rec.get('sha256'))[:12]})")
     return "\n".join(lines)
+
+
+#: The metrics :func:`format_summary` shows of a checkpoint's metrics row, when it has them.
+_HEADLINE = ("val/segm/mAP", "val/bbox/mAP", "val/real/segm/mAP_alone", "val/real/segm/mAP_set",
+             "val/real/segm/mAP_linked_set", "val/real/match/f1", "val/real/reid_set/f1", "val/real/match/cluster_f1",
+             "val/sets/segm/mAP_alone", "val/sets/segm/mAP_set", "val/sets/match/f1")
+
+
+def _num(x, nd: int) -> str:
+    return "-" if x is None or x != x else f"{x:.{nd}f}"

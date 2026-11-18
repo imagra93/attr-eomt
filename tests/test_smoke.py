@@ -943,3 +943,31 @@ def test_link_width_is_independent_of_panel_size():
     assert len(set(widths.values())) == 1, f"stroke varies with panel_size: {widths}"
     lo, hi = LINK_WIDTH_PX
     assert lo <= next(iter(widths.values())) <= hi
+
+
+def test_progress_prints_plain_lines_when_not_on_a_terminal(capsys, monkeypatch):
+    import sys
+
+    from eomt import progress as P
+
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+    bar = P.progress(range(20), desc="epoch 0/1", unit="batch")
+    assert isinstance(bar, P.LineProgress)
+    for i in bar:
+        bar.set_postfix({"loss": f"{i:.1f}"})
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("epoch 0/1")]
+    assert len(lines) == 10 and "\r" not in "".join(lines)  # one line per 10 %
+    assert lines[-1].startswith("epoch 0/1: 20/20 (100%)") and "loss=19.0" in lines[-1]
+
+
+def test_metrics_csv_of_a_resumed_run_takes_new_columns(tmp_path):
+    import csv
+
+    from eomt.engine.train import _CsvLogger
+
+    path = tmp_path / "metrics.csv"
+    path.write_text("epoch,train/loss\n0,1.5\n")
+    log = _CsvLogger(path, ["epoch", "train/loss", "train/data_wait"])
+    log.append({"epoch": 1, "train/loss": 1.2, "train/data_wait": 0.1})
+    rows = list(csv.DictReader(path.open()))
+    assert [r["train/data_wait"] for r in rows] == ["nan", "0.1"] and rows[0]["train/loss"] == "1.5"

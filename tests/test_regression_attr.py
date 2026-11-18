@@ -236,3 +236,20 @@ def test_metric_plots_show_each_regression_head_as_its_mae(tmp_path, monkeypatch
     assert acc.get_title() == "aux 'kind' accuracy by primary class" and acc.get_ylim()[1] == 1.08
     assert mae.get_title() == "aux 'cost' mean absolute error by primary class"
     assert [b.get_height() for b in mae.patches] == [25.0, 10.0] and mae.get_ylim()[1] > 25.0
+
+
+def test_regression_metrics_weigh_every_instance_alike_and_report_buckets():
+    from eomt.config import AuxHeadSpec
+    from eomt.engine.validate import attr_metric_names, regression_metrics
+
+    spec = AuxHeadSpec("surface", 1, regression=True, log=True, bins=(10, 35))
+    gt = torch.tensor([5.0, 20.0, 100.0])
+    pred = torch.tensor([10.0, 20.0, 50.0])  # x2 on the small one, exact, /2 on the large one
+    m = regression_metrics(spec, pred, gt)
+    assert set(m) == set(attr_metric_names(spec))
+    assert m["aux_mae/surface"] == pytest.approx(55 / 3)  # dominated by the large instance
+    assert m["aux_ratio/surface"] == pytest.approx(1.0)  # the median ratio
+    assert m["aux_mae/surface@<10"] == pytest.approx(5.0) and m["aux_ratio/surface@>=35"] == pytest.approx(0.5)
+    assert m["aux_logmae/surface@10-35"] == pytest.approx(0.0)
+    plain = regression_metrics(AuxHeadSpec("cost", 1, regression=True), pred, gt)
+    assert set(plain) == {"aux_mae/cost"}  # log-space metrics for a log head only

@@ -145,6 +145,42 @@ def predict_image(
     return result
 
 
+#: The embeddings a joint forward can link detections with: the matching head's, or the per-query embedding
+#: (re-identification's fingerprint).
+LINK_EMBEDS = ("match", "reid")
+
+
+def link_defaults(model, embed: str | None = None) -> tuple[str, float, tuple[str, ...] | None]:
+    """``(embed, threshold, gate keys)`` the photos predicted together by ``model`` are linked with by default: the
+    embedding that linked best at the model's last validation (the checkpoint's ``link_embed``; without one, the
+    matching head's when the model has one), the similarity threshold stored for it (0.7 without one) and the gate keys
+    its links were validated with (``None`` = no gate). A model whose links were never trained nor validated (no
+    matching head, no recorded calibration) is gated by ``("class",)``, as re-identification of single photos is.
+    ``embed`` picks the embedding instead."""
+    has_head = getattr(model, "match_head", None) is not None
+    embed = embed or getattr(model, "link_embed", None) or ("match" if has_head else "reid")
+    if embed not in LINK_EMBEDS:
+        raise ValueError(f"embed {embed!r}: choose from {LINK_EMBEDS}")
+    if embed == "match" and not has_head:
+        raise ValueError("embed='match' needs a model with a matching head (train(multiview=...) with match_dim > 0)")
+    thres = getattr(model, "match_thres" if embed == "match" else "reid_thres", None)
+    if not (has_head or getattr(model, "link_embed", None)):
+        return embed, float(thres) if thres is not None else 0.7, ("class",)
+    gate = getattr(model, "link_group_by", None)
+    return embed, float(thres) if thres is not None else 0.7, tuple(gate) if gate else None
+
+
+def _view_type_ids(model, view_types, n: int):
+    """The model's ids of the photos' view types (names or values, compared as text with the checkpoint's vocabulary;
+    0 = unknown), or None."""
+    if view_types is None:
+        return None
+    if len(view_types) != n:
+        raise ValueError(f"view_types: one per photo ({n}), got {len(view_types)}")
+    vocab = [str(v) for v in (getattr(model, "xview_cfg", None) or {}).get("view_types") or []]
+    return torch.tensor([vocab.index(str(v)) + 1 if v is not None and str(v) in vocab else 0 for v in view_types])
+
+
 @torch.no_grad()
 def predict_set(
     model,
@@ -157,17 +193,24 @@ def predict_set(
     mask_thresh: float = 0.5,
     letterbox: bool = True,
     amp: bool | str = False,
+    embed: str | None = None,
+    view_types: list | None = None,
 ) -> list[dict]:
     """Predict the photos of ONE subject together, in one forward pass: with a cross-view model (``xview``) the
     queries of each photo take what the others show; any other model predicts each photo as :func:`predict_image`.
 
-    Returns one :func:`~eomt.postprocess.postprocess_instance` dict per photo, each with ``"embed"`` ``(N, d)``: the
-    matching head's embedding of each kept detection when the model has one (``match_embed``, L2-normalized), else the
-    per-query embedding (re-identification's fingerprint, :mod:`eomt.reid`). At most the model's ``max_views`` photos.
+    Returns one :func:`~eomt.postprocess.postprocess_instance` dict per photo, each with ``"embed"`` ``(N, d)``, the
+    embedding each kept detection is linked by: ``embed="match"`` the matching head's (L2-normalized), ``"reid"`` the
+    per-query embedding of this forward (re-identification's fingerprint, :mod:`eomt.reid`); by default the one that
+    linked best at the model's last validation (:func:`link_defaults`). At most the model's ``max_views`` photos.
+    ``view_types`` (one per photo, e.g. the images' ``view_type``) tells a model trained with view types what kind of
+    photo each one is; a value it does not know, or ``None``, is unknown.
     """
     max_views = int((getattr(model, "xview_cfg", None) or {}).get("max_views", len(images)))
     if not 1 <= len(images) <= max_views:
         raise ValueError(f"predict_set takes 1 to {max_views} photos of one subject, got {len(images)}.")
+    embed = link_defaults(model, embed)[0]
+    vt = _view_type_ids(model, view_types, len(images))
     aux_scopes = {s.name: s.applies_to for s in getattr(model, "aux_specs", []) if s.applies_to is not None}
     chws, metas = zip(*(
         preprocess_numpy(np.array(im.convert("RGB")), imgsz, letterbox=letterbox,
@@ -178,18 +221,30 @@ def predict_set(
     set_ids = torch.zeros(len(images), dtype=torch.long)
     dtype = _amp_dtype(device, amp)
     if dtype is None:
-        out = model(x, set_ids=set_ids)
+        out = model(x, set_ids=set_ids, view_types=vt)
     else:
         with torch.autocast("cuda", dtype=dtype):
-            out = model(x, set_ids=set_ids)
-    embed = out.get("match_embed", out["query_embed"])
+            out = model(x, set_ids=set_ids, view_types=vt)
+    vectors = out["match_embed"] if embed == "match" else out["query_embed"]
     results = []
     for b, (im, meta) in enumerate(zip(images, metas)):
         res = postprocess_instance(slice_batch(out, b), conf_thres, im.size, max_det=max_det, mask_thresh=mask_thresh,
                                    preprocess_meta=meta, aux_scopes=aux_scopes)
-        res["embed"] = embed[b, res["query_idx"]].float().cpu()
+        res["embed"] = vectors[b, res["query_idx"]].float().cpu()
         results.append(res)
     return results
+
+
+def _explicit_groups(groups, n: int, max_views: int) -> list[list[int]]:
+    """``groups`` (photo indices) checked, plus every photo they leave out alone."""
+    out, seen = [], set()
+    for g in groups:
+        g = [int(i) for i in g]
+        if not g or len(g) > max_views or len(set(g)) < len(g) or seen & set(g) or any(not 0 <= i < n for i in g):
+            raise ValueError(f"groups: {g} must hold 1 to {max_views} distinct photos of 0..{n - 1}, each in one group")
+        seen.update(g)
+        out.append(g)
+    return out + [[i] for i in range(n) if i not in seen]
 
 
 def subject_sets(feats: torch.Tensor, max_views: int, *, mode: str = "partition", k: int = 3) -> list[list[int]]:
@@ -234,25 +289,59 @@ def predict_subject(
     mask_thresh: float = 0.5,
     letterbox: bool = True,
     amp: bool | str = False,
-) -> list[dict]:
+    groups: list[list[int]] | None = None,
+    view_types: list | None = None,
+    embed: str | None = None,
+    identities: bool = False,
+    group_by: tuple[str, ...] | str | None = "auto",
+    sim_thres: float | None = None,
+) -> list[dict] | dict:
     """Predict every photo of one subject together with other photos of it: one result per photo, in
     input order, as :func:`predict_set` gives them.
 
     The photos are grouped by :func:`subject_sets`: ``mode="order"`` takes them ``max_views`` at a time in the given
     order; ``"partition"`` and ``"anchor"`` group them on the mean patch token of a pass at ``feature_size`` (a small
     input, about a quarter of the cost of a prediction at 644 px). ``"order"`` and ``"partition"`` predict every photo
-    once, ``"anchor"`` once per photo with its ``k`` most similar others. A model without cross-view modules predicts
-    each photo alone either way.
+    once, ``"anchor"`` once per photo with its ``k`` most similar others. ``groups`` (lists of photo indices, each photo
+    in one at most; those left out are predicted alone) gives the groups instead, e.g. each overview with the close-ups
+    it shows. A model without cross-view modules predicts each photo alone either way. ``view_types`` (one per photo)
+    as in :func:`predict_set`.
+
+    ``identities=True`` also links the detections of every photo with those of every other (across the groups too) and
+    clusters them (:func:`eomt.reid.link_identities`), with the model's calibrated embedding, threshold and gate
+    (:func:`link_defaults`; ``embed``, ``sim_thres`` and ``group_by`` override them, ``group_by="auto"`` being the gate
+    the links were validated with). The return is then ``{"images": [one result per photo, each with "identity_ids"],
+    "identities": [one record per identity: its members, fused attributes (a vote) and regression values], "matches",
+    "config"}``.
     """
     if not images:
-        return []
+        return {"images": [], "identities": [], "matches": [], "config": {}} if identities else []
     kw = dict(device=device, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
-              letterbox=letterbox, amp=amp)
+              letterbox=letterbox, amp=amp, embed=embed)
     max_views = int((getattr(model, "xview_cfg", None) or {}).get("max_views", 1))
     if max_views < 2 or len(images) == 1:
-        return [predict_set(model, [im], **kw)[0] for im in images]
-    feats = torch.zeros(len(images), 1) if mode == "order" else _mean_patch_tokens(model, images, feature_size, **kw)
-    return _predict_groups(model, images, subject_sets(feats, max_views, mode=mode, k=k), mode, **kw)
+        sets, mode = [[i] for i in range(len(images))], "order"
+    elif groups is not None:
+        sets, mode = _explicit_groups(groups, len(images), max_views), "order"
+    else:
+        feats = torch.zeros(len(images), 1) if mode == "order" else _mean_patch_tokens(model, images, feature_size, **kw)
+        sets = subject_sets(feats, max_views, mode=mode, k=k)
+    results = _predict_groups(model, images, sets, mode, view_types=view_types, **kw)
+    if not identities:
+        return results
+    from ..reid import link_identities, validate_group_by
+
+    embed, thres, gate = link_defaults(model, embed)
+    keys = validate_group_by(gate if group_by == "auto" else group_by, getattr(model, "aux_specs", []))
+    thres = float(sim_thres) if sim_thres is not None else thres
+    linked = link_identities(results, sim_thres=thres, group_by=keys, names=getattr(model, "names", None),
+                             aux_specs=getattr(model, "aux_specs", []))
+    origin = linked["origin"]
+    matches = [{"a_image": origin[p["a"]][0], "a_det": origin[p["a"]][1], "b_image": origin[p["b"]][0],
+                "b_det": origin[p["b"]][1], "similarity": round(p["similarity"], 4), "accepted": bool(p["accepted"]),
+                "reason": p["reason"], "identity_id": p.get("identity_id")} for p in linked["pairs"]]
+    return {"images": results, "identities": linked["identities"], "matches": matches,
+            "config": {"embed": embed, "sim_thres": thres, "group_by": list(keys), "groups": sets}}
 
 
 @torch.no_grad()
@@ -279,11 +368,12 @@ def _mean_patch_tokens(model, images, size, *, device, letterbox, amp, **_) -> t
     return torch.stack(feats)
 
 
-def _predict_groups(model, images, groups, mode, **kw) -> list[dict]:
+def _predict_groups(model, images, groups, mode, view_types=None, **kw) -> list[dict]:
     """One :func:`predict_set` per group; every photo keeps its own result (the first photo only, for ``"anchor"``)."""
     results: list[dict | None] = [None] * len(images)
     for group in groups:
-        res = predict_set(model, [images[i] for i in group], **kw)
+        vt = [view_types[i] for i in group] if view_types is not None else None
+        res = predict_set(model, [images[i] for i in group], view_types=vt, **kw)
         for i, r in zip(group if mode != "anchor" else group[:1], res):
             results[i] = r
     return results

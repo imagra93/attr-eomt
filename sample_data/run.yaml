@@ -26,6 +26,7 @@ attributes:
   # price: {log: true, range: [0, 20000]}           # a regression head: regress log1p; values outside are ignored
   # surface_cm2: {log: true, crop: scale}           # follows the share of the instance a crop keeps in view
   # length_cm: {crop: ignore, min_visible: 0.95}    # dropped when less than 95 % of the instance is in view
+  # weight_kg: {log: true, bins: [1, 10]}           # validation also reports its errors per GT bucket (<1, 1-10, >=10)
 
 # --- augmentation: eomt.data.transforms.AugConfig fields over its defaults (see the README, "Augmentation")
 aug:

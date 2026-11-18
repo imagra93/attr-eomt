@@ -87,8 +87,9 @@ def plot_metrics_csv(csv_path, out_png) -> None:
     task = "segm" if any(f.startswith("val/segm/") for f in fields) else "bbox"
 
     aux_keys = [k for k in fields if k.startswith(("train/aux_acc/", "val/aux_acc/"))]
-    # regression heads: one MAE panel each, as their units differ
-    mae_heads = list(dict.fromkeys(k.split("/", 2)[2] for k in fields if k.startswith(("train/aux_mae/", "val/aux_mae/"))))
+    # regression heads: one MAE panel each, as their units differ (with the head's GT-value buckets, ``@<bucket>``)
+    mae_heads = list(dict.fromkeys(k.split("/", 2)[2].split("@")[0] for k in fields
+                                   if k.startswith(("train/aux_mae/", "val/aux_mae/"))))
 
     n_panels = 3 + bool(aux_keys) + len(mae_heads)
     rows = max(2, math.ceil(n_panels / 2))
@@ -115,9 +116,11 @@ def plot_metrics_csv(csv_path, out_png) -> None:
             "Aux head accuracy", "accuracy",
         )
     for head in mae_heads:
+        buckets = [k for k in fields if k.startswith(f"val/aux_mae/{head}@")]
         _plot_series(
             next(panels), x, cols,
-            [(f"train/aux_mae/{head}", "train"), (f"val/aux_mae/{head}", "val")],
+            [(f"train/aux_mae/{head}", "train"), (f"val/aux_mae/{head}", "val")]
+            + [(k, f"val {k.split('@', 1)[1]}") for k in buckets],
             f"Aux '{head}' mean absolute error", "MAE (real units)",
         )
     for ax in panels:

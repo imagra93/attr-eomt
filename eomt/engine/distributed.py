@@ -46,6 +46,25 @@ def shard(ds):
     return ds if world_size() == 1 else Subset(ds, range(rank(), len(ds), world_size()))
 
 
+def shard_groups(ds, keys: list):
+    """This process's share of ``ds`` keeping the items of one group together (``keys[i]``: item ``i``'s group): every
+    ``world_size``-th group, in order of first appearance, so a per-group computation (e.g. over the photos of one
+    subject) needs nothing from the other processes."""
+    if world_size() == 1:
+        return ds
+    order = {k: g for g, k in enumerate(dict.fromkeys(keys))}
+    return Subset(ds, [i for i, k in enumerate(keys) if order[k] % world_size() == rank()])
+
+
+def broadcast(obj):
+    """The main process's ``obj`` on every process (``obj`` itself on one)."""
+    if world_size() == 1:
+        return obj
+    box = [obj if is_main() else None]
+    dist.broadcast_object_list(box, src=0)
+    return box[0]
+
+
 def gather(obj) -> list | None:
     """``[obj of process 0, obj of process 1, ...]`` on the main process, ``None`` on the others (``[obj]`` on one)."""
     if world_size() == 1:
