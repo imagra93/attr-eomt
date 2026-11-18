@@ -512,7 +512,7 @@ def build_val_parts(*, val_images, val_json, imgsz: int, aug_cfg, aux, is_detect
             val_images, val_json, imgsz=imgsz, transform=build_val_transform(imgsz), shared_aux=aux)
     if sets is not None:
         parts["sets"] = CocoSubjectSets(val_images, val_json, imgsz=imgsz, aug=aug_cfg, seed=0, augment=False,
-                                        sets={**dataclasses.asdict(sets), "p_single": 0.0, "p_hard": 0.0},
+                                        sets={**dataclasses.asdict(sets), "p_single": 0.0, "p_hard": 0.0, "p_random": 0.0},
                                         shared_aux=aux, fixed=fixed)
     return parts
 

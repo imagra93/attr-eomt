@@ -327,3 +327,25 @@ def test_trainable_presets_and_prefixes():
     with pytest.raises(ValueError, match="neither a group"):
         build_multiview_optimizer(m, 1e-4, 0.05, {"xviews": 1.0})
     assert MultiviewConfig(xview=False).groups() == {"match_head": 1.0}
+
+
+def test_sets_from_groups_with_a_share_of_random_ones(tmp_path):
+    """sets.groups: the photos of a subject with the same group value are one set (as inference groups them); p_random
+    of the sets are random combinations on top; a photo with no group is a set alone."""
+    img_dir, jf = _subject_coco(tmp_path, n_s2=4)
+    data = json.loads(jf.read_text())
+    group = {1: "a", 2: "a", 3: "b", 4: "x", 5: "x", 6: "x", 7: "x"}  # im8: no group; im3 is input only: no set
+    for im in data["images"]:
+        if im["id"] in group:
+            im["group"] = group[im["id"]]
+    jf.write_text(json.dumps(data))
+    ds = CocoSubjectSets(img_dir, jf, imgsz=112, aug=AUG, seed=0, augment=False, sets={"max_views": 3, "groups": "group"})
+    files = [[ds.coco.loadImgs(i)[0]["file_name"] for i in ds[k]["photos"]] for k in range(len(ds))]
+    assert sorted(map(sorted, files)) == [["im1.png", "im2.png"], ["im4.png", "im5.png", "im6.png"], ["im7.png"]]
+    assert ds.first_photos() == [ds[k]["photos"][0] for k in range(len(ds))]
+    mixed = CocoSubjectSets(img_dir, jf, imgsz=112, aug=AUG, seed=0, sets={"max_views": 3, "groups": "group",
+                                                                         "p_random": 0.25})
+    assert len(mixed) == 3 + 1                                   # 25 % of the sets random: one more on three groups
+    assert len(mixed[3]["photos"]) >= 1 and all(p in {1, 2, 3, 4, 5, 6, 7} for p in mixed[3]["photos"])
+    with pytest.raises(ValueError, match="p_random"):
+        CocoSubjectSets(img_dir, jf, imgsz=112, aug=AUG, sets={"p_random": 0.3})

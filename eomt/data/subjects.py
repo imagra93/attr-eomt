@@ -77,14 +77,23 @@ def _draw(weights: dict):
 
 @dataclass
 class SubjectSetConfig:
-    """How the real sets are drawn: at most ``max_views`` photos; ``sizes`` (``{photos: weight}``, 2 to ``max_views``)
-    the size of a set of several (default: as many photos as the subject has, up to ``max_views``); ``p_single`` sets of
-    the anchor alone; ``p_shared`` sets whose companions are first the photos sharing a linked instance with the
-    anchor. ``p_hard`` (training only) the sets of several whose anchor is made hard, by one of the synthetic cases
-    weighted by ``hard`` (``{case: weight}``, :data:`HARD_CASES`; default all alike); ``occluder_cover`` the
-    share of an instance the ``occluded`` case covers."""
+    """How the sets are drawn: at most ``max_views`` photos.
+
+    ``groups`` (an image field): the photos of a subject with the same value of that field are one set — the groups the
+    photos are predicted in at inference (e.g. written by the dataset's build with the deployment's grouping rule). Every
+    group is then a set once per epoch (a group larger than ``max_views`` is split), and ``p_random`` of the sets are
+    drawn at random as below instead, an augmentation against learning only the fixed groups. Without ``groups``, every
+    photo of a subject is the anchor of one random set per epoch.
+
+    A random set: ``sizes`` (``{photos: weight}``, 2 to ``max_views``) the size of a set of several (default: as many
+    photos as the subject has, up to ``max_views``); ``p_single`` sets of the anchor alone; ``p_shared`` sets whose
+    companions are first the photos sharing a linked instance with the anchor. ``p_hard`` (training only, every set)
+    the sets of several whose first photo is made hard, by one of the cases weighted by ``hard`` (``{case: weight}``,
+    :data:`HARD_CASES`; default all alike); ``occluder_cover`` the share of an instance the ``occluded`` case covers."""
 
     max_views: int = 4
+    groups: str | None = None
+    p_random: float = 0.0
     sizes: dict | None = None
     p_single: float = 0.0
     p_shared: float = 0.5
@@ -95,6 +104,8 @@ class SubjectSetConfig:
     def __post_init__(self) -> None:
         if self.max_views < 2:
             raise ValueError("SubjectSetConfig: max_views < 2")
+        if not 0.0 <= self.p_random < 1.0 or (self.p_random and not self.groups):
+            raise ValueError(f"SubjectSetConfig: p_random {self.p_random} must be in [0, 1), with groups")
         if self.sizes is not None:
             self.sizes = {int(n): float(w) for n, w in self.sizes.items()}
             if not self.sizes or any(not 2 <= n <= self.max_views for n in self.sizes) or sum(self.sizes.values()) <= 0:
@@ -204,6 +215,19 @@ class CocoSubjectSets(_Occluder, CocoInstanceSeg):
         self.anchors = [i for i in sorted(self._subject_of) if self._supervision[i] != "none"]
         if not self.anchors:
             raise ValueError(f"{json_file}: no image with a subject_id (and supervision other than 'none')")
+        self._groups: list[list[int]] = []  # the photos of each group (sets.groups), in the data's order
+        if self.sets.groups:
+            by_key: dict = {}
+            for i in sorted(self._subject_of):
+                v = self.coco.loadImgs(self.ids[i])[0].get(self.sets.groups)
+                by_key.setdefault((self._subject_of[i], ("photo", i) if v is None else ("group", str(v))), []).append(i)
+            for photos in by_key.values():  # a group with no photo that trains is no set; a large one is split
+                for k in range(0, len(photos), self.sets.max_views):
+                    chunk = photos[k:k + self.sets.max_views]
+                    if any(self._supervision[j] != "none" for j in chunk):
+                        self._groups.append(sorted(chunk, key=lambda j: self._supervision[j] == "none"))
+        self._n_random = (round(len(self._groups) * self.sets.p_random / (1.0 - self.sets.p_random))
+                          if self._groups else 0)
         self.fixed = None
         if fixed is not None:
             self.fixed, self.fixed_report = self._resolve_fixed(fixed)
@@ -239,19 +263,31 @@ class CocoSubjectSets(_Occluder, CocoInstanceSeg):
         return len(names)
 
     def __len__(self) -> int:
-        return len(self.fixed) if self.fixed is not None else len(self.anchors)
+        if self.fixed is not None:
+            return len(self.fixed)
+        return len(self._groups) + self._n_random if self._groups else len(self.anchors)
 
     @property
     def num_subjects(self) -> int:
         return len(self._members)
 
     def subject_of_set(self, i: int):
-        """The subject of set ``i``."""
-        return self._subject_of[self.fixed[i][0] if self.fixed is not None else self.anchors[i]]
+        """The subject of set ``i`` (a fixed set, a group, or the anchor of a random set without groups)."""
+        if self.fixed is not None:
+            return self._subject_of[self.fixed[i][0]]
+        if self._groups:
+            if i >= len(self._groups):
+                raise IndexError("a random set's subject is drawn when the set is")
+            return self._subject_of[self._groups[i][0]]
+        return self._subject_of[self.anchors[i]]
 
     def first_photos(self) -> list:
-        """The image id of each set's anchor."""
-        return [self.ids[s[0]] for s in self.fixed] if self.fixed is not None else [self.ids[a] for a in self.anchors]
+        """The image id of each set's first photo (the random sets' anchors are drawn: not listed)."""
+        if self.fixed is not None:
+            return [self.ids[s[0]] for s in self.fixed]
+        if self._groups:
+            return [self.ids[g[0]] for g in self._groups]
+        return [self.ids[a] for a in self.anchors]
 
     def _instance_code(self, subject, instance_id) -> int:
         """The ``instance_id`` of an annotation of ``subject`` as a non-negative int (a JSON number or string)."""
@@ -286,8 +322,10 @@ class CocoSubjectSets(_Occluder, CocoInstanceSeg):
     def _choose(self, i: int) -> tuple[list[int], bool]:
         if self.fixed is not None:
             return list(self.fixed[i]), _coin(self.aug.flip_prob)
+        if self._groups and i < len(self._groups):
+            return list(self._groups[i]), _coin(self.aug.flip_prob)
         c = self.sets
-        anchor = self.anchors[i]
+        anchor = self.anchors[_randint(0, len(self.anchors) - 1)] if self._groups else self.anchors[i]
         n_others = len(self._members[self._subject_of[anchor]]) - 1
         if not n_others or _coin(c.p_single):
             size = 1
