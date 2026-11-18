@@ -680,6 +680,19 @@ class _Logger:
 LOG_EVERY = 10
 
 
+@contextlib.contextmanager
+def _inference_numerics():
+    """PyTorch's default numerics (no TF32 matmuls, no cuDNN autotuning), which training turns on for speed: validated
+    in them, the trainer's metrics are exactly those a standalone validation, or the deployed model, reproduces."""
+    b = torch.backends
+    saved = (b.cuda.matmul.allow_tf32, b.cudnn.allow_tf32, b.cudnn.benchmark)
+    b.cuda.matmul.allow_tf32, b.cudnn.allow_tf32, b.cudnn.benchmark = False, True, False
+    try:
+        yield
+    finally:
+        b.cuda.matmul.allow_tf32, b.cudnn.allow_tf32, b.cudnn.benchmark = saved
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # train()
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1177,7 +1190,7 @@ def train(
                 train_peak = torch.cuda.max_memory_allocated(dev)
                 torch.cuda.reset_peak_memory_stats(dev)
             # a block mid-window unmasks a random share of its queries: the same ones at every validation
-            with torch.random.fork_rng(devices=[dev] if dev.type == "cuda" else []):
+            with torch.random.fork_rng(devices=[dev] if dev.type == "cuda" else []), _inference_numerics():
                 torch.manual_seed(0)
                 metrics, aux_pc = validate_parts(
                     eval_model, val_parts, device=dev, batch=batch, workers=workers, conf_thres=vcfg.conf_thres,
