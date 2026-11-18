@@ -37,3 +37,4 @@ local_training_scripts/
 # Local, never published: run scripts and notes of private datasets
 /train*.sh
 /wishlist.md
+/training/
