@@ -999,10 +999,19 @@ class EoMTModel(nn.Module):
         # read it, and so does re-identification on checkpoints without a matching head.
         q = out.last_hidden_state[:, : self.config.num_queries, :]
         result["query_embed"] = q
-        # The photo's embedding [B, hidden]: the mean of its final patch tokens, what comparing photos by appearance
-        # reads (e.g. grouping a subject's photos, :func:`eomt.engine.predict.similar_groups`). A mean: always exposed.
+        # The photo's embedding [B, hidden]: the mean of its final patch tokens over the photo itself, what comparing
+        # photos by appearance reads (e.g. grouping a subject's photos, :func:`eomt.engine.predict.similar_groups`).
+        # A patch whose pixels are all exactly 0 is letterbox padding (the preprocessing fills it with 0, which no
+        # normalized pixel equals) and is left out, so photos of other shapes compare alike. A mean: always exposed.
         first_patch = self.config.num_queries + self.eomt.embeddings.num_prefix_tokens
-        result["photo_embed"] = out.last_hidden_state[:, first_patch:].mean(1)
+        patches = out.last_hidden_state[:, first_patch:]
+        ps = self.config.patch_size
+        content = F.max_pool2d(pixel_values.detach().abs().amax(1, keepdim=True).float(), ps).flatten(1) > 0
+        if content.shape[1] != patches.shape[1]:  # not one input patch per token: every token
+            content = torch.ones(patches.shape[:2], dtype=torch.bool, device=patches.device)
+        content |= ~content.any(1, keepdim=True)  # an all-zero input: every patch
+        w = content.to(patches.dtype).unsqueeze(-1)
+        result["photo_embed"] = (patches * w).sum(1) / w.sum(1)
         if self.aux_heads and not training:
             # In training the attribute loss applies each head to the matched queries only.
             specs = {s.name: s for s in self.aux_specs}

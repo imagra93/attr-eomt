@@ -34,8 +34,8 @@ before are refused** (their single-photo starting checkpoints load as before, wi
   time are two groups of 4 instead of 4 + 1; `similar_groups(features, max_views)` groups photos by
   `photo_similarity`: the cosine of one or several descriptions of each photo (e.g. a first model's class areas and the
   photo's appearance), averaged with `weights`, optionally `center`ed, filled the same way.
-- **`photo_embed`**: every forward returns each photo's mean final patch token `(B, hidden)`; `predict_set` results
-  carry it, and `predict_batch(photo_embed=True)`.
+- **`photo_embed`**: every forward returns each photo's mean final patch token `(B, hidden)` over the photo (the
+  letterbox padding left out); `predict_set` results carry it, and `predict_batch(photo_embed=True)`.
 - `predict_batch` / `predict_set` / `predict_subject` take RGB arrays as well as PIL images, already preprocessed inputs
   (`prepared`: numpy or tensors, from `preprocess_numpy` or `preprocess_torch`) and the size each result is returned at
   (`sizes`).

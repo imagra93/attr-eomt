@@ -300,17 +300,23 @@ Groups may share photos: a photo in several groups is predicted in the first and
 `fill=True` tops the default last group up with the photos before it (5 photos at 4 a time: two groups of 4, not
 4 + 1), and `similar_groups` groups the photos by what they show, so that metadata saying where a photo was taken is
 not needed. It compares one or several descriptions of each photo, averaged with weights: e.g. how much of each class
-a first model finds in it, and its appearance, the mean final patch token every forward returns (`photo_embed`). Two
-close-ups of one part stay together even when the first model reads one of them on the wrong side:
+a first model finds in it, and its appearance, the mean final patch token over the photo (the letterbox padding left
+out) that every forward returns (`photo_embed`). Two close-ups of one part stay together even when the first model
+reads one of them on the wrong side:
 
 ```python
+import torch
+from eomt import EoMT
+from eomt.config import INFERENCE_DEFAULTS
 from eomt.engine import predict_batch, predict_subject, similar_groups
 
 model = EoMT("runs/train/mv").model
-looks = torch.stack([r["photo_embed"] for r in predict_batch(model, photos, photo_embed=True, device="cuda",
-                                                             imgsz=model.image_size)])
+kw = {k: model.inference.get(k, d) for k, d in INFERENCE_DEFAULTS.items()}   # the checkpoint's thresholds, as
+kw.update(device="cuda", imgsz=model.image_size)                             # EoMT.predict / match use them
+looks = torch.stack([r["photo_embed"] for r in predict_batch(model, photos, photo_embed=True, **kw)])
+# class_areas: (n_photos, n_classes), e.g. how much of each class a first model finds in each photo
 groups = similar_groups([class_areas, looks], max_views=4, weights=[1, 1], center=[False, True])  # every group full
-out = predict_subject(model, photos, groups=groups, identities=True, device="cuda", imgsz=model.image_size)
+out = predict_subject(model, photos, groups=groups, identities=True, **kw)
 ```
 
 `predict_set` / `predict_subject` / `predict_batch` also take photos already preprocessed (`prepared`: one

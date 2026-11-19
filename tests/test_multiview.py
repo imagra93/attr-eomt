@@ -506,3 +506,24 @@ def test_a_subject_predicted_from_prepared_inputs_in_filled_groups():
     assert again[0]["photo_embed"].shape == want[0].shape   # predict_set gives it too (in its set)
     with pytest.raises(ValueError, match="sizes"):
         predict_set(m, photos[:3], sizes=[(80, 60)], **kw)
+
+
+def test_photo_embed_leaves_the_letterbox_padding_out():
+    """The photo's mean patch token is taken over the photo: the patches of a letterbox's padding (all exactly 0) are
+    left out, a patch the photo partly covers is kept, and a photo without padding is the plain mean."""
+    torch.manual_seed(0)
+    m = build_model("s", nc=2, imgsz=112).eval()                     # an 8 x 8 grid of 14 px patches
+    rng = np.random.default_rng(0)
+    wide = preprocess_numpy(rng.integers(0, 255, (60, 112, 3), dtype=np.uint8), 112, letterbox=True)
+    full = preprocess_numpy(rng.integers(0, 255, (112, 112, 3), dtype=np.uint8), 112, letterbox=True)
+    assert tuple(wide[1]["content_hw"]) == (60, 112)                 # rows 60.. are padding: patch row 4 is partly photo
+    x = torch.from_numpy(np.stack([wide[0], full[0]]))
+    with torch.no_grad():
+        got = m(x)["photo_embed"]
+        tokens = m.eomt(pixel_values=x).last_hidden_state[:, m.config.num_queries + m.eomt.embeddings.num_prefix_tokens:]
+    assert torch.allclose(got[0], tokens[0, : 5 * 8].mean(0), atol=1e-5)   # patch rows 0-4 of 8
+    assert not torch.allclose(got[0], tokens[0].mean(0), atol=1e-3)
+    assert torch.allclose(got[1], tokens[1].mean(0), atol=1e-5)
+    with torch.no_grad():
+        blank = m(torch.zeros(1, 3, 112, 112))["photo_embed"]        # nothing but padding: every patch, not NaN
+    assert torch.isfinite(blank).all()
