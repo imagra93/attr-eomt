@@ -999,6 +999,10 @@ class EoMTModel(nn.Module):
         # read it, and so does re-identification on checkpoints without a matching head.
         q = out.last_hidden_state[:, : self.config.num_queries, :]
         result["query_embed"] = q
+        # The photo's embedding [B, hidden]: the mean of its final patch tokens, what comparing photos by appearance
+        # reads (e.g. grouping a subject's photos, :func:`eomt.engine.predict.similar_groups`). A mean: always exposed.
+        first_patch = self.config.num_queries + self.eomt.embeddings.num_prefix_tokens
+        result["photo_embed"] = out.last_hidden_state[:, first_patch:].mean(1)
         if self.aux_heads and not training:
             # In training the attribute loss applies each head to the matched queries only.
             specs = {s.name: s for s in self.aux_specs}

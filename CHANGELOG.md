@@ -28,6 +28,17 @@ before are refused** (their single-photo starting checkpoints load as before, wi
 - **Training**: DDP no longer searches for unused parameters (every trainable parameter joins each step's graph) and
   keeps the gradients in its buckets.
 - `EoMTModel.forward(trunk=..., keep_xview_attn=...)` and `EoMTEncoder.encode_trunk()`.
+- **Groups of a subject's photos** (`eomt.engine.predict`): a photo may be in several groups (predicted in the first,
+  context in the others, `group_owners`); `fill=True` (`subject_groups`, `predict_subject`, `predict(subject=True)`,
+  `match`, `scripts/match.py --fill`) tops the last default group up with the photos before it, so 5 photos at 4 a
+  time are two groups of 4 instead of 4 + 1; `similar_groups(features, max_views)` groups photos by
+  `photo_similarity`: the cosine of one or several descriptions of each photo (e.g. a first model's class areas and the
+  photo's appearance), averaged with `weights`, optionally `center`ed, filled the same way.
+- **`photo_embed`**: every forward returns each photo's mean final patch token `(B, hidden)`; `predict_set` results
+  carry it, and `predict_batch(photo_embed=True)`.
+- `predict_batch` / `predict_set` / `predict_subject` take RGB arrays as well as PIL images, already preprocessed inputs
+  (`prepared`: numpy or tensors, from `preprocess_numpy` or `preprocess_torch`) and the size each result is returned at
+  (`sizes`).
 
 ## 3.0.0 (2026-11-19)
 

@@ -408,3 +408,101 @@ def test_sets_from_groups_with_a_share_of_random_ones(tmp_path):
     assert len(mixed[3]["photos"]) >= 1 and all(p in {1, 2, 3, 4, 5, 6, 7} for p in mixed[3]["photos"])
     with pytest.raises(ValueError, match="p_random"):
         CocoSubjectSets(img_dir, jf, imgsz=112, aug=AUG, sets={"p_random": 0.3})
+
+
+# ------------------------------------------------------------------------------------- groups and prepared inputs
+
+def test_groups_fill_the_last_one_and_may_repeat_a_photo_as_context():
+    from types import SimpleNamespace
+
+    from eomt.engine.predict import group_owners, subject_groups
+
+    m = SimpleNamespace(xview_cfg={"max_views": 4})
+    assert subject_groups(m, 5) == [[0, 1, 2, 3], [4]]                       # the default is unchanged
+    assert subject_groups(m, 5, fill=True) == [[0, 1, 2, 3], [4, 3, 2, 1]]   # 4 and 4, not 4 + 1
+    assert subject_groups(m, 6, fill=True) == [[0, 1, 2, 3], [4, 5, 3, 2]]
+    assert subject_groups(m, 8, fill=True) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert subject_groups(m, 3, fill=True) == [[0, 1, 2]]                    # fewer photos than a set holds
+    given = [[0, 1, 2, 3], [4, 0, 1, 2]]                                      # photos 0-2 are context in the second
+    assert subject_groups(m, 6, given) == given + [[5]]
+    assert group_owners(given) == {0: 0, 1: 0, 2: 0, 3: 0, 4: 1}
+    for bad in ([[0, 0]], [[0, 1, 2, 3, 4]], [[6]], [[]]):
+        with pytest.raises(ValueError):
+            subject_groups(m, 6, bad)
+
+
+def test_similar_groups_put_together_the_photos_that_show_the_same_things():
+    from eomt.engine.predict import similar_groups
+
+    # photos 0 and 2 show mostly class A, 1 and 3 mostly class B, 4 both; 5 nothing
+    f = np.array([[1, 0], [0, 1], [0.9, 0.1], [0.1, 0.9], [0.5, 0.5], [0, 0]])
+    assert similar_groups(f[:4], 2) == [[0, 2], [1, 3]]
+    assert similar_groups(f[:4], 2, order=[1]) == [[1, 3], [0, 2]]           # the order chooses who picks first
+    assert similar_groups(f[:5], 2, fill=False) == [[0, 2], [1, 3], [4]]
+    assert similar_groups(f[:5], 2) == [[0, 2], [1, 3], [4, 3]]               # filled: 3 is context for 4
+    assert similar_groups(f, 3) == [[0, 2, 4], [1, 3, 5]]                    # a row of zeros joins by order
+    assert similar_groups(np.zeros((0, 2)), 4) == []
+    with pytest.raises(ValueError):
+        similar_groups(f, 2, order=[7])
+
+
+def test_photos_alike_in_one_way_are_not_split_by_an_error_in_another():
+    """Three close-ups of one door, the last read on the wrong side by the parts model: by parts alone it goes with
+    the real other-side door; with the photos' appearance as well it stays with its look-alikes."""
+    from eomt.engine.predict import photo_similarity, similar_groups
+
+    # columns: left door, right door, rear bumper. Photos 0, 2, 5: the left door (5 read as the right one);
+    # 1, 3: the bumper; 4: the right door.
+    parts = np.array([[1, 0, 0], [0, 0, 1], [1, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 0]])
+    looks = np.array([[1, 0], [0, 1], [1, 0.05], [0.05, 1], [0.7, 0.7], [1, 0.1]])
+    assert similar_groups(parts, 3, fill=False) == [[0, 2, 1], [3, 4, 5]]
+    assert similar_groups([parts, looks], 3, fill=False) == [[0, 2, 5], [1, 3, 4]]
+    assert similar_groups([parts, looks], 3, weights=[1, 0], fill=False) == similar_groups(parts, 3, fill=False)
+    shared = looks + 10.0                                   # a component every photo shares: centering takes it out
+    assert similar_groups([parts, shared], 3, center=[False, True], fill=False) == [[0, 2, 5], [1, 3, 4]]
+    sim = photo_similarity([parts, looks], weights=[3, 1])
+    assert sim.shape == (6, 6) and np.allclose(np.diag(sim), 1.0)
+    assert sim[0, 2] == pytest.approx((3 * 1 + looks[0] @ looks[2] / np.linalg.norm(looks[2])) / 4)
+    for bad in ({"weights": [1]}, {"weights": [-1, 1]}, {"center": [True]}):
+        with pytest.raises(ValueError):
+            photo_similarity([parts, looks], **bad)
+    with pytest.raises(ValueError):
+        photo_similarity([parts, looks[:5]])
+
+
+def test_a_subject_predicted_from_prepared_inputs_in_filled_groups():
+    """A photo repeated as context keeps the result of its first group; prepared inputs (tensors) and an output size
+    give the detections of the photos themselves, at that size."""
+    from eomt.engine.predict import predict_batch, predict_set, predict_subject
+
+    torch.manual_seed(0)
+    m = build_model("s", nc=2, imgsz=112, xview={"max_views": 3}, matcher={}).eval()
+    m.init_xview()
+    for blk in m.eomt.xview:                                          # open gates: a photo's result depends on its set
+        torch.nn.init.normal_(blk.gate.bias)
+        torch.nn.init.normal_(blk.patch_gate.bias)
+    rng = np.random.default_rng(0)
+    photos = [rng.integers(0, 255, (120, 160, 3), dtype=np.uint8) for _ in range(4)]   # RGB arrays, not PIL
+    kw = dict(device="cpu", imgsz=112, conf_thres=0.0, max_det=5, amp=False)
+    out = predict_subject(m, photos, fill=True, identities=True, **kw)
+    assert out["config"]["groups"] == [[0, 1, 2], [3, 2, 1]]
+    first = predict_set(m, photos[:3], **kw)
+    for got, want in zip(out["images"][:3], first):
+        assert torch.equal(got["scores"], want["scores"])
+    assert torch.equal(out["images"][3]["scores"], predict_set(m, [photos[3], photos[2], photos[1]], **kw)[0]["scores"])
+    assert all(len(r["identity_ids"]) == r["num_detections"] for r in out["images"])
+
+    prepared = [preprocess_numpy(p, 112, letterbox=True) for p in photos[:3]]
+    tensors = [(torch.from_numpy(chw), meta) for chw, meta in prepared]
+    again = predict_set(m, photos[:3], prepared=tensors, sizes=[(80, 60)] * 3, **kw)
+    for got, want in zip(again, first):
+        assert torch.allclose(got["scores"], want["scores"]) and got["masks"].shape[-2:] == (60, 80)
+        assert torch.allclose(got["embed"], want["embed"])
+    alone = predict_batch(m, photos[:2], prepared=tensors[:2], sizes=[(80, 60)] * 2, photo_embed=True, **kw)
+    assert [r["masks"].shape[-2:] for r in alone] == [(60, 80)] * 2
+    with torch.no_grad():                                   # the photo's mean final patch token, alone
+        want = m(torch.stack([t for t, _ in tensors[:2]]))["photo_embed"]
+    assert torch.allclose(torch.stack([r["photo_embed"] for r in alone]), want, atol=1e-6)
+    assert again[0]["photo_embed"].shape == want[0].shape   # predict_set gives it too (in its set)
+    with pytest.raises(ValueError, match="sizes"):
+        predict_set(m, photos[:3], sizes=[(80, 60)], **kw)

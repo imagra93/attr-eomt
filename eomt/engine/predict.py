@@ -5,6 +5,8 @@
 * :func:`predict` — a photo, a folder of photos, or a folder of subject folders: batched, streamed and rendered;
 * :func:`predict_set` — up to ``max_views`` photos of one subject in one forward pass;
 * :func:`predict_subject` — every photo of one subject, grouped into sets, optionally linked into identities.
+* :func:`subject_groups` / :func:`similar_groups` — the groups a subject's photos are predicted in: consecutive
+  (``fill``: no short last group), given, or by what the photos show; a photo may be context in several.
 
 Every function runs the network in bf16 where the GPU has it (``amp="auto"``); ``amp=False`` runs it in fp32.
 """
@@ -88,9 +90,43 @@ def _aux_scopes(model) -> dict:
     return {s.name: s.applies_to for s in getattr(model, "aux_specs", []) if s.applies_to is not None}
 
 
+def _rgb(image) -> np.ndarray:
+    """A PIL image or an RGB ``(H, W, 3)`` array, as an array."""
+    return np.asarray(image.convert("RGB")) if isinstance(image, Image.Image) else np.asarray(image)
+
+
+def _size(image) -> tuple[int, int]:
+    """``(w, h)`` of a PIL image or an ``(H, W, ...)`` array."""
+    if isinstance(image, Image.Image):
+        return image.size
+    h, w = np.shape(image)[:2]
+    return int(w), int(h)
+
+
 def _preprocess(model, image, imgsz: int, letterbox: bool):
-    return preprocess_numpy(np.asarray(image.convert("RGB")), imgsz, letterbox=letterbox,
+    return preprocess_numpy(_rgb(image), imgsz, letterbox=letterbox,
                             mean=getattr(model, "pixel_mean", None), std=getattr(model, "pixel_std", None))
+
+
+def _stack(prepared: list, device) -> torch.Tensor:
+    """The batch of ``prepared`` photos (one ``(chw, meta)`` each, from :func:`eomt.preprocess.preprocess_numpy` or
+    :func:`eomt.preprocess.preprocess_torch`: numpy arrays or tensors, on any device) on ``device``."""
+    chws = [chw for chw, _ in prepared]
+    if any(isinstance(c, torch.Tensor) for c in chws):
+        return torch.stack([torch.as_tensor(c).to(device, non_blocking=True) for c in chws])
+    return torch.from_numpy(np.stack(chws)).to(device, non_blocking=True)
+
+
+def _inputs(model, images: list, prepared: list | None, sizes: list | None, imgsz: int, letterbox: bool):
+    """``(prepared, sizes)`` of photos: ``prepared`` as given (else preprocessed here) and the ``(w, h)`` each result is
+    returned at (``sizes`` as given, else the photo's own)."""
+    if prepared is not None and len(prepared) != len(images):
+        raise ValueError(f"prepared: {len(prepared)} inputs for {len(images)} photos")
+    if sizes is not None and len(sizes) != len(images):
+        raise ValueError(f"sizes: {len(sizes)} sizes for {len(images)} photos")
+    prepared = prepared or [_preprocess(model, im, imgsz, letterbox) for im in images]
+    sizes = [tuple(int(v) for v in s) for s in sizes] if sizes is not None else [_size(im) for im in images]
+    return prepared, sizes
 
 
 def _postprocess(model, out, b, size, meta, conf_thres, max_det, mask_thresh) -> dict:
@@ -104,19 +140,24 @@ def _postprocess(model, out, b, size, meta, conf_thres, max_det, mask_thresh) ->
 
 
 @torch.no_grad()
-def predict_batch(model, images: list[Image.Image], *, device, imgsz: int, conf_thres: float = 0.3, max_det: int = 100,
+def predict_batch(model, images: list, *, device, imgsz: int, conf_thres: float = 0.3, max_det: int = 100,
                   mask_thresh: float = 0.5, letterbox: bool = True, amp: bool | str = "auto", embed: bool = False,
-                  prepared: list | None = None) -> list[dict]:
-    """Several independent photos in one forward pass, one result dict per photo (see :func:`predict_image`).
-    ``prepared`` (one ``(chw, meta)`` per photo, :func:`eomt.preprocess.preprocess_numpy`) skips the preprocessing."""
-    prepared = prepared or [_preprocess(model, im, imgsz, letterbox) for im in images]
-    x = torch.from_numpy(np.stack([chw for chw, _ in prepared])).to(device, non_blocking=True)
-    out = _forward(model, x, device, amp)
+                  prepared: list | None = None, sizes: list | None = None, photo_embed: bool = False) -> list[dict]:
+    """Several independent photos (PIL images or RGB arrays) in one forward pass, one result dict per photo (see
+    :func:`predict_image`). ``prepared`` (one ``(chw, meta)`` per photo, from
+    :func:`eomt.preprocess.preprocess_numpy` or :func:`eomt.preprocess.preprocess_torch`, e.g. already on the GPU)
+    skips the preprocessing; ``sizes`` (one ``(w, h)`` per photo) returns the boxes and masks at that size instead of
+    the photo's own (e.g. a fixed mask grid). ``photo_embed`` adds ``"photo_embed"`` ``(hidden,)``, the photo's mean
+    final patch token (to compare photos by appearance, :func:`similar_groups`)."""
+    prepared, sizes = _inputs(model, images, prepared, sizes, imgsz, letterbox)
+    out = _forward(model, _stack(prepared, device), device, amp)
     results = []
-    for b, (im, (_, meta)) in enumerate(zip(images, prepared)):
-        res = _postprocess(model, out, b, im.size, meta, conf_thres, max_det, mask_thresh)
+    for b, (size, (_, meta)) in enumerate(zip(sizes, prepared)):
+        res = _postprocess(model, out, b, size, meta, conf_thres, max_det, mask_thresh)
         if embed:  # the per-query embedding of each kept detection (raw: normalising is the linker's job)
             res["embed"] = out["query_embed"][b, res["query_idx"]].float().cpu()
+        if photo_embed and "photo_embed" in out:
+            res["photo_embed"] = out["photo_embed"][b].float().cpu()
         results.append(res)
     return results
 
@@ -178,7 +219,7 @@ def max_views(model) -> int:
 @torch.no_grad()
 def predict_set(
     model,
-    images: list[Image.Image],
+    images: list,
     *,
     device,
     imgsz: int,
@@ -187,47 +228,138 @@ def predict_set(
     mask_thresh: float = 0.5,
     letterbox: bool = True,
     amp: bool | str = "auto",
+    prepared: list | None = None,
+    sizes: list | None = None,
 ) -> list[dict]:
-    """Predict photos of ONE subject in one forward pass: with cross-view sublayers the queries of each photo take what
-    the others show (at most :func:`max_views` photos); a model without them predicts each photo alone.
+    """Predict photos (PIL images or RGB arrays) of ONE subject in one forward pass: with cross-view sublayers the
+    queries of each photo take what the others show (at most :func:`max_views` photos); a model without them predicts
+    each photo alone. ``prepared`` and ``sizes`` as in :func:`predict_batch`.
+
+    ``model`` may be a wrapper of the network (e.g. one rescoring its outputs) whose ``forward`` passes ``set_ids`` on
+    and keeps ``query_embed`` / ``masks_queries_logits`` in its output.
 
     Returns one result dict per photo (:func:`predict_image`), each with ``"embed"`` ``(N, hidden)``, the per-query
     embedding of its detections, and ``"link_box"`` ``(N, 4)``, the box of each mask on the input canvas: what the set
-    matcher links them by (:func:`link_results`; a model without one links by the embedding's cosine).
+    matcher links them by (:func:`link_results`; a model without one links by the embedding's cosine); and
+    ``"photo_embed"`` ``(hidden,)``, the photo's mean final patch token in this set.
     """
     if getattr(model, "xview_cfg", None) and not 1 <= len(images) <= max_views(model):
         raise ValueError(f"predict_set takes 1 to {max_views(model)} photos of one subject, got {len(images)}.")
     if getattr(model, "family", "instance") == "detect":
         raise ValueError("predict_set: the detect family predicts photos one by one (predict_batch)")
-    prepared = [_preprocess(model, im, imgsz, letterbox) for im in images]
-    x = torch.from_numpy(np.stack([chw for chw, _ in prepared])).to(device, non_blocking=True)
-    out = _forward(model, x, device, amp, set_ids=torch.zeros(len(images), dtype=torch.long))
+    prepared, sizes = _inputs(model, images, prepared, sizes, imgsz, letterbox)
+    out = _forward(model, _stack(prepared, device), device, amp, set_ids=torch.zeros(len(images), dtype=torch.long))
     results = []
-    for b, (im, (_, meta)) in enumerate(zip(images, prepared)):
-        res = _postprocess(model, out, b, im.size, meta, conf_thres, max_det, mask_thresh)
+    for b, (size, (_, meta)) in enumerate(zip(sizes, prepared)):
+        res = _postprocess(model, out, b, size, meta, conf_thres, max_det, mask_thresh)
         q = res["query_idx"].to(out["query_embed"].device)
         res["embed"] = out["query_embed"][b, q].float().cpu()
         res["link_box"] = mask_boxes(out["masks_queries_logits"][b, q]).cpu()
+        if "photo_embed" in out:
+            res["photo_embed"] = out["photo_embed"][b].float().cpu()
         results.append(res)
     return results
 
 
-def subject_groups(model, n: int, groups: list[list[int]] | None = None, *, batch: int = 8) -> list[list[int]]:
+def subject_groups(model, n: int, groups: list[list[int]] | None = None, *, batch: int = 8,
+                   fill: bool = False) -> list[list[int]]:
     """The groups of photo indices a subject's ``n`` photos are predicted in: ``groups`` checked (1 to
-    :func:`max_views` distinct photos each, every photo in one group at most; those left out are predicted alone), else
-    consecutive photos, :func:`max_views` at a time. Without cross-view sublayers the photos are independent: ``batch``
-    at a time."""
+    :func:`max_views` distinct photos each; those in no group are predicted alone), else consecutive photos,
+    :func:`max_views` at a time. Without cross-view sublayers the photos are independent: ``batch`` at a time.
+
+    A photo may be in several groups: its result comes from the first one (:func:`group_owners`), and the later ones
+    only show it to the others. ``fill`` (consecutive groups only) tops a short last group up to :func:`max_views` with
+    the photos just before it, so that no photo is predicted with fewer companions than the subject has: 5 photos at 4
+    a time are ``[0, 1, 2, 3]`` and ``[4, 3, 2, 1]``, not ``[0, 1, 2, 3]`` and ``[4]``."""
     k = max_views(model)
     if groups is None:
-        return [list(c) for c in _chunks(range(n), k if k > 1 else batch)]
-    out, seen = [], set()
+        out = [list(c) for c in _chunks(range(n), k if k > 1 else batch)]
+        if fill and k > 1 and len(out) > 1 and len(out[-1]) < k:
+            last = out[-1]
+            out[-1] = last + list(range(last[0] - 1, -1, -1))[: k - len(last)]
+        return out
+    out = []
     for g in groups:
         g = [int(i) for i in g]
-        if not g or len(g) > k or len(set(g)) < len(g) or seen & set(g) or any(not 0 <= i < n for i in g):
-            raise ValueError(f"groups: {g} must hold 1 to {k} distinct photos of 0..{n - 1}, each in one group")
-        seen.update(g)
+        if not g or len(g) > k or len(set(g)) < len(g) or any(not 0 <= i < n for i in g):
+            raise ValueError(f"groups: {g} must hold 1 to {k} distinct photos of 0..{n - 1}")
         out.append(g)
+    seen = {i for g in out for i in g}
     return out + [[i] for i in range(n) if i not in seen]
+
+
+def group_owners(groups: list[list[int]]) -> dict[int, int]:
+    """Photo index -> the index of the group its result comes from: the first group listing it (in a later one it is
+    context for the others only)."""
+    owners: dict[int, int] = {}
+    for g, members in enumerate(groups):
+        for i in members:
+            owners.setdefault(int(i), g)
+    return owners
+
+
+def photo_similarity(features, *, weights=None, center=False) -> np.ndarray:
+    """``(n, n)`` similarity of a subject's photos: the cosine of their rows in each of ``features`` (one ``(n, d)``
+    array, or a list of them), averaged with ``weights`` (default equal). Several arrays describe the photos in several
+    ways, e.g. how much of each class a model finds in them, the same with the sides merged, and their appearance
+    (``photo_embed``), so that an error in one (a part read on the wrong side) is outvoted by the others (the photos
+    still look alike). ``center`` (one bool, or one per array) subtracts the photos' mean row first: for embeddings
+    that every photo of a subject shares much of. A row of zeros is like no other photo in that array."""
+    blocks = list(features) if isinstance(features, (list, tuple)) and len(features) and \
+        all(np.ndim(b) == 2 for b in features) else [features]
+    blocks = [np.asarray(b, dtype=np.float64) for b in blocks]
+    n = len(blocks[0])
+    if any(b.ndim != 2 or len(b) != n for b in blocks):
+        raise ValueError(f"features: one (n, d) array per description, with the same n; got {[b.shape for b in blocks]}")
+    w = np.ones(len(blocks)) if weights is None else np.asarray(weights, dtype=np.float64).ravel()
+    if len(w) != len(blocks) or (w < 0).any() or w.sum() <= 0:
+        raise ValueError(f"weights: one non-negative weight per array of features, not all 0; got {w.tolist()}")
+    centers = [bool(center)] * len(blocks) if isinstance(center, (bool, int)) else [bool(c) for c in center]
+    if len(centers) != len(blocks):
+        raise ValueError(f"center: one bool, or one per array of features ({len(blocks)})")
+    sim = np.zeros((n, n))
+    for b, wk, c in zip(blocks, w, centers):
+        if c and n > 1:
+            b = b - b.mean(0, keepdims=True)
+        norm = np.linalg.norm(b, axis=1, keepdims=True)
+        b = np.divide(b, norm, out=np.zeros_like(b), where=norm > 0)
+        sim += wk * (b @ b.T)
+    return sim / w.sum()
+
+
+def similar_groups(features, max_views: int, *, weights=None, center=False, fill: bool = True,
+                   order=None) -> list[list[int]]:
+    """Groups of up to ``max_views`` photos of one subject by what they show, for :func:`predict_subject`'s ``groups``.
+
+    ``features``: one ``(n, d)`` array (one row per photo) or a list of them, compared by :func:`photo_similarity`
+    (``weights``, ``center``); e.g. how much of each class a model finds in each photo (a close-up then goes with the
+    photos showing the same things, whatever its metadata says) and the photo's appearance (``photo_embed`` of
+    :func:`predict_batch`; very close close-ups of one part stay together even when the model reads one of them on the
+    other side). Each photo still free, in ``order`` (default: input order; photos it leaves out follow in input
+    order), starts a group with the free photos most like it (ties: the closest in the input). With ``fill``, a group
+    left short tops up with the photos most like its first one among those already grouped, as context
+    (:func:`subject_groups`): a subject of 5 photos at 4 a time gives two groups of 4.
+    """
+    sim = photo_similarity(features, weights=weights, center=center)
+    n = len(sim)
+    if n == 0:
+        return []
+    k = max(1, int(max_views))
+    seeds = list(dict.fromkeys(int(i) for i in (order if order is not None else range(n))))
+    if any(not 0 <= i < n for i in seeds):
+        raise ValueError(f"order: photo indices must be in 0..{n - 1}")
+    seeds += [i for i in range(n) if i not in set(seeds)]
+    free, groups = set(range(n)), []
+    for i in seeds:
+        if i not in free:
+            continue
+        ranked = sorted((j for j in range(n) if j != i), key=lambda j: (-sim[i, j], abs(j - i), j))
+        group = [i] + [j for j in ranked if j in free][: k - 1]
+        free -= set(group)
+        if fill and len(group) < k:
+            group += [j for j in ranked if j not in group][: k - len(group)]
+        groups.append(group)
+    return groups
 
 
 def link_results(model, results: list[dict], *, group_by="auto", sim_thres: float | None = None,
@@ -260,7 +392,7 @@ def link_results(model, results: list[dict], *, group_by="auto", sim_thres: floa
 @torch.no_grad()
 def predict_subject(
     model,
-    images: list[Image.Image],
+    images: list,
     *,
     device,
     imgsz: int,
@@ -273,22 +405,34 @@ def predict_subject(
     identities: bool = False,
     group_by: tuple[str, ...] | str | None = "auto",
     sim_thres: float | None = None,
+    fill: bool = False,
+    prepared: list | None = None,
+    sizes: list | None = None,
 ) -> list[dict] | dict:
-    """Predict every photo of one subject, any number of them, together with other photos of it: grouped by
-    :func:`subject_groups` (``groups`` gives them, e.g. each overview with the close-ups it shows; by default
-    consecutive photos), one :func:`predict_set` per group. Returns one result per photo, in input order.
+    """Predict every photo (PIL images or RGB arrays) of one subject, any number of them, together with other photos of
+    it: grouped by :func:`subject_groups` (``groups`` gives them, e.g. each overview with the close-ups it shows, or
+    :func:`similar_groups`; by default consecutive photos, ``fill`` topping the last group up), one :func:`predict_set`
+    per group. A photo in several groups gets its result from the first (:func:`group_owners`). Returns one result per
+    photo, in input order. ``prepared`` / ``sizes``: one per photo, as in :func:`predict_batch`.
 
     ``identities=True`` also links the detections of every photo with those of every other, across the groups too
     (:func:`link_results`), and returns ``{"images": [one result per photo, each with "identity_ids"], "identities":
     [one record per identity: its members, fused attributes and regression values], "matches", "config"}``.
     """
+    for name, given in (("prepared", prepared), ("sizes", sizes)):
+        if given is not None and len(given) != len(images):
+            raise ValueError(f"{name}: {len(given)} entries for {len(images)} photos")
     results: list[dict | None] = [None] * len(images)
-    sets = subject_groups(model, len(images), groups)
+    sets = subject_groups(model, len(images), groups, fill=fill)
     kw = dict(device=device, imgsz=imgsz, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh,
               letterbox=letterbox, amp=amp)
+    pick = lambda seq, group: None if seq is None else [seq[i] for i in group]  # noqa: E731
     for group in sets:
-        for i, r in zip(group, predict_set(model, [images[i] for i in group], **kw)):
-            results[i] = r
+        res = predict_set(model, [images[i] for i in group], prepared=pick(prepared, group), sizes=pick(sizes, group),
+                          **kw)
+        for i, r in zip(group, res):
+            if results[i] is None:  # the first group listing a photo gives its result; a later one shows it only
+                results[i] = r
     if not identities:
         return results
     linked = link_results(model, results, group_by=group_by, sim_thres=sim_thres, groups=sets)
@@ -325,6 +469,7 @@ def predict(
     augment: bool | dict = False,
     tiles: bool | int | dict = False,
     subject: bool = False,
+    fill: bool = False,
     alpha: float = 0.35,
     draw_boxes: bool = True,
     show_scores: bool = True,
@@ -340,7 +485,8 @@ def predict(
     ``save=None`` the rendered image is kept as ``result["plot"]``). ``augment`` / ``tiles``: test-time augmentation /
     tiled inference (one photo at a time). ``subject=True`` predicts the photos of each subject together
     (:func:`predict_subject`, for a model post-trained with ``multiview``): the photos of ``source`` are one subject and
-    each of its subfolders is another, whose annotated images keep the subfolder under ``save``.
+    each of its subfolders is another, whose annotated images keep the subfolder under ``save``; ``fill`` tops each
+    subject's last group up with the photos before it (:func:`subject_groups`).
     """
     if subject and (augment or tiles):
         raise ValueError("predict(subject=True) predicts the photos together, without augment / tiles.")
@@ -348,13 +494,13 @@ def predict(
         model = load_model(model, device=device)
     gen = _predict_iter(model, source, plot=plot, save=save, conf_thres=conf_thres, max_det=max_det,
                         mask_thresh=mask_thresh, imgsz=imgsz, batch=batch, amp=amp, augment=augment, tiles=tiles,
-                        subject=subject, alpha=alpha, draw_boxes=draw_boxes, show_scores=show_scores, color_by=color_by,
-                        verbose=verbose)
+                        subject=subject, fill=fill, alpha=alpha, draw_boxes=draw_boxes, show_scores=show_scores,
+                        color_by=color_by, verbose=verbose)
     return gen if stream else list(gen)
 
 
 def _predict_iter(model, source, *, plot, save, conf_thres, max_det, mask_thresh, imgsz, batch, amp, augment, tiles,
-                  subject, alpha, draw_boxes, show_scores, color_by, verbose):
+                  subject, fill, alpha, draw_boxes, show_scores, color_by, verbose):
     dev = next(model.parameters()).device
     imgsz = int(imgsz if imgsz is not None else model.image_size)
     letterbox = bool(getattr(model, "preprocess_letterbox", True))
@@ -379,7 +525,7 @@ def _predict_iter(model, source, *, plot, save, conf_thres, max_det, mask_thresh
     n, t0 = 0, time.perf_counter()
     for paths, images, prepared in _prefetched(load, groups, depth=2):
         if subject:
-            results = predict_subject(model, images, **kw)
+            results = predict_subject(model, images, fill=fill, **kw)
         elif tta:
             results = [predict_image(model, im, augment=augment, tiles=tiles, **kw) for im in images]
         else:

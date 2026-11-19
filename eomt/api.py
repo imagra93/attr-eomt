@@ -283,7 +283,8 @@ class EoMT:
     def predict(self, source: str | Path, *, plot: bool = False, save: str | None = "runs/predict",
                 conf_thres: float | None = None, max_det: int | None = None, mask_thresh: float | None = None,
                 imgsz: int | None = None, batch: int = 8, stream: bool = False, amp: bool | str = "auto",
-                augment: bool | dict = False, tiles: bool | int | dict = False, subject: bool = False, **draw):
+                augment: bool | dict = False, tiles: bool | int | dict = False, subject: bool = False,
+                fill: bool = False, **draw):
         """Run inference on an image or a folder (:func:`eomt.engine.predict.predict`): one result dict per image
         (``boxes`` / ``scores`` / ``classes`` / ``masks`` and, with attribute heads, ``aux`` / ``aux_values``), or a
         generator of them with ``stream=True``. ``batch`` photos per forward pass, in bf16 where the GPU has it.
@@ -291,20 +292,22 @@ class EoMT:
         else :data:`~eomt.config.INFERENCE_DEFAULTS`; ``imgsz`` the trained size. ``plot=True`` renders every image
         under ``save``; ``augment`` / ``tiles`` add test-time augmentation / tiled inference; ``subject=True`` predicts
         the photos of each subject together (a model post-trained with ``multiview``): ``source`` holds one subject's
-        photos, or a subfolder per subject. ``draw`` options: ``alpha``, ``draw_boxes``, ``show_scores``, ``color_by``.
+        photos, or a subfolder per subject; ``fill`` tops a subject's last group up with the photos before it (5 photos
+        at 4 a time: two groups of 4). ``draw`` options: ``alpha``, ``draw_boxes``, ``show_scores``, ``color_by``.
         """
         from .engine.predict import predict as _predict
 
         return _predict(self.model, str(source), plot=plot, save=save,
                         **_inference_kw(self.model, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh),
                         imgsz=_resolve_imgsz(imgsz, self.model), batch=batch, stream=stream, amp=amp, augment=augment,
-                        tiles=tiles, subject=subject, **draw)
+                        tiles=tiles, subject=subject, fill=fill, **draw)
 
     # ------------------------------------------------------------------ match
     def match(self, source: str | Path, *, plot: bool = True, save: str | None = "runs/match",
               conf_thres: float | None = None, max_det: int | None = None, mask_thresh: float | None = None,
               imgsz: int | None = None, amp: bool | str = "auto", groups: list[list[int]] | None = None,
-              group_by: tuple[str, ...] | str | None = "auto", sim_thres: float | None = None, **draw) -> dict:
+              group_by: tuple[str, ...] | str | None = "auto", sim_thres: float | None = None, fill: bool = False,
+              **draw) -> dict:
         """Which detections across the photos of one subject (a folder) are the same physical instance
         (:func:`eomt.engine.match.match`): one identity per instance, with its members, fused attributes and values.
 
@@ -312,15 +315,16 @@ class EoMT:
         the per-query embedding the detector computes anyway (re-identification), at the threshold and within the gate
         (``group_by``: ``"class"`` and categorical attribute heads) its validation calibrated; ``sim_thres`` and
         ``group_by`` override them. A cross-view model predicts the photos together, its ``max_views`` at a time
-        (``groups`` chooses them). With ``plot``, a grid of the photos colored by identity and a JSON summary are
-        written under ``save``.
+        (``groups`` chooses them, and may repeat a photo as context, e.g. :func:`eomt.engine.predict.similar_groups`;
+        ``fill`` tops the default last group up instead of leaving it short). With ``plot``, a grid of the photos
+        colored by identity and a JSON summary are written under ``save``.
         """
         from .engine.match import match as _match
 
         return _match(self.model, str(source), plot=plot, save=save,
                       **_inference_kw(self.model, conf_thres=conf_thres, max_det=max_det, mask_thresh=mask_thresh),
                       imgsz=_resolve_imgsz(imgsz, self.model), amp=amp, groups=groups, group_by=group_by,
-                      sim_thres=sim_thres, **draw)
+                      sim_thres=sim_thres, fill=fill, **draw)
 
     # ------------------------------------------------------------------- save
     def save(self, path: str | Path, *, dtype: str | None = None) -> None:

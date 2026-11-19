@@ -29,6 +29,8 @@ def main() -> None:
                    help="Gate keys, comma-separated ('class' and attribute heads; 'none': no gate; default: calibrated).")
     p.add_argument("--links", default="chain", choices=("chain", "all", "none"), help="Connectors drawn in the grid.")
     p.add_argument("--no-plot", action="store_true", help="Only the JSON summary.")
+    p.add_argument("--fill", action="store_true",
+                   help="Top the last group up with the photos before it (5 photos at 4 a time: 4 and 4, not 4 + 1).")
     p.add_argument("--device", default="auto")
     args = p.parse_args()
     gate = args.group_by
@@ -38,7 +40,7 @@ def main() -> None:
     subjects = sorted(d for d in src.iterdir() if d.is_dir()) if args.each_subdir else [src]
     for folder in subjects:
         model.match(folder, plot=not args.no_plot, save=args.out, conf_thres=args.conf, sim_thres=args.sim_thres,
-                    group_by=gate, link_mode=args.links)
+                    group_by=gate, link_mode=args.links, fill=args.fill)
 
 
 if __name__ == "__main__":

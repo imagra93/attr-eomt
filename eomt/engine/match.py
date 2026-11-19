@@ -85,6 +85,7 @@ def match(
     groups: list[list[int]] | None = None,
     group_by: tuple[str, ...] | str | None = "auto",
     sim_thres: float | None = None,
+    fill: bool = False,
     keep_masks: bool = False,
     panel_size: int = 480,
     cols: int | None = None,
@@ -99,7 +100,10 @@ def match(
         source: a folder of photos (non-recursive) or a single image; any number of photos.
         device: only consulted when ``model`` is a path to load.
         groups: photo indices predicted together by a cross-view model (each group up to its ``max_views``; by default
-            consecutive photos); see :func:`eomt.engine.predict.subject_groups`.
+            consecutive photos; e.g. :func:`eomt.engine.predict.similar_groups`); a photo in several groups is
+            predicted in the first and context in the others; see :func:`eomt.engine.predict.subject_groups`.
+        fill: with the default groups, top the last one up to ``max_views`` with the photos before it (5 photos at 4
+            a time: two groups of 4, not 4 + 1).
         group_by: gate keys — two instances may only match if they agree on all of them (``"class"`` and categorical
             attribute heads; ``None`` disables gating). ``"auto"``: the gate the model's links were calibrated with,
             else ``("class",)`` for a model never calibrated.
@@ -127,7 +131,7 @@ def match(
     dev = next(model.parameters()).device
     imgsz = int(imgsz if imgsz is not None else model.image_size)
     names = getattr(model, "names", None)
-    sets = subject_groups(model, len(paths), groups)
+    sets = subject_groups(model, len(paths), groups, fill=fill)
     LOG.info(f"[match] eomt-{model.size} on {dev}: {len(paths)} photo(s) in {len(sets)} group(s), "
           f"group_by={gate if group_by == 'auto' else group_by}, sim_thres={thres if sim_thres is None else sim_thres}")
 
@@ -142,6 +146,8 @@ def match(
                           mask_thresh=mask_thresh, letterbox=bool(getattr(model, "preprocess_letterbox", True)), amp=amp)
         ms = (time.perf_counter() - it0) * 1e3 / len(group)
         for i, image, r in zip(group, images, res):
+            if results[i] is not None:  # already predicted in an earlier group: here it was context for the others
+                continue
             r.update(elapsed_ms=ms, path=str(paths[i]), image_index=i)
             if plot:
                 small, panel_res = _panelize(image, r, panel_size)

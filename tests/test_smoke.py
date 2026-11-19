@@ -39,7 +39,8 @@ def test_build_forward_shapes():
         out = model(x)
     # ``query_embed`` is emitted unconditionally — including for models with no aux
     # heads, which is what lets cross-photo re-id run on any checkpoint.
-    assert set(out) == {"masks_queries_logits", "class_queries_logits", "quality_logits", "query_embed"}
+    assert set(out) == {"masks_queries_logits", "class_queries_logits", "quality_logits", "query_embed",
+                        "photo_embed"}
     q = EOMT_CONFIGS["s"].num_queries
     assert out["class_queries_logits"].shape == (2, q, NC + 1)
     assert out["masks_queries_logits"].shape[:2] == (2, q)

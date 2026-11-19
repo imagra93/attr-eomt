@@ -296,6 +296,27 @@ The set matcher matches the photos predicted together as one set, and any other 
 without one links by the per-query embedding (re-identification, nothing trained for it), at 0.7 within the same class
 unless it was calibrated.
 
+Groups may share photos: a photo in several groups is predicted in the first and shown to the others in the rest.
+`fill=True` tops the default last group up with the photos before it (5 photos at 4 a time: two groups of 4, not
+4 + 1), and `similar_groups` groups the photos by what they show, so that metadata saying where a photo was taken is
+not needed. It compares one or several descriptions of each photo, averaged with weights: e.g. how much of each class
+a first model finds in it, and its appearance, the mean final patch token every forward returns (`photo_embed`). Two
+close-ups of one part stay together even when the first model reads one of them on the wrong side:
+
+```python
+from eomt.engine import predict_batch, predict_subject, similar_groups
+
+model = EoMT("runs/train/mv").model
+looks = torch.stack([r["photo_embed"] for r in predict_batch(model, photos, photo_embed=True, device="cuda",
+                                                             imgsz=model.image_size)])
+groups = similar_groups([class_areas, looks], max_views=4, weights=[1, 1], center=[False, True])  # every group full
+out = predict_subject(model, photos, groups=groups, identities=True, device="cuda", imgsz=model.image_size)
+```
+
+`predict_set` / `predict_subject` / `predict_batch` also take photos already preprocessed (`prepared`: one
+`(chw, meta)` per photo from `preprocess_numpy` or `preprocess_torch`, e.g. on the GPU) and return the masks at a
+given size per photo (`sizes`). The model may be a wrapper of the network that passes `set_ids` on.
+
 ---
 
 ## Training recipe
