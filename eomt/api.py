@@ -347,7 +347,7 @@ class EoMT:
             aux_head_arch=m.aux_head_arch, letterbox=bool(getattr(m, "preprocess_letterbox", True)),
             loss_weights=m.loss_weights, num_upscale_blocks=m.num_upscale_blocks, fpn_scales=m.fpn_scales,
             norm_mean=m.pixel_mean, norm_std=m.pixel_std, patch_size=m.patch_size, xview=m.xview_cfg,
-            match_dim=m.match_dim or None, match_residual=m.match_residual or None, match_thres=m.match_thres,
+            matcher=m.matcher_cfg, match_thres=m.match_thres,
             link_group_by=list(m.link_group_by) if m.link_group_by else None,
             inference=getattr(m, "inference", None) or None, dtype=dtype, **(getattr(m, "meta", None) or {}),
         )

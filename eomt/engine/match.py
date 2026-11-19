@@ -152,7 +152,8 @@ def match(
             LOG.info(f"[match] {paths[i].name}: {r['num_detections']} instances ({ms:.1f} ms)")
 
     # --- 2. fingerprints, gate, Hungarian, link (each detection stamped with its identity)
-    linked = link_results(model, results, group_by=group_by, sim_thres=sim_thres, paths=[str(p) for p in paths])
+    linked = link_results(model, results, group_by=group_by, sim_thres=sim_thres, paths=[str(p) for p in paths],
+                          groups=sets)
     identity, identities, pairs = linked["identity"], linked["identities"], linked["pairs"]
     origin, sim, diagnostics = linked["origin"], linked["sim"], linked["diagnostics"]
     accepted = [p for p in pairs if p["accepted"]]

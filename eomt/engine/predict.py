@@ -22,6 +22,7 @@ import torch
 from PIL import Image
 
 from .._log import LOG
+from ..matcher import link_probabilities, mask_boxes
 from ..postprocess import postprocess_detection, postprocess_instance, slice_batch
 from ..preprocess import preprocess_numpy
 from ..serialization import load_model
@@ -159,11 +160,12 @@ def predict_image(
 
 
 def link_defaults(model) -> tuple[float, tuple[str, ...] | None]:
-    """``(threshold, gate keys)`` the detections of a model are linked with by default: the cosine threshold its
-    validation calibrated (``match_thres``) and the gate it was calibrated with (``None`` = no gate); for a model never
-    calibrated (re-identification by the query embedding of a single-photo model), 0.7 within the same class."""
+    """``(threshold, gate keys)`` the detections of a model are linked with by default: the threshold its validation
+    calibrated (``match_thres``: a probability of the set matcher, else a cosine of the query embeddings) and the gate
+    it was calibrated with (``None`` = no gate); for a model never calibrated, 0.5 (a set matcher) or 0.7
+    (re-identification by the query embedding of a single-photo model), within the same class."""
     if getattr(model, "match_thres", None) is None:
-        return 0.7, ("class",)
+        return (0.5 if getattr(model, "matcher", None) is not None else 0.7), ("class",)
     gate = getattr(model, "link_group_by", None)
     return float(model.match_thres), tuple(gate) if gate else None
 
@@ -189,9 +191,9 @@ def predict_set(
     """Predict photos of ONE subject in one forward pass: with cross-view sublayers the queries of each photo take what
     the others show (at most :func:`max_views` photos); a model without them predicts each photo alone.
 
-    Returns one result dict per photo (:func:`predict_image`), each with ``"embed"`` ``(N, d)``: the embedding its
-    detections are linked by — the matching head's (L2-normalized) when the model has one, else the per-query
-    embedding (re-identification's fingerprint, :mod:`eomt.reid`).
+    Returns one result dict per photo (:func:`predict_image`), each with ``"embed"`` ``(N, hidden)``, the per-query
+    embedding of its detections, and ``"link_box"`` ``(N, 4)``, the box of each mask on the input canvas: what the set
+    matcher links them by (:func:`link_results`; a model without one links by the embedding's cosine).
     """
     if getattr(model, "xview_cfg", None) and not 1 <= len(images) <= max_views(model):
         raise ValueError(f"predict_set takes 1 to {max_views(model)} photos of one subject, got {len(images)}.")
@@ -200,11 +202,12 @@ def predict_set(
     prepared = [_preprocess(model, im, imgsz, letterbox) for im in images]
     x = torch.from_numpy(np.stack([chw for chw, _ in prepared])).to(device, non_blocking=True)
     out = _forward(model, x, device, amp, set_ids=torch.zeros(len(images), dtype=torch.long))
-    vectors = out.get("match_embed", out["query_embed"])
     results = []
     for b, (im, (_, meta)) in enumerate(zip(images, prepared)):
         res = _postprocess(model, out, b, im.size, meta, conf_thres, max_det, mask_thresh)
-        res["embed"] = vectors[b, res["query_idx"]].float().cpu()
+        q = res["query_idx"].to(out["query_embed"].device)
+        res["embed"] = out["query_embed"][b, q].float().cpu()
+        res["link_box"] = mask_boxes(out["masks_queries_logits"][b, q]).cpu()
         results.append(res)
     return results
 
@@ -228,19 +231,24 @@ def subject_groups(model, n: int, groups: list[list[int]] | None = None, *, batc
 
 
 def link_results(model, results: list[dict], *, group_by="auto", sim_thres: float | None = None,
-                 paths: list[str] | None = None) -> dict:
-    """Link the detections of the photos of one subject (each result with its ``"embed"``, :func:`predict_set`) into
-    identities (:func:`eomt.reid.link_identities`: Hungarian per photo pair, union-find with a merge guard), with the
-    model's calibrated threshold and gate (:func:`link_defaults`; ``sim_thres`` and ``group_by`` override them,
-    ``group_by="auto"`` being the calibrated gate). Stamps every result with ``identity_ids`` and returns the linking
-    (:func:`eomt.reid.link_identities`) plus ``"matches"`` (every candidate pair, by photo and detection) and
-    ``"config"``."""
+                 paths: list[str] | None = None, groups: list[list[int]] | None = None) -> dict:
+    """Link the detections of the photos of one subject (each result from :func:`predict_set`) into identities
+    (:func:`eomt.reid.link_identities`: Hungarian per photo pair, union-find with a merge guard), by the set matcher's
+    probabilities (the photos of each of ``groups``, those predicted together, matched together; any other two photos
+    as a pair) or, without one, the cosine of the embeddings; with the model's calibrated threshold and gate
+    (:func:`link_defaults`; ``sim_thres`` and ``group_by`` override them, ``group_by="auto"`` being the calibrated
+    gate). Stamps every result with ``identity_ids`` and returns the linking (:func:`eomt.reid.link_identities`) plus
+    ``"matches"`` (every candidate pair, by photo and detection) and ``"config"``."""
     from ..reid import link_identities, validate_group_by
 
     thres, gate = link_defaults(model)
     keys = validate_group_by(gate if group_by == "auto" else group_by, getattr(model, "aux_specs", []))
     thres = float(sim_thres) if sim_thres is not None else thres
-    linked = link_identities(results, sim_thres=thres, group_by=keys, dim=model.config.hidden_size,
+    sim = None
+    if getattr(model, "matcher", None) is not None and all("link_box" in r for r in results):
+        sim = link_probabilities(model.matcher, [r["embed"] for r in results], [r["link_box"] for r in results],
+                                 groups=groups)
+    linked = link_identities(results, sim_thres=thres, group_by=keys, dim=model.config.hidden_size, sim=sim,
                              names=getattr(model, "names", None), aux_specs=getattr(model, "aux_specs", []), paths=paths)
     origin = linked["origin"]
     matches = [{"a_image": origin[p["a"]][0], "a_det": origin[p["a"]][1], "b_image": origin[p["b"]][0],
@@ -283,7 +291,7 @@ def predict_subject(
             results[i] = r
     if not identities:
         return results
-    linked = link_results(model, results, group_by=group_by, sim_thres=sim_thres)
+    linked = link_results(model, results, group_by=group_by, sim_thres=sim_thres, groups=sets)
     return {"images": results, "identities": linked["identities"], "matches": linked["matches"],
             "config": {**linked["config"], "groups": sets}}
 

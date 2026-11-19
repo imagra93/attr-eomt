@@ -26,10 +26,11 @@ object detection on a DINOv2 backbone, built around three things:
    categorical (classify) or real-valued (regress) — read off the same per-query embedding the detector computes. No
    second model, no crops, no combinatorial label space.
 2. **Several photos of one subject, predicted together** (if you have them labelled): cross-view attention lets each
-   photo's queries take what the other photos show, so an instance that is tiny or ambiguous in one photo is found and
-   classified with the help of another.
-3. **Instance matching across photos** (if you have it labelled): a matching head embeds every instance so that the same
-   physical instance in two photos lands close; `match()` turns a folder of photos into one identity per instance.
+   photo's queries and features take what the other photos show, so an instance that is tiny or ambiguous in one photo
+   is found and classified with the help of another.
+3. **Instance matching across photos** (if you have it labelled): a set matcher decides, in the context of all the
+   instances of the photos, which ones are the same; `match()` turns a folder of photos into one identity per
+   instance.
 
 It is a clean-room, Apache-2.0 reimplementation: the weights you train are yours to release.
 
@@ -66,8 +67,8 @@ one vector, the **per-query embedding** `[B, Q, hidden]`. A class head and a mas
 what keeps attributes attached to the right instance.
 
 The attribute heads tap the **same embedding**: each is a small MLP, trained on the queries the detector's Hungarian
-matcher assigned to an instance. The optional matching head reads it too, and the optional cross-view sublayers let the
-queries of several photos of one subject attend to each other's tokens.
+matcher assigned to an instance. The optional set matcher reads it too, and the optional cross-view sublayers let the
+queries and features of several photos of one subject attend to each other's tokens.
 
 | size | backbone        | hidden | layers | queries | params |
 |------|-----------------|--------|--------|---------|--------|
@@ -152,7 +153,7 @@ The attributes can also live beside a plain COCO file: an `attributes.yaml` sche
 | key | meaning |
 |-----|---------|
 | image `subject_id` | photos with the same id show the same subject; photos without one take no part in the sets |
-| annotation `instance_id` | the same physical instance in every photo of the subject that shows it (a number or a string); the matching head learns these links |
+| annotation `instance_id` | the same physical instance in every photo of the subject that shows it (a number or a string); the set matcher learns these links |
 | image `supervision` | `full` (default): every instance is annotated. `positives`: only some are, so nothing unannotated is taught as background. `none`: the photo is only input for the others |
 | annotation `iscrowd: 1` | a region left out of the loss: detections there are neither right nor wrong |
 
@@ -229,12 +230,17 @@ also `aux_logmae` and `aux_ratio`, the median of prediction / GT).
 
 A **multi-view post-training** adds to a trained single-photo model what you have labelled:
 
-- **`xview`** — cross-view attention after each query block: the queries of each photo of a set attend to the tokens of
-  the other photos (plus a null token, to abstain). Each photo's masks still cover only what it shows. It starts as the
-  identity, and a photo alone is predicted exactly as before.
-- **`matching`** — a head that embeds every instance (the per-query embedding plus a learned residual, so it starts as
-  re-identification), trained with a sigmoid loss on the `instance_id` links so that one global threshold separates
-  "same instance" from "another one". It trains with or without `xview`.
+- **`xview`** — cross-view attention after each query block: the queries of each photo of a set, and its patch tokens
+  pooled 2x2, attend to the tokens of the other photos. Each row's update is gated per head by `tanh` of a learned
+  function of the row, starting at 0: the sublayer starts as the identity, a photo alone is predicted exactly as
+  before, and each query learns when to use the other photos. `attn_w > 0` adds a loss pointing a query's cross-view
+  attention at the same instance in the other photos (its mask and its query there).
+- **`matching`** — a set matcher (SuperGlue / LightGlue style): the detected instances of the photos (their per-query
+  embedding and mask box) attend to each other within a photo and across photos, and every two instances of two
+  photos get a probability of being the same (a dual softmax, with a "no partner in that photo" bin), trained on the
+  `instance_id` links. One threshold on that probability links them. It trains with or without `xview`.
+- **`lora`** — `{rank, blocks}`: LoRA on the attention of the frozen ViT blocks below the query blocks, so the features
+  can adapt to the sets; merged into the exported weights (no cost at inference).
 
 ```yaml
 train: {init_weights: runs/train/my-run/weights/best.pt, epochs: 4, batch: 1}   # batch counts sets of photos
@@ -251,7 +257,7 @@ Every photo of a subject is the anchor of one set per epoch, with companions fro
 sets first take those that show one of its linked instances). The horizontal flip is drawn once per set, so left and
 right never mix within a subject. `p_hard` makes the anchor hard to read alone (shrunk, degraded, a close-up or
 occluded) while its companions stay as they are, so the evidence has to come from them. `trainable` also takes
-`{group or parameter-name prefix: LR multiplier}` (groups `xview`, `match_head`, `query_blocks`, `heads`; e.g.
+`{group or parameter-name prefix: LR multiplier}` (groups `xview`, `matcher`, `lora`, `query_blocks`, `heads`; e.g.
 `{xview: 1.0, aux_heads.price: 0.0}`).
 
 When your application predicts fixed groups of photos (decided before the model sees them), train on those groups:
@@ -263,10 +269,12 @@ Validation then scores the groups.
 **Validation** scores fixed sets of the validation photos of each subject, unaugmented and placed exactly as inference
 places them: `sets/segm/mAP_{alone,set}` (each photo predicted alone and with its set; `_linked_` restricted to the
 instances another photo shows, where the others can help), the attributes alone and with the set, and the links:
-`sets/match/{f1,precision,recall,thres}` (the embedding inference links with), `sets/reid/*` (the baseline:
-re-identification of the photos predicted alone), `_gated` within the gate, `match/f1_stored` at the threshold stored
-before the validation, and `*/cluster_f1` (B-cubed F1 of the identities over each whole subject). The best threshold is
-stored in the checkpoint: inference links with it.
+`sets/match/{f1,precision,recall,thres}` (what inference links with: the set matcher, else the embedding),
+`sets/reid/*` (the baseline: re-identification of the photos predicted alone), `_gated` within the gate,
+`*_oracle/*` (the same links between the annotated instances themselves: linking with perfect detection),
+`match/f1_stored` at the threshold stored before the validation, and `*/cluster_f1` (B-cubed F1 of the identities over
+each whole subject). The best threshold is stored in the checkpoint: inference links with it. `val.final_epochs`
+validates every epoch at the end of a run validated every `interval` epochs.
 
 ```python
 EoMT("runs/train/mv").val(multiview=True)                                  # the run's own validation, standalone
@@ -284,8 +292,9 @@ out["images"][0]["identity_ids"]         # an identity per detection of photo 0
 out["identities"][0]["attributes"]       # the identity's attributes, voted over its photos (regression: fused)
 ```
 
-A model without a matching head links by the per-query embedding (re-identification, nothing trained for it), at 0.7
-within the same class unless it was calibrated.
+The set matcher matches the photos predicted together as one set, and any other two photos as a pair. A model
+without one links by the per-query embedding (re-identification, nothing trained for it), at 0.7 within the same class
+unless it was calibrated.
 
 ---
 

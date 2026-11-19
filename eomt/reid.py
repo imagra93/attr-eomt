@@ -464,6 +464,7 @@ def link_identities(
     sim_thres: float,
     group_by: tuple[str, ...] = (CLASS_KEY,),
     dim: int | None = None,
+    sim: torch.Tensor | None = None,
     center: bool = False,
     guard: str = "mean",
     guard_factor: float = 1.0,
@@ -471,13 +472,15 @@ def link_identities(
     aux_specs=None,
     paths: list[str] | None = None,
 ) -> dict:
-    """The whole linking of a set of photos' results (each with ``"embed"``): flatten, similarity, Hungarian per photo
+    """The whole linking of a set of photos' results (each with ``"embed"``): flatten, similarity (the cosine of the
+    embeddings, or ``sim`` ``(M, M)`` over the detections in photo order, e.g. the set matcher's), Hungarian per photo
     pair within the gate groups, union-find with the merge guard, one record per identity. Stamps every result with
     ``identity_ids`` ``(n,)`` and returns ``{"identity", "identities", "pairs", "origin", "sim", "diagnostics"}``
     (:func:`flatten_instances`, :func:`pairwise_matches`, :func:`cluster`, :func:`summarize_identities`,
     :func:`similarity_diagnostics`). ``group_by`` must be validated (:func:`validate_group_by`)."""
     embed, photo, keys, origin = flatten_instances(results, group_by=group_by, dim=dim)
-    sim = similarity_matrix(embed, center=center)
+    if sim is None:
+        sim = similarity_matrix(embed, center=center)
     gate = gate_mask(photo, keys)
     pairs = pairwise_matches(sim, photo, keys, sim_thres=sim_thres)
     identity, pairs = cluster(pairs, sim, photo, num_instances=len(origin), sim_thres=sim_thres, guard=guard,

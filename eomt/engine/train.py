@@ -37,8 +37,10 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
 from .._log import LOG
-from ..aux_cls import aux_loss, gate_indices, match_loss, match_loss_params
-from ..config import DEFAULT_IMAGE_SIZE, EOMT_CONFIGS, INFERENCE_DEFAULTS, PATCH_SIZE, aux_specs_from_meta, normalize_loss_weights
+from ..aux_cls import aux_loss, gate_indices, xview_attention_loss
+from ..lora import add_lora, has_lora, merge_state
+from ..matcher import DEFAULT_MATCHER, set_match_loss
+from ..config import DEFAULT_IMAGE_SIZE, INFERENCE_DEFAULTS, PATCH_SIZE, aux_specs_from_meta, normalize_loss_weights
 from ..data import CocoDetection, CocoInstanceSeg, CocoSubjectSets, CocoValImages, collate_sets, collate_train
 from ..data.coco import _attr_label
 from ..data.subjects import SubjectSetConfig
@@ -157,7 +159,8 @@ class AuxConfig:
 
 @dataclass
 class ValConfig:
-    """Validation every ``interval`` epochs and after the last one, at ``imgsz`` (default: the training size), keeping
+    """Validation every ``interval`` epochs, every epoch of the last ``final_epochs`` and after the last one, at
+    ``imgsz`` (default: the training size), keeping
     every detection up to ``max_det`` per image scoring at least ``conf_thres`` (0: COCO mAP's convention).
     ``group_by`` (an image field, or several) adds the main metrics per value of that field. ``best_key`` is the
     ``metrics.csv`` validation column (without ``val/``) ``best.pt`` is chosen on, highest first (default: ``segm/mAP``,
@@ -165,6 +168,7 @@ class ValConfig:
     matching head alone)."""
 
     interval: int = 2
+    final_epochs: int = 0
     imgsz: int | None = None
     conf_thres: float = 0.0
     max_det: int = 100
@@ -173,12 +177,12 @@ class ValConfig:
 
 
 #: What trains in a multi-view post-training (``MultiviewConfig.trainable``): parameter group -> multiplier of
-#: ``optim.lr0``. Every other parameter of the checkpoint stays frozen. "new": only the modules the post-training adds,
-#: so a photo predicted alone gives exactly the checkpoint's result; "query_blocks": also the query blocks and the
-#: prediction heads, slower.
+#: ``optim.lr0``. Every other parameter of the checkpoint stays frozen. "new": only the modules the post-training adds
+#: (the cross-view sublayers, the set matcher and the LoRA factors), so a photo predicted alone gives the checkpoint's
+#: result (without LoRA); "query_blocks": also the query blocks and the prediction heads, slower.
 TRAINABLE_PRESETS: dict[str, dict[str, float]] = {
-    "new": {"xview": 1.0, "match_head": 1.0},
-    "query_blocks": {"xview": 1.0, "match_head": 1.0, "query_blocks": 0.4, "heads": 0.2},
+    "new": {"xview": 1.0, "matcher": 1.0, "lora": 1.0},
+    "query_blocks": {"xview": 1.0, "matcher": 1.0, "lora": 1.0, "query_blocks": 0.4, "heads": 0.2},
 }
 
 
@@ -188,16 +192,18 @@ class MultiviewConfig:
     images' ``subject_id`` groups the photos, and the annotations' ``instance_id`` links the instances across them
     (:mod:`eomt.data.subjects`).
 
-    ``xview``: cross-view attention, so that the photos of a set are predicted together, each photo's queries taking
-    what the others show (a photo alone is predicted as before). ``matching``: a head embedding every instance, trained
-    so that the same instance in two photos lands close, which links the detections of all the photos of a subject
-    (``match_w`` weighs its loss); it learns from the ``instance_id`` links, with or without ``xview``. ``gate``
-    (``"class"`` and categorical attribute heads) restricts the links to instances that agree on those, and the links'
-    threshold is calibrated that way on the validation sets.
+    ``xview``: cross-view attention, so that the photos of a set are predicted together, each photo's queries and
+    (pooled) patches taking what the others show (a photo alone is predicted as before); ``attn_w`` weighs a loss that
+    points the queries' cross-view attention at the same instance in the other photos (0: off). ``matching``: the set
+    matcher (:class:`~eomt.matcher.SetMatcher`), which links the detections of the photos of a subject, trained on the
+    ``instance_id`` links (``match_w`` weighs its loss), with or without ``xview``. ``gate`` (``"class"`` and
+    categorical attribute heads) restricts the links to instances that agree on those, and the links' threshold is
+    calibrated that way on the validation sets. ``lora``: ``{rank, blocks, alpha}`` adapts the attention of the
+    ``blocks`` frozen ViT blocks below the query blocks (:mod:`eomt.lora`; ``None``: off).
 
     ``trainable``: what trains, a preset of :data:`TRAINABLE_PRESETS` or ``{group or parameter-name prefix: LR
-    multiplier}`` (groups ``xview``, ``match_head``, ``query_blocks``, ``heads``; a prefix such as ``aux_heads.area``
-    wins over the groups, and 0 freezes it). ``sets``: how the sets are drawn
+    multiplier}`` (groups ``xview``, ``matcher``, ``lora``, ``query_blocks``, ``heads``; a prefix such as
+    ``aux_heads.area`` wins over the groups, and 0 freezes it). ``sets``: how the sets are drawn
     (:class:`~eomt.data.subjects.SubjectSetConfig`; its ``max_views`` is the most photos predicted together).
     ``val_sets``: a file of fixed validation sets (every run writes its own as ``val_sets.json``), to score runs on the
     same sets.
@@ -206,6 +212,8 @@ class MultiviewConfig:
     xview: bool = True
     matching: bool = True
     match_w: float = 1.0
+    attn_w: float = 0.0
+    lora: dict | None = None
     gate: list[str] | None = None
     trainable: str | dict = "new"
     sets: SubjectSetConfig | dict = field(default_factory=SubjectSetConfig)
@@ -224,7 +232,8 @@ class MultiviewConfig:
     def groups(self) -> dict[str, float]:
         """The LR multiplier of each trainable group or prefix, without the modules this post-training has not."""
         groups = dict(TRAINABLE_PRESETS[self.trainable]) if isinstance(self.trainable, str) else dict(self.trainable)
-        return {g: m for g, m in groups.items() if (g != "xview" or self.xview) and (g != "match_head" or self.matching)}
+        return {g: m for g, m in groups.items() if (g != "xview" or self.xview) and (g != "matcher" or self.matching)
+                and (g != "lora" or self.lora)}
 
 
 def _section(cls, value, name: str):
@@ -310,7 +319,7 @@ def build_optimizer(model, lr: float, weight_decay: float, backbone_lr_mult: flo
 #: Parameter groups of a multi-view post-training -> name prefixes (the query blocks are added per model).
 _MULTIVIEW_GROUPS = {
     "xview": ("eomt.xview.",),
-    "match_head": ("match_head.",),
+    "matcher": ("matcher.",),
     "query_blocks": ("eomt.cross_blocks.", "eomt.query."),
     "heads": ("eomt.class_predictor.", "eomt.mask_head.", "eomt.upscale_block.", "eomt.quality_head.",
               "eomt.layernorm.", "aux_heads."),
@@ -325,7 +334,7 @@ def build_multiview_optimizer(model, lr: float, weight_decay: float, trainable: 
     it. The query blocks warm up with the encoder (``is_backbone``), the rest with the heads."""
     n, nb = model.config.num_hidden_layers, model.config.num_blocks
     named = {**_MULTIVIEW_GROUPS, "query_blocks": _MULTIVIEW_GROUPS["query_blocks"]
-             + tuple(f"eomt.layers.{i}." for i in range(n - nb, n))}
+             + tuple(f"eomt.layers.{i}." for i in range(n - nb, n)), "lora": ()}  # the LoRA factors: by name below
     names = [name for name, _ in model.named_parameters()]
     explicit = sorted((k for k in trainable if k not in named), key=len, reverse=True)
     unknown = [k for k in explicit if not any(nm == k or nm.startswith(k + ".") for nm in names)]
@@ -333,6 +342,8 @@ def build_multiview_optimizer(model, lr: float, weight_decay: float, trainable: 
         raise ValueError(f"multiview trainable {unknown}: neither a group ({sorted(named)}) nor a parameter-name prefix")
 
     def group_of(name: str):
+        if ".parametrizations.weight.0.lora_" in name:  # a LoRA factor (eomt.lora)
+            return "lora"
         hit = next((k for k in explicit if name == k or name.startswith(k + ".")), None)
         return hit if hit is not None else next((g for g, pre in named.items() if name.startswith(pre)), None)
 
@@ -634,12 +645,11 @@ class _CsvLogger:
 
 class _Forward(torch.nn.Module):
     """``fn(model, *args)`` as a module's forward, so that DistributedDataParallel sees every parameter a training step
-    uses: the attribute and matching losses run on the model's outputs, outside ``model.forward``. ``extra`` holds the
-    parameters ``fn`` uses outside the model (the matching loss's learned scalars)."""
+    uses: the attribute, matcher and attention losses run on the model's outputs, outside ``model.forward``."""
 
-    def __init__(self, model, fn, extra=None):
+    def __init__(self, model, fn):
         super().__init__()
-        self.model, self.fn, self.extra = model, fn, extra
+        self.model, self.fn = model, fn
 
     def forward(self, *args):
         return self.fn(self.model, *args)
@@ -875,16 +885,13 @@ def train(
             vs.write_sets(run_dir / "val_sets.json")
     aux_class_weight = _class_weights(train_ds) if aux_specs and acfg.class_weights else None
 
-    # --- the cross-view sublayers and the matching head of a multi-view post-training
-    xview_cfg, match_dim, match_residual = None, 0, False
+    # --- the cross-view sublayers and the set matcher of a multi-view post-training
+    xview_cfg = matcher_cfg = None
     if mv is not None:
         if mv.xview:
             xview_cfg = {**DEFAULT_XVIEW, **(src.get("xview") or {}), "max_views": mv.sets.max_views}
-        if mv.matching:  # a checkpoint's head as it is (stage B), else the residual head at the hidden size
-            if src.get("match_dim"):
-                match_dim, match_residual = int(src["match_dim"]), bool(src.get("match_residual"))
-            else:
-                match_dim, match_residual = EOMT_CONFIGS[size].hidden_size, True
+        if mv.matching:  # a checkpoint's matcher as it is, else the default one
+            matcher_cfg = {**DEFAULT_MATCHER, **(src.get("matcher") or {})}
 
     # --- the run, as args.yaml and every checkpoint's run_config record it
     run_cfg = {
@@ -920,47 +927,19 @@ def train(
     # --- model
     net = build_model(size, nc=nc, imgsz=imgsz, names=names, family=family, aux_heads=aux_specs,
                       aux_head_arch=aux_head_arch, loss_weights=loss_weights, num_upscale_blocks=num_upscale_blocks,
-                      fpn_scales=fpn_scales, xview=xview_cfg, match_dim=match_dim,
-                      match_residual=match_residual).to(dev)
+                      fpn_scales=fpn_scales, xview=xview_cfg, matcher=matcher_cfg).to(dev)
     LOG.info(f"[model] loss weights: {loss_weights}; upscale blocks {net.num_upscale_blocks}"
           + (f"; FPN {net.fpn_scales}" if net.fpn_scales else "")
           + (f"; attribute heads {net.aux_head_arch}" if aux_specs else ""))
-    match_params = match_loss_params().to(dev) if mv is not None and net.match_head is not None else None
     start_epoch, best_metric = 0, float("-inf")
-
-    def make_optimizer():
-        if mv is not None:
-            opt = build_multiview_optimizer(net, ocfg.lr0, ocfg.weight_decay, mv.groups())
-        else:
-            opt = build_optimizer(net, ocfg.lr0, ocfg.weight_decay, ocfg.backbone_lr_mult, ocfg.llrd)
-        if match_params is not None:
-            opt.add_param_group({"params": list(match_params.values()), "lr": ocfg.lr0, "initial_lr": ocfg.lr0,
-                                 "weight_decay": 0.0, "is_backbone": False})
-        return opt
-
-    optimizer = make_optimizer()
-    if mv is not None:
-        n_train = sum(p.numel() for p in net.parameters() if p.requires_grad) / 1e6
-        LOG.info(f"[multiview] {'cross-view attention' if net.eomt.xview is not None else 'no cross-view attention'}, "
-              + (f"matching head {net.match_dim}-d{' residual' if net.match_residual else ''}"
-                 if net.match_head is not None else "no matching head")
-              + f"; training {mv.groups()} ({n_train:.1f} M parameters), the rest of the checkpoint is frozen")
-    if resume_ckpt is not None:
-        net.load_state_dict(resume_ckpt["model"])
-        if match_params is not None and resume_ckpt.get("match_params"):
-            match_params.load_state_dict(resume_ckpt["match_params"])
-        optimizer.load_state_dict(resume_ckpt["optimizer"])
-        start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
-        # best.pt may be newer than last.pt (written after it, before a crash): never overwrite it with a worse one
-        best_path = weights_dir / "best.pt"
-        best_metric = max(float(resume_ckpt.get("best_metric", float("-inf"))),
-                          float(load_raw(best_path).get("best_metric", float("-inf"))) if best_path.is_file()
-                          else float("-inf"))
-        LOG.info(f"[resume] at epoch {start_epoch} (best {best_metric:.4f})")
-    elif init_ckpt is not None:
+    lora_cfg = None
+    if resume_ckpt is None and init_ckpt is not None:
         # Weights only; a tensor whose shape differs (another number of classes, a new head) keeps its fresh init.
         cur = net.state_dict()
         ckpt_sd = init_ckpt["model"]
+        if has_lora(ckpt_sd):  # an exported training state: its LoRA factors merged
+            lora = init_ckpt.get("lora") or {}
+            ckpt_sd = merge_state(ckpt_sd, scale=float(lora.get("alpha", 1)) / float(lora.get("rank", 1)))
         filtered = {k: v for k, v in ckpt_sd.items() if k in cur and cur[k].shape == v.shape}
         skipped = [k for k, v in ckpt_sd.items() if k in cur and cur[k].shape != v.shape]
         missing, unexpected = net.load_state_dict(filtered, strict=False)
@@ -972,10 +951,35 @@ def train(
             LOG.info(f"[init] in the checkpoint, not in the model: {module_counts(unexpected)}")
         if net.eomt.xview is not None and not any(k.startswith("eomt.xview.") for k in ckpt_sd):
             net.init_xview()  # each cross-view sublayer starts as a copy of its query block's attention
-    elif pretrained:
+    elif resume_ckpt is None and pretrained:
         load_dinov2_backbone(net)
         net.to(dev)
+    if mv is not None and mv.lora:  # after the weights (a resumed run's come with its factors): they start at 0
+        lora_cfg = add_lora(net, **mv.lora)
 
+    def make_optimizer():
+        if mv is not None:
+            return build_multiview_optimizer(net, ocfg.lr0, ocfg.weight_decay, mv.groups())
+        return build_optimizer(net, ocfg.lr0, ocfg.weight_decay, ocfg.backbone_lr_mult, ocfg.llrd)
+
+    optimizer = make_optimizer()
+    if mv is not None:
+        n_train = sum(p.numel() for p in net.parameters() if p.requires_grad) / 1e6
+        LOG.info(f"[multiview] {'cross-view attention' if net.eomt.xview is not None else 'no cross-view attention'}, "
+              + (f"set matcher {net.matcher_cfg}" if net.matcher is not None else "no set matcher")
+              + (f", LoRA {lora_cfg} on blocks {sorted({int(n.split('.')[2]) for n, _ in net.named_parameters() if '.lora_' in n})}"
+                 if lora_cfg else "")
+              + f"; training {mv.groups()} ({n_train:.1f} M parameters), the rest of the checkpoint is frozen")
+    if resume_ckpt is not None:
+        net.load_state_dict(resume_ckpt["model"])
+        optimizer.load_state_dict(resume_ckpt["optimizer"])
+        start_epoch = int(resume_ckpt.get("epoch", -1)) + 1
+        # best.pt may be newer than last.pt (written after it, before a crash): never overwrite it with a worse one
+        best_path = weights_dir / "best.pt"
+        best_metric = max(float(resume_ckpt.get("best_metric", float("-inf"))),
+                          float(load_raw(best_path).get("best_metric", float("-inf"))) if best_path.is_file()
+                          else float("-inf"))
+        LOG.info(f"[resume] at epoch {start_epoch} (best {best_metric:.4f})")
     cross_view = net.eomt.xview is not None
     geom_key = "box_labels" if is_detect else "mask_labels"
 
@@ -983,27 +987,37 @@ def train(
         """One micro-batch: the model's loss (detection, in the forward) plus the matching and attribute losses on the
         final prediction's matching, gated. Returns ``(loss, stats)``, the stats as device tensors."""
         partial = {} if extras is None else {"ignore_masks": extras["ignore"], "neg_weight": extras["neg_weight"]}
+        attn_w = mv.attn_w if mv is not None and cross_view else 0.0
         out = m(pixel_values, class_labels=class_labels, set_ids=set_ids if cross_view else None,
-                **{geom_key: geom_labels}, **partial)
+                keep_xview_attn=attn_w > 0, **{geom_key: geom_labels}, **partial)
         loss, stats = out["loss"], {}
         gated = None
-        if aux_specs or "match_embed" in out:
+        matching = m.matcher is not None and set_ids is not None
+        if aux_specs or matching or attn_w > 0:
             gated = gate_indices(out, out["indices"], geom_labels, class_labels, iou_thr=acfg.iou_gate,
                                  require_class=acfg.class_gate)
-        if "match_embed" in out and set_ids is not None:
+        if matching:
             negatives = _extra_negatives(m, out, out["indices"], extras, link_conf)
             mstats: dict = {}
-            m_loss = match_loss(out, gated, inst_ids, set_ids, match_params, negatives=negatives, stats=mstats)
+            m_loss = set_match_loss(m, out, gated, inst_ids, set_ids, negatives=negatives, stats=mstats)
             loss = loss + mv.match_w * m_loss
             stats["match"] = (m_loss.detach(), mstats)
+        if attn_w > 0:
+            grid = (pixel_values.shape[-2] // m.patch_size, pixel_values.shape[-1] // m.patch_size)
+            x_loss = xview_attention_loss(m, out, gated, inst_ids, geom_labels, grid)
+            loss = loss + attn_w * x_loss
+            stats["attn"] = x_loss.detach()
         if aux_specs:
             astats: dict = {}
             a_loss, _ = aux_loss(m, out, geom_labels, class_labels, aux_labels, weights=acfg.per_head, indices=gated,
                                  class_weights=aux_class_weight, stats=astats)
             loss = loss + acfg.w * a_loss
             stats["aux"] = astats
-        if not loss.requires_grad:  # nothing that trains took part (e.g. a photo alone in a post-training): a zero step,
-            loss = loss + sum(p.sum() * 0.0 for p in m.parameters() if p.requires_grad)  # so the backward still runs
+        if world > 1 or not loss.requires_grad:
+            # every trainable parameter joins the graph (a module that took no part this step, e.g. the cross-view
+            # sublayers for a photo alone, gets a zero gradient): DDP then needs no search for unused parameters,
+            # and a step where nothing trained took part still runs its backward
+            loss = loss + sum(p.sum() for p in m.parameters() if p.requires_grad) * 0.0
         return loss, stats
 
     # Precision: bf16 where the GPU has it (no gradient scaler), else fp16 with one.
@@ -1013,10 +1027,10 @@ def train(
     LOG.info(f"[amp] {'off' if not amp_on else str(autocast_dtype).split('.')[-1]}"
           + (" (+ gradient scaler)" if scaler.is_enabled() else ""))
 
-    step_model = _Forward(net, micro_step, torch.nn.ModuleDict({"match": match_params} if match_params is not None else {}))
+    step_model = _Forward(net, micro_step)
     if world > 1:  # the masked-attention probabilities are set alike on every process
         step_model = DistributedDataParallel(step_model, device_ids=[dev.index], broadcast_buffers=False,
-                                             find_unused_parameters=True)
+                                             gradient_as_bucket_view=True)  # the gradients live in DDP's buckets
     ema_model = ModelEMA(net, decay=ocfg.ema_decay, tau=ocfg.ema_tau, device=dev) if ocfg.ema else None
     if ema_model is not None and resume_ckpt is not None and resume_ckpt.get("ema"):
         ema = dict(resume_ckpt["ema"])
@@ -1038,7 +1052,7 @@ def train(
 
     # The links' calibration: the threshold of the linking embedding and the gate keys, from the last validation of
     # the sets (a post-trained checkpoint's until then).
-    link = {"match_thres": (src or {}).get("match_thres") if net.match_head is not None or cross_view else None,
+    link = {"match_thres": (src or {}).get("match_thres") if net.matcher is not None or cross_view else None,
             "link_group_by": list(mv.gate) if mv is not None and mv.gate else None}
 
     def _save(path: Path, *, state_dict, trainer_state: bool, row: dict, best: float):
@@ -1047,14 +1061,15 @@ def train(
             extra["optimizer"] = optimizer.state_dict()
             if ema_model is not None:
                 extra["ema"] = ema_model.state_dict()
-            if match_params is not None:
-                extra["match_params"] = match_params.state_dict()
+            extra["lora"] = lora_cfg  # the factors stay apart in the trainer state (resume)
+        elif lora_cfg:  # an exported checkpoint: the LoRA factors merged into the weights
+            state_dict = merge_state(state_dict, scale=lora_cfg["alpha"] / lora_cfg["rank"])
         save_checkpoint(wrap_checkpoint(
             state_dict, size=size, nc=nc, imgsz=imgsz, names=names, task=family, aux_heads=aux_specs,
             aux_head_arch=aux_head_arch, letterbox=True, loss_weights=loss_weights,
             num_upscale_blocks=net.num_upscale_blocks, fpn_scales=net.fpn_scales, norm_mean=net.pixel_mean,
             norm_std=net.pixel_std, patch_size=net.patch_size, inference=inference, run_config=run_cfg,
-            xview=net.xview_cfg, match_dim=net.match_dim or None, match_residual=net.match_residual or None, **link,
+            xview=net.xview_cfg, matcher=net.matcher_cfg, **link,
             **extra,
         ), path)
 
@@ -1062,8 +1077,12 @@ def train(
     # matching loss and what it sees, the share of time spent waiting for data, then the validation columns
     metric_of = {s.name: _aux_metric(s) for s in aux_specs}
     csv_fields = ["epoch", "train/loss"] + [f"train/{metric_of[s.name]}/{s.name}" for s in aux_specs]
-    if match_params is not None:
-        csv_fields += ["train/match_loss"] + [f"train/match/{k}" for k in ("pos_cos", "hardneg_cos", "unpaired")]
+    matching = net.matcher is not None
+    attn_on = mv is not None and cross_view and mv.attn_w > 0
+    if matching:
+        csv_fields += ["train/match_loss"] + [f"train/match/{k}" for k in ("pos_p", "paired")]
+    if attn_on:
+        csv_fields.append("train/attn_loss")
     csv_fields.append("train/data_wait")
     val_keys = val_metric_keys(val_parts, aux_specs, is_detect=is_detect, group_by=vcfg.group_by,
                                link_group_by=mv.gate if mv is not None else None)
@@ -1081,8 +1100,8 @@ def train(
         if sampler is not None:
             sampler.set_epoch(epoch)
         zero = lambda: torch.zeros((), device=dev)  # noqa: E731
-        running, running_match = zero(), zero()
-        match_sums = {k: [zero(), zero()] for k in ("pos_cos", "hardneg_cos", "unpaired")}  # sum, count of the finite
+        running, running_match, running_attn = zero(), zero(), zero()
+        match_sums = {k: [zero(), zero()] for k in ("pos_p", "paired")}  # sum, count of the finite
         aux_sums = {s.name: [zero(), zero()] for s in aux_specs}  # correct (abs. error), counted
         if dev.type == "cuda":
             torch.cuda.reset_peak_memory_stats(dev)
@@ -1133,6 +1152,8 @@ def train(
                     ok = torch.isfinite(v)
                     match_sums[k][0] += torch.where(ok, v, 0.0)
                     match_sums[k][1] += ok.float()
+            if "attn" in stats:
+                running_attn += stats["attn"]
             for n, (hit, cnt) in stats.get("aux", {}).items():
                 aux_sums[n][0] += hit
                 aux_sums[n][1] += cnt
@@ -1142,8 +1163,10 @@ def train(
                 if aux_specs:
                     postfix["aux"] = " ".join(f"{n}={_fmt(float(s) / float(c) if float(c) else float('nan'), 2)}"
                                               for n, (s, c) in aux_sums.items())
-                if match_params is not None:
+                if matching:
                     postfix["match"] = f"{float(running_match) / (step + 1):.3f}"
+                if attn_on:
+                    postfix["attn"] = f"{float(running_attn) / (step + 1):.3f}"
                 pbar.set_postfix(postfix)
                 if tb is not None:
                     tb.log({"train/loss": float(loss.detach()), "lr/head": head_group["lr"]}, it)
@@ -1153,10 +1176,10 @@ def train(
         epoch_s = time.perf_counter() - epoch_t0
         totals = sum_over_processes((float(running), float(running_match),
                                      {k: [float(s), float(c)] for k, (s, c) in match_sums.items()}, data_wait,
-                                     {n: [float(s), float(c)] for n, (s, c) in aux_sums.items()}))
+                                     {n: [float(s), float(c)] for n, (s, c) in aux_sums.items()}, float(running_attn)))
         row: dict = {"epoch": epoch}
         if main:
-            running_f, match_f, match_tot, wait_f, aux_tot = totals
+            running_f, match_f, match_tot, wait_f, aux_tot, attn_f = totals
             row["train/loss"] = running_f / (iters_per_epoch * world)
             row["train/data_wait"] = wait_f / world / max(epoch_s, 1e-9)
             aux_acc = {n: s / c if c else float("nan") for n, (s, c) in aux_tot.items()}
@@ -1164,13 +1187,16 @@ def train(
             LOG.info(f"[epoch {epoch}] mean loss {row['train/loss']:.4f}; waited for data {100 * row['train/data_wait']:.0f} "
                   "% of the epoch" + ("; attribute heads (train) " + "  ".join(
                       f"{n} {metric_of[n][4:]}={v:.3f}" for n, v in aux_acc.items()) if aux_specs else ""))
-            if match_params is not None:
+            if matching:
                 seen = {k: s / c if c else float("nan") for k, (s, c) in match_tot.items()}
                 row["train/match_loss"] = match_f / (iters_per_epoch * world)
                 row.update({f"train/match/{k}": v for k, v in seen.items()})
-                LOG.info(f"[epoch {epoch}] matching loss {row['train/match_loss']:.4f}: same instance cos "
-                      f"{_fmt(seen['pos_cos'])}, hardest other cos {_fmt(seen['hardneg_cos'])}, "
-                      f"{_fmt(100 * seen['unpaired'], 0)} % of the instances without a partner in their set")
+                LOG.info(f"[epoch {epoch}] set matcher loss {row['train/match_loss']:.4f}: true pairs at probability "
+                         f"{_fmt(seen['pos_p'])}, {_fmt(100 * seen['paired'], 0)} % of the instances of a set of several "
+                         "photos with a partner in it")
+            if attn_on:
+                row["train/attn_loss"] = attn_f / (iters_per_epoch * world)
+                LOG.info(f"[epoch {epoch}] cross-view attention loss {row['train/attn_loss']:.4f}")
             if tb is not None and aux_specs:
                 tb.log({f"train/{metric_of[n]}/{n}": v for n, v in aux_acc.items()}, epoch)
 
@@ -1185,7 +1211,8 @@ def train(
             _save(weights_dir / "last.pt", state_dict=net.state_dict(), trainer_state=True, row=row, best=best_metric)
         metrics: dict = {}
         aux_pc = None
-        if val_parts and (last_epoch or (epoch + 1) % max(1, vcfg.interval) == 0):
+        if val_parts and (last_epoch or (epoch + 1) % max(1, vcfg.interval) == 0
+                          or epoch >= epochs - vcfg.final_epochs):
             eval_model.eomt.set_attn_mask_probs(val_probs)
             if dev.type == "cuda":
                 train_peak = torch.cuda.max_memory_allocated(dev)

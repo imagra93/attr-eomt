@@ -15,8 +15,6 @@ categorical heads), evaluated as the mean absolute error in real units.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F  # noqa: N812
 
@@ -177,79 +175,61 @@ def aux_loss(
     return total, per_head
 
 
-def match_loss_params() -> torch.nn.ParameterDict:
-    """The learned scalars of :func:`match_loss`: its log-temperature ``t`` and bias ``b`` (SigLIP's start, 10 and
-    -10)."""
-    return torch.nn.ParameterDict({"t": torch.nn.Parameter(torch.tensor(math.log(10.0))),
-                                   "b": torch.nn.Parameter(torch.tensor(-10.0))})
-
-
-def match_loss(out: dict, indices, inst_ids: list[torch.Tensor], set_ids: torch.Tensor, params: torch.nn.ParameterDict,
-               *, negatives: torch.Tensor | None = None, stats: dict | None = None):
-    """Loss of the matching head (``out["match_embed"]``) over the matched queries of each set of photos: a binary "same
-    instance?" for every two queries of two different photos of a set, with logit ``exp(t) * cos + b`` (SigLIP,
-    ``params`` from :func:`match_loss_params`), summed per query. It calibrates the absolute similarity, so that one
-    global threshold separates the links, as inference makes them.
-
-    Two matched queries are the same instance when their targets carry the same instance id (``inst_ids``) in two
-    different photos of a set. ``indices`` is the query->target matching (gated as for the attribute heads). Targets
-    with a negative id (an instance whose links are unknown) take no part. ``negatives`` ``(B, Q)`` bool marks more
-    queries that are no instance (the confident unmatched queries of fully annotated photos: the false detections and
-    duplicates that make false links at inference); they are negatives of the queries of the OTHER photos of their
-    set. Computed in fp32 even under autocast: its absolute scale is what it calibrates.
-
-    ``stats`` (a dict) receives, as device tensors (NaN when undefined), ``pos_cos``, the mean cosine of the pairs of one
-    instance; ``hardneg_cos``, the mean over the queries with a partner of their highest cosine with a query of another
-    photo that is not it; and ``unpaired``, the share of the queries of known instances in sets of several photos
-    without a partner in their set. Returns 0 when nothing pairs up.
-    """
-    emb = out["match_embed"]
-    dev = emb.device
-    feats, ids, photo, sets, extra = [], [], [], [], []
+def xview_attention_loss(model, out: dict, indices, inst_ids: list[torch.Tensor], mask_labels: list[torch.Tensor],
+                         grid: tuple[int, int]) -> torch.Tensor:
+    """Where the queries look in the other photos of their set (``out["xview_attn"]``, a forward with
+    ``keep_xview_attn=True``): for each query matched (``indices``) to an instance of known id that another photo of
+    the set shows, in every cross-view sublayer, ``-log`` of the attention (averaged over the heads) it puts on that
+    instance in the other photos: the patches under its mask there (``mask_labels``, at the input size) and the query
+    matched to it there. The mean over those queries and sublayers; 0 when no instance is shown by two photos."""
+    cache = out.get("xview_attn") or []
+    zero = out["query_embed"].sum() * 0.0
+    if not cache:
+        return zero
+    nq = model.config.num_queries
+    start = nq + model.eomt.embeddings.num_prefix_tokens
+    query_of, target_of = {}, {}  # (photo, id) -> its matched query / its target
     for b, (src, tgt) in enumerate(indices):
-        if src.numel():
-            src, tgt = src.to(dev), tgt.to(dev)
-            feats.append(emb[b, src])
-            ids.append(inst_ids[b].to(dev)[tgt])
-            photo.append(torch.full_like(src, b))
-            sets.append(torch.full_like(src, int(set_ids[b])))
-            extra.append(torch.zeros_like(src, dtype=torch.bool))
-        if negatives is not None:
-            q = negatives[b].nonzero().flatten().to(dev)
-            if q.numel():
-                feats.append(emb[b, q])
-                ids.append(torch.full_like(q, -1))
-                photo.append(torch.full_like(q, b))
-                sets.append(torch.full_like(q, int(set_ids[b])))
-                extra.append(torch.ones_like(q, dtype=torch.bool))
-    zero = emb.sum() * 0.0
-    if not feats:
-        return zero
-    f, ids, photo, sets, extra = (torch.cat(t) for t in (feats, ids, photo, sets, extra))
-    keep = (ids >= 0) | extra
-    f, ids, photo, sets, extra = f[keep], ids[keep], photo[keep], sets[keep], extra[keep]
-    known = ids >= 0
-    if not known.any():
-        return zero
-    other = (sets[:, None] == sets[None]) & (photo[:, None] != photo[None])
-    pos = other & known[:, None] & known[None] & (ids[:, None] == ids[None])
-    with torch.autocast(dev.type, enabled=False):  # fp32: autocast would make the cosines bf16
-        cos = f.float() @ f.float().T
-        if stats is not None:
-            with torch.no_grad():
-                has = pos.any(1)
-                negs = other & ~pos & (known[None] | extra[None])
-                hn = cos.masked_fill(~negs, float("-inf")).amax(1)[has]
-                hn = hn[hn.isfinite()]
-                multi = torch.bincount(set_ids.cpu().long()).to(dev)[sets] > 1  # an instance of a set of several photos
-                stats.update(pos_cos=cos[pos].mean(), hardneg_cos=hn.mean(),  # the mean of nothing is NaN
-                             unpaired=(known & ~has & multi).sum() / (known & multi).sum())
-        pairs = other & ~(extra[:, None] & extra[None]) & torch.ones_like(other).triu(1)
-        if not pairs.any():
-            return zero
-        logit = params["t"].float().exp() * cos + params["b"].float()
-        terms = F.softplus(-(pos.float() * 2 - 1) * logit)[pairs]
-        return terms.sum() / (pairs.any(1) | pairs.any(0)).sum()
+        ids = inst_ids[b].tolist()
+        for t, i in enumerate(ids):
+            if i >= 0:
+                target_of[(b, i)] = t
+        for s_, t_ in zip(src.tolist(), tgt.tolist()):
+            if ids[t_] >= 0:
+                query_of[(b, ids[t_])] = s_
+    patches: dict = {}
+
+    def patch_mask(b: int, t: int) -> torch.Tensor:
+        if (b, t) not in patches:
+            m = mask_labels[b][t].float()[None, None]
+            patches[(b, t)] = (F.adaptive_max_pool2d(m, grid) > 0.5).flatten()
+        return patches[(b, t)]
+
+    terms = []
+    for entry in cache:  # one per cross-view sublayer and set
+        idx, q, k, others, n = entry["idx"].tolist(), entry["q"], entry["k"], entry["others"].tolist(), entry["tokens"]
+        for vi, b in enumerate(idx):
+            rows, wanted = [], []
+            for (bb, iid), s_ in query_of.items():
+                if bb != b:
+                    continue
+                keys = torch.zeros(len(others[vi]) * n, dtype=torch.bool, device=k.device)
+                for oi, j in enumerate(others[vi]):
+                    bj = idx[j]
+                    if (bj, iid) not in target_of:
+                        continue
+                    keys[oi * n + start: (oi + 1) * n] = patch_mask(bj, target_of[(bj, iid)]).to(k.device)
+                    if (bj, iid) in query_of:
+                        keys[oi * n + query_of[(bj, iid)]] = True
+                if keys.any():
+                    rows.append(s_)
+                    wanted.append(keys)
+            if rows:
+                qr = q[vi][:, rows].float()  # [h, R, dh]
+                attn = (qr @ k[vi].float().transpose(-1, -2) * qr.shape[-1] ** -0.5).softmax(-1).mean(0)  # [R, keys]
+                mass = (attn * torch.stack(wanted).float()).sum(-1)
+                terms.append(-torch.log(mass.clamp_min(1e-6)))
+    return torch.cat(terms).mean() if terms else zero
 
 
 @torch.no_grad()

@@ -1,5 +1,34 @@
 # Changelog
 
+## 3.1.0 (unreleased)
+
+The multi-view post-training, rebuilt from what the 3.0 runs showed: the cross-view attention's null token never
+learned (its logit stayed at its starting value), the matching head linked hardly better than plain re-identification
+(link F1 0.68 vs 0.66), and the photos' own features never saw the other photos. **Multi-view checkpoints of 3.0 and
+before are refused** (their single-photo starting checkpoints load as before, with identical predictions).
+
+- **Cross-view attention, gated.** Each row's update is gated per head by `tanh` of a learned function of the row,
+  starting at 0 (the sublayer starts as the identity), in place of the null token and the LayerScale. The patch tokens,
+  pooled 2x2, attend to the other photos too and their update is spread back over the patches, so the mask features see
+  the other photos (`xview: {patches, pool}`; ~+3 % per step). One attention call per set. The output projection has no
+  bias, so a closed gate adds nothing.
+- **Attention supervision** (`multiview.attn_w`): a loss pointing each linked query's cross-view attention at the same
+  instance in the other photos (its mask and its query there).
+- **The set matcher** (`eomt.matcher.SetMatcher`, replaces the matching head, `match_dim`, `match_residual` and the
+  sigmoid matching loss): the detected instances of the photos, by their query embedding and mask box, attend to each
+  other within and across photos; every two instances of two photos get a probability of being the same (a dual softmax
+  with a "no partner in that photo" bin), trained on the `instance_id` links (`multiview.match_w`). Inference links with
+  it (the photos predicted together as one set, any other two as a pair) at its calibrated probability threshold.
+- **LoRA** (`multiview.lora: {rank, blocks, alpha}`, `eomt.lora`): the attention of the frozen ViT blocks below the query
+  blocks adapts; the trainer's `best.pt` holds the merged weights, and any checkpoint with factors is merged on loading.
+  Trainable group `lora`; the `match_head` group is now `matcher`.
+- **Validation**: `sets/{match,reid}_oracle/*`, the links between the annotated instances themselves (linking with
+  perfect detection); the blocks below the queries run once per set for the photos alone and together;
+  `val.final_epochs` validates every epoch at the end of a run validated every `interval` epochs.
+- **Training**: DDP no longer searches for unused parameters (every trainable parameter joins each step's graph) and
+  keeps the gradients in its buckets.
+- `EoMTModel.forward(trunk=..., keep_xview_attn=...)` and `EoMTEncoder.encode_trunk()`.
+
 ## 3.0.0 (2026-11-19)
 
 A cleanup for a public release: one way to do each thing, one config per concern, and the options no trained model

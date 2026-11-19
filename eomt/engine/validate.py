@@ -26,6 +26,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch.utils.data import DataLoader
 
 from ..data import collate_val
+from ..matcher import link_probabilities, mask_boxes
 from ..postprocess import postprocess_detection, postprocess_instance, slice_batch
 from ..progress import progress
 from ..tta import TTAConfig, predict_views
@@ -658,33 +659,41 @@ def _det_ids(r: dict, sel: torch.Tensor, gt_masks: torch.Tensor, gt_ids: torch.T
     return d_ids
 
 
-def _link_record(r: dict, embed: torch.Tensor, sel: torch.Tensor, d_ids: np.ndarray, gate_keys: tuple) -> dict:
-    """What linking needs of one photo's detections ``sel``: their L2-normalized embeddings (``embed`` ``(Q, d)``, on the
-    CPU), instance ids (:func:`_det_ids`) and gate keys (the class and categorical attributes named by ``gate_keys``)."""
+def _link_record(r: dict, embed: torch.Tensor, sel: torch.Tensor, d_ids: np.ndarray, gate_keys: tuple,
+                 masks: torch.Tensor | None = None) -> dict:
+    """What linking needs of one photo's detections ``sel``: their embeddings (``embed`` ``(Q, d)``: L2-normalized as
+    ``emb``, raw as ``feat``, on the CPU), the boxes of their masks (``masks`` ``(Q, h, w)`` logits, for the set
+    matcher), instance ids (:func:`_det_ids`) and gate keys (the class and categorical attributes named by
+    ``gate_keys``)."""
     q = r["query_idx"][sel.to(r["query_idx"].device)]
-    emb = F.normalize(embed[q.to(embed.device)].float(), dim=-1).cpu()
+    feat = embed[q.to(embed.device)].float()
     classes = r["classes"].tolist()
     aux_ids = {k: r["aux"][k]["ids"].tolist() for k in gate_keys if k != "class"}
     keys = [tuple(classes[i] if k == "class" else aux_ids[k][i] for k in gate_keys) for i in sel.tolist()]
-    return {"emb": emb, "ids": d_ids, "keys": keys}
+    rec = {"emb": F.normalize(feat, dim=-1).cpu(), "feat": feat.cpu(), "ids": d_ids, "keys": keys}
+    if masks is not None:
+        rec["box"] = mask_boxes(masks[q.to(masks.device)]).cpu()
+    return rec
 
 
-def _flatten_records(records: list[dict], gated: bool):
-    """``(similarity (M, M), photo (M,), keys, ids (M,))`` of the records of several photos."""
+def _flatten_records(records: list[dict], gated: bool, sim_fn=None):
+    """``(similarity (M, M), photo (M,), keys, ids (M,))`` of the records of several photos: the cosine of their
+    embeddings, or ``sim_fn(records)`` (the set matcher's probabilities)."""
     emb = torch.cat([r["emb"] for r in records]) if records else torch.zeros(0, 0)
     photo = torch.tensor([i for i, r in enumerate(records) for _ in r["ids"]], dtype=torch.long)
     keys = [k if gated else () for r in records for k in r["keys"]]
     ids = np.concatenate([r["ids"] for r in records]) if records else np.zeros(0, dtype=int)
-    return emb @ emb.T, photo, keys, ids
+    sim = sim_fn(records) if sim_fn is not None and len(ids) else emb @ emb.T
+    return sim, photo, keys, ids
 
 
-def _record_links(records: list[dict], gated: bool) -> list[tuple[float, bool]]:
+def _record_links(records: list[dict], gated: bool, sim_fn=None) -> list[tuple[float, bool]]:
     """Every link the linker proposes between two photos of a set, as at inference (:func:`eomt.reid.pairwise_matches`:
     Hungarian per photo pair, within each gate group when ``gated``), as ``(similarity, same instance)``; a link with a
     detection of unknown id is left out."""
     from ..reid import pairwise_matches
 
-    sim, photo, keys, ids = _flatten_records(records, gated)
+    sim, photo, keys, ids = _flatten_records(records, gated, sim_fn)
     if len(ids) < 2:
         return []
     out = []
@@ -743,13 +752,13 @@ def _bcubed(identity: np.ndarray, ids: np.ndarray) -> tuple[float, float, int]:
     return p_sum, r_sum, len(items)
 
 
-def _cluster_counts(records: list[dict], thres: float, gated: bool) -> tuple[float, float, int]:
+def _cluster_counts(records: list[dict], thres: float, gated: bool, sim_fn=None) -> tuple[float, float, int]:
     """Link the detections of every photo of one subject as :func:`eomt.engine.predict.predict_subject` does
     (``identities``: Hungarian per photo pair at ``thres``, union-find with its merge guard) and count the B-cubed
     sums (:func:`_bcubed`) of the identities."""
     from ..reid import cluster, gate_mask, pairwise_matches
 
-    sim, photo, keys, ids = _flatten_records(records, gated)
+    sim, photo, keys, ids = _flatten_records(records, gated, sim_fn)
     if not len(ids) or thres is None or not math.isfinite(thres):
         return 0.0, 0.0, 0
     pairs = pairwise_matches(sim, photo, keys, sim_thres=thres)
@@ -778,6 +787,7 @@ def set_metric_keys(prefix: str, specs, *, gated: bool = False, groups: dict | N
     keys += [f"segm/{k}_{sub}_{m}" for sub in ("linked", "unlinked") for k in ("mAP", "AR100") for m in _MODES]
     keys += [f"{n}_{m}" for s in specs for n in attr_metric_names(s) for m in _MODES]
     keys += [f"{src}{v}/{n}" for src in LINK_SOURCES for v in ("", "_gated")[: 1 + gated] for n in _LINK_STATS]
+    keys += [f"{src}_oracle/{n}" for src in LINK_SOURCES for n in _LINK_STATS]
     keys += ["match/f1_stored"]
     keys += [f"{src}/cluster_{n}" for src in LINK_SOURCES for n in ("f1", "precision", "recall")]
     for field, values in (groups or {}).items():
@@ -828,6 +838,9 @@ def evaluate_sets(
       (Hungarian per photo pair, as at inference) of the detections scoring at least ``link_conf``, at the similarity
       threshold of the best F1 (``thres``). With ``link_group_by`` (gate keys: ``"class"`` and categorical heads) also
       ``<source>_gated/*``: the links only within each gate group.
+    * ``<source>_oracle/{f1,precision,recall,thres}``: the same links between the instances themselves (oracle
+      detections: the queries matched to the annotated instances of known id, as in training), ungated: how well the
+      embedding / the set matcher links when detection is perfect.
     * ``match/f1_stored``: F1 at the given ``thres`` (e.g. the checkpoint's stored one) instead of the best one of this
       validation (an optimistic number); gated when ``link_group_by`` is set, as the links are then made.
     * ``<source>/cluster_{f1,precision,recall}``: the identities over each whole subject: the first photo of every set
@@ -839,6 +852,7 @@ def evaluate_sets(
     """
     from pycocotools import mask as mask_utils
 
+    from ..aux_cls import match_queries
     from ..reid import validate_group_by
 
     device = torch.device(device) if not isinstance(device, torch.device) else device
@@ -852,6 +866,17 @@ def evaluate_sets(
     # the links are those of inference
     aux_scopes = {s.name: s.applies_to for s in getattr(model, "aux_specs", []) if s.applies_to is not None}
     cross_view = getattr(getattr(model, "eomt", None), "xview", None) is not None
+    matcher = getattr(model, "matcher", None)
+    # the "match" links: the set matcher's probabilities (the photos of a set together, those of several sets two by
+    # two, as predict_subject links them), else the cosine of the query embeddings of the photos predicted together
+    joint_sim = pair_sim = None
+    if matcher is not None:
+        def joint_sim(recs):  # noqa: E306
+            return link_probabilities(matcher, [r["feat"] for r in recs], [r["box"] for r in recs],
+                                      groups=[list(range(len(recs)))])
+
+        def pair_sim(recs):  # noqa: E306
+            return link_probabilities(matcher, [r["feat"] for r in recs], [r["box"] for r in recs])
     fields = _fields(group_by)
     indexed = _Indexed(sets_ds)
     mine = shard_groups(indexed, [sets_ds.subject_of_set(i) for i in range(len(sets_ds))])
@@ -864,6 +889,7 @@ def evaluate_sets(
     tot = {m: {s.name: 0 for s in specs if not s.regression} for m in _MODES}
     reg = {m: {s.name: ([], []) for s in specs if s.regression} for m in _MODES}
     links = {(src, g): [] for src in LINK_SOURCES for g in variants}  # (similarity, same instance, set's groups)
+    links.update({(f"{src}_oracle", False): [] for src in LINK_SOURCES})
     n_true: dict = {}  # set's groups -> instances shown by two photos (the links to find)
     anchors: dict = {}  # subject -> {source: [record of the first photo of each of its sets]}
     for idx, item in progress(loader, desc="val-sets", unit="set", leave=False, disable=not verbose):
@@ -893,13 +919,26 @@ def evaluate_sets(
                              "area": float(mask_utils.area(rle)), "bbox": [float(x) for x in mask_utils.toBbox(rle)],
                              "linked": int(a_ids[g]) >= 0 and int(a_ids[g]) in others})
         records = {src: [] for src in LINK_SOURCES}
+        oracle = {src: [] for src in LINK_SOURCES}
         out = None
+        with _autocast(device, amp):  # the blocks below the queries: the same for the photos alone and in their set
+            trunk = model.eomt.encode_trunk(pv)
         for m in _MODES:  # one forward at a time, each photo's masks dropped once used (validation memory)
             if out is None or cross_view:  # without cross-view sublayers a photo's prediction is the same in its set
                 with _autocast(device, amp):
-                    out = model(pv) if m == "alone" else model(pv, set_ids=torch.zeros(len(views), dtype=torch.long))
-            embeds = ({"reid": out["query_embed"]} if m == "alone"
-                      else {"match": out.get("match_embed", out["query_embed"])})
+                    out = (model(pv, trunk=trunk) if m == "alone"
+                           else model(pv, set_ids=torch.zeros(len(views), dtype=torch.long), trunk=trunk))
+            src = "reid" if m == "alone" else "match"
+            embeds = {src: out["query_embed"]}
+            # oracle detections: the queries matched to the annotated instances (each its own detection)
+            matched = match_queries(model, out, [g.float() for g in gt_masks], [v[2].to(device) for v in views])
+            for k, (q_i, t_i) in enumerate(matched):
+                rec_ids = gt_ids[k][t_i.cpu()].numpy()
+                rec_ids = np.where(rec_ids >= 0, rec_ids, -2)  # an instance whose links are unknown takes no part
+                feat = out["query_embed"][k][q_i.to(device)].float()
+                oracle[src].append({"emb": F.normalize(feat, dim=-1).cpu(), "feat": feat.cpu(),
+                                    "box": mask_boxes(out["masks_queries_logits"][k][q_i.to(device)]).cpu(),
+                                    "ids": rec_ids, "keys": [() for _ in rec_ids]})
             for k in range(len(views)):
                 r = postprocess_instance(slice_batch(out, k), 0.0, (size, size), max_det=max_det, aux_scopes=aux_scopes)
                 # the detections that may be an instance nobody annotated: all of a photo not fully annotated, else
@@ -929,13 +968,15 @@ def evaluate_sets(
                 sel = (r["scores"] >= link_conf).nonzero().flatten()
                 d_ids = _det_ids(r, sel, gt_masks[k], gt_ids[k], iou_gate, unsure)
                 for src, e in embeds.items():
-                    records[src].append(_link_record(r, e[k], sel, d_ids, gate_keys))
+                    records[src].append(_link_record(r, e[k], sel, d_ids, gate_keys, out["masks_queries_logits"][k]))
                 del r
             del embeds
-        del out
+        del out, trunk
         for src, recs in records.items():
+            sim_fn = joint_sim if src == "match" else None
             for g in variants:
-                links[(src, g)] += [(sim, ok, grp) for sim, ok in _record_links(recs, g)]
+                links[(src, g)] += [(sim, ok, grp) for sim, ok in _record_links(recs, g, sim_fn)]
+            links[(f"{src}_oracle", False)] += [(sim, ok, grp) for sim, ok in _record_links(oracle[src], False, sim_fn)]
             anchors.setdefault(sets_ds.subject_of_set(idx), {}).setdefault(src, []).append(recs[0])
 
     parts = gather((images, anns, dets, hits, tot, reg, links, n_true, img_group))
@@ -947,7 +988,7 @@ def evaluate_sets(
     counts = {src: [0.0, 0.0, 0] for src in LINK_SOURCES}
     for by_src in anchors.values():
         for src, recs in by_src.items():
-            p, r, n = _cluster_counts(recs, cluster_thres[src], deployed)
+            p, r, n = _cluster_counts(recs, cluster_thres[src], deployed, pair_sim if src == "match" else None)
             counts[src] = [counts[src][0] + p, counts[src][1] + r, counts[src][2] + n]
     counts = sum_over_processes(counts)
     if counts is not None:

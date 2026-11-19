@@ -41,6 +41,7 @@ from .config import (
     normalize_loss_weights,
 )
 from .loss import EoMTLoss
+from .matcher import DEFAULT_MATCHER, SetMatcher
 from .preprocess import IMAGENET_MEAN, IMAGENET_STD
 
 #: Supported task families. ``"instance"`` is the original mask-classification head;
@@ -68,6 +69,7 @@ class EoMTOutput:
     quality_logits: torch.Tensor | None = None  # instance family: predicted mask IoU (logits) of the quality head
     last_hidden_state: torch.Tensor | None = None
     indices: list | None = None  # training: the final prediction's query -> target matching
+    xview_attn: list | None = None  # keep_xview_attn: per cross-view sublayer and set, its query rows and keys
 
 
 def _act(name: str):
@@ -423,59 +425,81 @@ def _set_groups(set_ids, device) -> list[torch.Tensor]:
 
 
 class CrossViewAttention(nn.Module):
-    """Cross-view sublayer, applied after a query block: the queries of each photo attend to every token of the OTHER
-    photos of its set — their patches (local evidence: a clearer view of an instance) and their queries (the instances
-    forming there) — plus a null token with a zero value, so that a query with nothing to take from the others abstains.
+    """Cross-view sublayer, applied after a query block: the queries of each photo, and its patch tokens pooled
+    ``pool`` x ``pool``, attend to every token of the OTHER photos of its set (their patches: local evidence, a clearer
+    view of an instance; their queries: the instances forming there).
 
-    The patches of a photo never look outside it, so its masks still cover only what it shows; the evidence from the
-    other photos enters through the queries and reaches the patches in the next block's self-attention. Starts as a
-    copy of the block's own attention (:meth:`init_from`: from the first step a query looks in another photo for what
-    it looks for in its own) behind a LayerScale of ``init_scale``, so it starts as the identity.
+    What each row takes is gated per head by ``tanh(W x + b)`` of the row itself (``W``, ``b`` start at 0, so the
+    sublayer starts as the identity and each query learns how much, and when, to use the other photos). The pooled
+    patch rows have their own gate; their update is spread back over the patches they pool, so the evidence of the
+    other photos reaches the mask features directly and a photo's masks can sharpen where another photo sees better.
+    The attention starts as a copy of the block's own (:meth:`init_from`): from the first step a query looks in another
+    photo for what it looks for in its own.
 
-    ponytail: one attention call per photo. A batched call over the set (each photo's own keys left out) gave the same
-    output but ran slower on the CPU. Batch it only if a GPU profile shows these calls in the step's hot path.
+    One attention call per set, with each photo's keys being the tokens of the others. Optionally (``cache``) each
+    set's query rows and keys are kept, for the loss that supervises where the queries look
+    (:func:`eomt.aux_cls.xview_attention_loss`).
     """
 
-    def __init__(self, config, init_scale: float = 1e-5, null_logit: float = 4.0):
+    def __init__(self, config, *, patches: bool = True, pool: int = 2):
         super().__init__()
+        h = config.num_attention_heads
+        self.patches = bool(patches)
+        self.pool = int(pool)
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = Attention(config)
-        self.null_key = nn.Parameter(torch.zeros(config.hidden_size))  # in key space (after k_proj)
-        self.null_logit = nn.Parameter(torch.full((config.num_attention_heads,), float(null_logit)))
-        self.layer_scale = nn.Parameter(torch.full((config.hidden_size,), float(init_scale)))
+        self.attention.out_proj.register_parameter("bias", None)  # a closed gate adds nothing, not even a bias
+        self.gate = nn.Linear(config.hidden_size, h)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+        if self.patches:
+            self.patch_gate = nn.Linear(config.hidden_size, h)
+            nn.init.zeros_(self.patch_gate.weight)
+            nn.init.zeros_(self.patch_gate.bias)
 
     @torch.no_grad()
     def init_from(self, block: "Layer") -> None:
         self.norm.load_state_dict(block.norm1.state_dict())
-        self.attention.load_state_dict(block.attention.state_dict())
+        self.attention.load_state_dict({k: v for k, v in block.attention.state_dict().items() if k != "out_proj.bias"})
 
-    def forward(self, hidden_states: torch.Tensor, groups: list[torch.Tensor], num_queries: int) -> torch.Tensor:
-        a = self.attention
+    def forward(self, hidden_states: torch.Tensor, groups: list[torch.Tensor], num_queries: int, num_prefix: int,
+                grid: tuple[int, int], cache: list | None = None) -> torch.Tensor:
+        a, nq = self.attention, num_queries
         h, dh, d = a.num_heads, a.head_dim, a.embed_dim
-        rows = list(hidden_states[:, :num_queries].unbind(0))
+        n = hidden_states.shape[1]
+        start = nq + num_prefix  # the first patch token
+        queries, patches = hidden_states[:, :nq], hidden_states[:, start:]
         for idx in groups:
+            v_n = len(idx)
             x = self.norm(hidden_states[idx])  # [V, N, D]: every token of the set's photos
-            q, k, v = a.q_proj(x[:, :num_queries]), a.k_proj(x), a.v_proj(x)
-            for i in range(len(idx)):
-                others = [j for j in range(len(idx)) if j != i]
-                kk = torch.cat([k[others].reshape(-1, d), self.null_key.to(k.dtype)[None]])
-                vv = torch.cat([v[others].reshape(-1, d), v.new_zeros(1, d)])
-                n = kk.shape[0]
-                qh = q[i].view(-1, h, dh).transpose(0, 1)[None]  # [1, h, Q, dh]
-                bias = torch.cat([qh.new_zeros(h, 1, n - 1), self.null_logit.to(qh.dtype).view(h, 1, 1)], -1)
-                out = F.scaled_dot_product_attention(
-                    qh, kk.view(n, h, dh).transpose(0, 1)[None], vv.view(n, h, dh).transpose(0, 1)[None],
-                    attn_mask=bias[None], scale=a.scale,
-                )
-                b = int(idx[i])
-                rows[b] = rows[b] + self.layer_scale * a.out_proj(out[0].transpose(0, 1).reshape(-1, d))
-        return torch.cat((torch.stack(rows), hidden_states[:, num_queries:]), dim=1)
+            k = a.k_proj(x).view(v_n, n, h, dh)
+            v = a.v_proj(x).view(v_n, n, h, dh)
+            others = torch.tensor([[j for j in range(v_n) if j != i] for i in range(v_n)], device=x.device)
+            kk = k[others].reshape(v_n, (v_n - 1) * n, h, dh).transpose(1, 2)  # [V, h, (V-1) N, dh]
+            vv = v[others].reshape(v_n, (v_n - 1) * n, h, dh).transpose(1, 2)
+            rows = x[:, :nq]
+            if self.patches:
+                pooled = F.avg_pool2d(x[:, start:].transpose(1, 2).reshape(v_n, d, *grid), self.pool, ceil_mode=True)
+                pgrid = pooled.shape[-2:]
+                rows = torch.cat((rows, pooled.flatten(2).transpose(1, 2)), dim=1)  # [V, Q + P, D]
+            qh = a.q_proj(rows).view(v_n, rows.shape[1], h, dh).transpose(1, 2)  # [V, h, R, dh]
+            out = F.scaled_dot_product_attention(qh, kk, vv, scale=a.scale)  # [V, h, R, dh]
+            if cache is not None:
+                cache.append({"idx": idx, "q": qh[:, :, :nq], "k": kk, "others": others, "tokens": n})
+            gate = torch.tanh(self.gate(rows[:, :nq])).transpose(1, 2)[..., None]  # [V, h, Q, 1]
+            upd = a.out_proj((out[:, :, :nq] * gate).transpose(1, 2).reshape(v_n, nq, d))
+            queries = queries.index_add(0, idx, upd.to(queries.dtype))
+            if self.patches:
+                pgate = torch.tanh(self.patch_gate(rows[:, nq:])).transpose(1, 2)[..., None]  # [V, h, P, 1]
+                pupd = a.out_proj((out[:, :, nq:] * pgate).transpose(1, 2).reshape(v_n, -1, d))
+                pupd = F.interpolate(pupd.transpose(1, 2).reshape(v_n, d, *pgrid), size=grid, mode="nearest")
+                patches = patches.index_add(0, idx, pupd.flatten(2).transpose(1, 2).to(patches.dtype))
+        return torch.cat((queries, hidden_states[:, nq:start], patches), dim=1)
 
 
-#: Cross-view settings (``EoMTModel(xview=...)``, saved in the checkpoint): the starting LayerScale and null-token
-#: logit, and the most photos predicted together. ``mode`` is always "blocks" (a cross-view sublayer after every query
-#: block); it is kept in the checkpoint for older versions.
-DEFAULT_XVIEW: dict = {"mode": "blocks", "init_scale": 1e-5, "null_logit": 4.0, "max_views": 4}
+#: Cross-view settings (``EoMTModel(xview=...)``, saved in the checkpoint): whether the pooled patch tokens take part
+#: (``patches``, pooled ``pool`` x ``pool``) and the most photos predicted together. ``mode`` is always "blocks".
+DEFAULT_XVIEW: dict = {"mode": "blocks", "patches": True, "pool": 2, "max_views": 4}
 
 
 class EoMTEncoder(nn.Module):
@@ -558,9 +582,8 @@ class EoMTEncoder(nn.Module):
         if xv:
             if xv.get("mode", "blocks") != "blocks":
                 raise ValueError(f"xview mode {xv['mode']!r}: only 'blocks' is supported")
-            self.xview = nn.ModuleList(
-                [CrossViewAttention(config, xv["init_scale"], xv["null_logit"]) for _ in range(config.num_blocks)]
-            )
+            kw = {k: xv[k] for k in ("patches", "pool") if k in xv}
+            self.xview = nn.ModuleList([CrossViewAttention(config, **kw) for _ in range(config.num_blocks)])
 
     # --- loss plumbing (mirrors HF get_loss_dict / get_loss) ----------------
 
@@ -654,15 +677,22 @@ class EoMTEncoder(nn.Module):
         set_ids: torch.Tensor | None = None,
         ignore_masks: list[torch.Tensor | None] | None = None,
         neg_weight: torch.Tensor | None = None,
+        trunk: torch.Tensor | None = None,
+        keep_xview_attn: bool = False,
     ) -> EoMTOutput:
         """``set_ids`` ``[B]`` groups the photos into sets of the same subject predicted together (equal ids = one set)
         for the cross-view sublayers; ``None``, or a photo alone in its set, is the single-photo model. ``ignore_masks``
         and ``neg_weight`` (training only) leave regions and partly annotated photos out of the "no object" loss
         (:class:`~eomt.loss.EoMTLoss`). In training every query block's prediction is supervised (deep supervision) and
-        ``indices`` is the final prediction's query->target matching."""
+        ``indices`` is the final prediction's query->target matching.
+
+        ``trunk``: the hidden states :meth:`encode_trunk` returned for ``pixel_values``, to run only the query blocks
+        (e.g. a set predicted alone and together). ``keep_xview_attn`` keeps each cross-view sublayer's query rows and
+        keys (``xview_attn``) for :func:`eomt.aux_cls.xview_attention_loss`."""
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")
         groups = _set_groups(set_ids, pixel_values.device) if self.xview is not None else []
+        xview_cache = [] if keep_xview_attn and groups else None
         geom_per_layer, class_per_layer = (), ()
         is_detect = self.family == "detect"
         geom_labels = box_labels if is_detect else mask_labels  # GT geometry for this family
@@ -671,12 +701,14 @@ class EoMTEncoder(nn.Module):
         # The actual patch grid of this input (it may differ from the trained grid at another input size).
         ps = self.config.patch_size
         grid = (pixel_values.shape[-2] // ps, pixel_values.shape[-1] // ps)
-        hidden_states = self.embeddings(pixel_values)
-        bank_feats = bank_pos = None
         nq = self.config.num_queries
         first_query_block = self.num_hidden_layers - self.config.num_blocks
+        hidden_states = self.encode_trunk(pixel_values) if trunk is None else trunk
+        bank_feats = bank_pos = None
 
         for idx, layer_module in enumerate(self.layers):
+            if idx < first_query_block:
+                continue
             if idx == first_query_block:
                 if self.fpn_scales:  # the multi-scale bank, built once at the injection point
                     patch = hidden_states[:, self.embeddings.num_prefix_tokens:]  # [B, Hn*Wn, hidden]
@@ -706,8 +738,9 @@ class EoMTEncoder(nn.Module):
             if self.fpn_scales and in_query_blocks:  # the queries gather fine / coarse context from the bank
                 refined = self.cross_blocks[block_idx](hidden_states[:, :nq], bank_feats, bank_pos)
                 hidden_states = torch.cat((refined, hidden_states[:, nq:]), dim=1)
-            if groups and in_query_blocks:  # cross-view: each photo's queries take what the other photos show
-                hidden_states = self.xview[block_idx](hidden_states, groups, nq)
+            if groups and in_query_blocks:  # cross-view: each photo takes what the other photos show
+                hidden_states = self.xview[block_idx](hidden_states, groups, nq, self.embeddings.num_prefix_tokens,
+                                                      grid, xview_cache)
 
         sequence_output = self.layernorm(hidden_states)
         geom_final, class_queries_logits = self.predict(sequence_output, grid)
@@ -734,7 +767,16 @@ class EoMTEncoder(nn.Module):
             class_queries_logits=class_queries_logits,
             last_hidden_state=sequence_output,
             indices=indices,
+            xview_attn=xview_cache,
         )
+
+    def encode_trunk(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """The hidden states entering the first query block: the embeddings and every block before the queries (with
+        cross-view sublayers, the same for a photo alone and in its set)."""
+        hidden_states = self.embeddings(pixel_values)
+        for layer_module in self.layers[: self.num_hidden_layers - self.config.num_blocks]:
+            hidden_states = layer_module(hidden_states)
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -793,8 +835,7 @@ def build_model(
     num_upscale_blocks: int | None = None,
     fpn_scales: tuple[float, ...] | list[float] | None = None,
     xview: dict | None = None,
-    match_dim: int = 0,
-    match_residual: bool = False,
+    matcher: dict | None = None,
 ) -> "EoMTModel":
     """Build an :class:`EoMTModel`.
 
@@ -804,8 +845,8 @@ def build_model(
     ``num_upscale_blocks`` the mask-head upsampling depth (instance only; ``None`` = the size preset's). ``fpn_scales``
     enables the multi-scale path (SimpleFPN + query cross-attention); ``None`` = the original single-scale model.
     ``xview`` (see :data:`DEFAULT_XVIEW`) adds the cross-view sublayers that let several photos of one subject be
-    predicted together, and ``match_dim > 0`` a head embedding each query for linking instances across photos
-    (``match_residual``: the query embedding plus a learned residual, see :class:`EoMTModel`).
+    predicted together, and ``matcher`` (see :data:`~eomt.matcher.DEFAULT_MATCHER`) the set matcher that links the
+    instances of several photos (:class:`~eomt.matcher.SetMatcher`).
     """
     if family not in FAMILIES:
         raise ValueError(f"family={family!r} is not one of {FAMILIES}.")
@@ -824,18 +865,17 @@ def build_model(
         num_upscale_blocks=num_upscale_blocks,
         fpn_scales=fpn_scales,
         xview=xview,
-        match_dim=match_dim,
-        match_residual=match_residual,
+        matcher=matcher,
     )
 
 
 class EoMTModel(nn.Module):
     """The trainable model: the encoder (:class:`EoMTEncoder`) plus the per-instance attribute heads and the optional
-    matching head.
+    set matcher (:class:`~eomt.matcher.SetMatcher`, applied to the detections by the linker and the trainer).
 
     The forward returns a dict: the raw query outputs (``class_queries_logits``, ``masks_queries_logits`` or
-    ``pred_boxes``, ``query_embed`` and, with heads, ``aux_queries_logits`` / ``aux_queries_values`` / ``match_embed``),
-    plus ``loss`` and ``indices`` (the final query->target matching) when labels are given in training.
+    ``pred_boxes``, ``query_embed`` and, with heads, ``aux_queries_logits`` / ``aux_queries_values``), plus ``loss``,
+    ``indices`` (the final query->target matching) and, when asked, ``xview_attn`` in training.
     """
 
     def __init__(
@@ -852,8 +892,7 @@ class EoMTModel(nn.Module):
         num_upscale_blocks: int | None = None,
         fpn_scales: tuple[float, ...] | list[float] | None = None,
         xview: dict | None = None,
-        match_dim: int = 0,
-        match_residual: bool = False,
+        matcher: dict | None = None,
     ):
         super().__init__()
         self.size = size
@@ -909,23 +948,11 @@ class EoMTModel(nn.Module):
                 for s in self.aux_specs
             }
         )
-        # Matching head: one L2-normalized ``match_dim`` vector per query, trained so that the same instance in two
-        # photos lands close (:func:`eomt.aux_cls.match_loss`). ``match_residual``: the query embedding plus the head's
-        # output, whose last layer starts at 0, so the head starts as re-identification by the query embedding and
-        # learns a correction (``match_dim`` is then the hidden size). ``match_thres`` is the cosine floor for "same
-        # instance", calibrated on the validation sets and restored from the checkpoint, and ``link_group_by`` the gate
-        # keys the links were validated with.
-        self.match_dim = int(match_dim)
-        self.match_residual = bool(match_residual) and self.match_dim > 0
-        if self.match_residual and self.match_dim != config.hidden_size:
-            raise ValueError(f"a residual matching head has the hidden size ({config.hidden_size}), not {self.match_dim}")
-        self.match_head = None
-        if self.match_dim > 0:
-            h = config.hidden_size
-            self.match_head = nn.Sequential(nn.Linear(h, h), nn.GELU(), nn.Linear(h, self.match_dim))
-            if self.match_residual:
-                nn.init.zeros_(self.match_head[-1].weight)
-                nn.init.zeros_(self.match_head[-1].bias)
+        # The set matcher (multi-view post-training): links the detections of several photos. ``match_thres`` is the
+        # probability floor for "same instance", calibrated on the validation sets and restored from the checkpoint,
+        # and ``link_group_by`` the gate keys the links were validated with.
+        self.matcher_cfg = {**DEFAULT_MATCHER, **matcher} if matcher is not None else None
+        self.matcher = SetMatcher(config.hidden_size, **self.matcher_cfg) if self.matcher_cfg else None
         self.match_thres: float | None = None
         self.link_group_by: tuple[str, ...] | None = None
 
@@ -947,6 +974,8 @@ class EoMTModel(nn.Module):
         set_ids: torch.Tensor | None = None,
         ignore_masks: list[torch.Tensor | None] | None = None,
         neg_weight: torch.Tensor | None = None,
+        trunk: torch.Tensor | None = None,
+        keep_xview_attn: bool = False,
     ):
         out = self.eomt(
             pixel_values=pixel_values,
@@ -956,6 +985,8 @@ class EoMTModel(nn.Module):
             set_ids=set_ids,
             ignore_masks=ignore_masks,
             neg_weight=neg_weight,
+            trunk=trunk,
+            keep_xview_attn=keep_xview_attn,
         )
         training = out.loss is not None
         if self.family == "detect":
@@ -968,9 +999,6 @@ class EoMTModel(nn.Module):
         # read it, and so does re-identification on checkpoints without a matching head.
         q = out.last_hidden_state[:, : self.config.num_queries, :]
         result["query_embed"] = q
-        if self.match_head is not None:
-            m = self.match_head(q)
-            result["match_embed"] = F.normalize((m + q if self.match_residual else m).float(), dim=-1)
         if self.aux_heads and not training:
             # In training the attribute loss applies each head to the matched queries only.
             specs = {s.name: s for s in self.aux_specs}
@@ -985,6 +1013,8 @@ class EoMTModel(nn.Module):
         if training:
             result["loss"] = out.loss
             result["indices"] = out.indices
+            if out.xview_attn is not None:
+                result["xview_attn"] = out.xview_attn
         return result
 
 

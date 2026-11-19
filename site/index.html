@@ -376,7 +376,7 @@ matched  = gather_matched(out, indices)                          <span class="c"
 
   <div class="note q">
     <span class="ic">↳</span>
-    <p>The same idea links instances across photos: a <strong>matching head</strong> on the per-query embedding, trained on the matched queries of photos of one subject (<code>multiview: {matching: true}</code>), embeds each instance so that the same physical instance in two photos lands close; <code>EoMT.match()</code> turns that into one identity per instance.</p>
+    <p>The same idea links instances across photos: a <strong>set matcher</strong> reads the per-query embedding and mask box of every detected instance of the photos, lets them attend to each other within and across photos, and gives every two instances of two photos a probability of being the same, trained on the matched queries of photos of one subject (<code>multiview: {matching: true}</code>); <code>EoMT.match()</code> turns that into one identity per instance.</p>
   </div>
 </section>
 

@@ -19,6 +19,7 @@ import torch
 
 from .config import HIDDEN_TO_SIZE, aux_specs_from_meta, aux_specs_to_meta
 from .device import resolve_device
+from .lora import has_lora, merge_state
 from .model import EoMTModel, build_model
 from .preprocess import IMAGENET_MEAN, IMAGENET_STD
 
@@ -33,7 +34,7 @@ CARRIED_KEYS = ("run_config", "epoch", "metrics", "best_key", "best_metric")
 
 
 def module_counts(keys) -> str:
-    """``"eomt.xview (52), match_head (4)"``: state-dict keys counted per module (two levels under ``eomt.``)."""
+    """``"eomt.xview (52), matcher (40)"``: state-dict keys counted per module (two levels under ``eomt.``)."""
     counts: dict[str, int] = {}
     for k in keys:
         parts = k.split(".")
@@ -229,9 +230,6 @@ def resolve_checkpoint(path: str | Path, *, prefer: str = "best") -> Path:
     raise FileNotFoundError(f"checkpoint path does not exist: {p}")
 
 
-#: Cross-view settings older versions recorded and this one ignores (the refiner's depth / heads, the keys a query read,
-#: the view-type vocabulary).
-_OLD_XVIEW_KEYS = ("layers", "heads", "keys", "view_types")
 
 
 def migrate_checkpoint(ckpt: dict[str, Any]) -> dict[str, Any]:
@@ -242,13 +240,10 @@ def migrate_checkpoint(ckpt: dict[str, Any]) -> dict[str, Any]:
       attribute heads (``aux_head_arch``); stretch preprocessing (``letterbox``); ImageNet normalisation; the mask-head
       depth and the multi-scale levels counted from the weights;
     * the masked-attention probability buffer (``eomt.attn_mask_probs``) is dropped: checkpoints are saved mask-free;
-    * cross-view: the view-type embeddings are dropped (view conditioning was removed), and so are the settings of
-      :data:`_OLD_XVIEW_KEYS`; a "refiner" model cannot be loaded;
     * the auxiliary box head is dropped with a warning (it only added boxes to the outputs);
-    * links: a checkpoint whose validation chose re-identification by the query embedding (``link_embed: reid``)
-      loses its matching head and keeps ``reid_thres`` as ``match_thres``, so it links as before; the other link
-      records (``reid_thres``, ``link_embed``, ``link_f1``) are dropped;
-    * int8-compressed and pixel-detail checkpoints are refused.
+    * link records of older versions (``reid_thres``, ``link_embed``, ``link_f1``) are dropped;
+    * multi-view post-trainings before 3.1 (cross-view sublayers with a null token, an embedding matching head) and
+      int8-compressed and pixel-detail checkpoints are refused.
     """
     if "model" not in ckpt:
         raise ValueError("not a wrapped EoMT checkpoint (no 'model' key)")
@@ -276,23 +271,15 @@ def migrate_checkpoint(ckpt: dict[str, Any]) -> dict[str, Any]:
         # the IoU-aware class targets and the quality head became defaults in schema 2.0: off where not recorded
         ck["loss_weights"] = {"iou_aware_cls": False, "quality_weight": 0.0, **(ck.get("loss_weights") or {})}
     state.pop("eomt.attn_mask_probs", None)
-    xv = ck.get("xview")
-    if xv:
-        if xv.get("mode", "blocks") != "blocks":
-            raise ValueError(f"cross-view mode {xv['mode']!r} is no longer supported (only 'blocks')")
-        ck["xview"] = {k: v for k, v in xv.items() if k not in _OLD_XVIEW_KEYS}
-        state = {k: v for k, v in state.items() if not (k.startswith("eomt.xview.") and ".view_embed." in k)}
+    if ck.get("xview") and any(k.startswith("eomt.xview.") and k.endswith(".null_logit") for k in state) or \
+            ck.get("match_dim") or any(k.startswith(("match_head.", "match_skip.")) for k in state):
+        raise ValueError("a multi-view post-training before attr-eomt 3.1 (cross-view null token / embedding matching "
+                         "head): no longer supported; its base single-photo checkpoint still loads")
     if ck.pop("aux_box_head", None) or any(k.startswith("eomt.aux_box_head.") for k in state):
         warnings.warn("the auxiliary box head is no longer supported: its weights are ignored (it only added boxes "
                       "to the outputs; masks, classes and attributes are unchanged)", RuntimeWarning, stacklevel=3)
         state = {k: v for k, v in state.items() if not k.startswith("eomt.aux_box_head.")}
-    if any(k.startswith("match_skip.") for k in state):
-        raise ValueError("a residual matching head narrower than the hidden size is no longer supported")
-    if ck.get("link_embed") == "reid":  # validated to link better by the query embedding: keep linking that way
-        ck["match_thres"] = ck.get("reid_thres")
-        ck["match_dim"], ck["match_residual"] = 0, False
-        state = {k: v for k, v in state.items() if not k.startswith("match_head.")}
-    for key in ("reid_thres", "link_embed", "link_f1"):
+    for key in ("reid_thres", "link_embed", "link_f1", "match_dim", "match_residual"):
         ck.pop(key, None)
     ck["model"] = state
     ck["schema_version"] = SCHEMA_VERSION
@@ -319,10 +306,13 @@ def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
         num_upscale_blocks=ckpt.get("num_upscale_blocks"),
         fpn_scales=ckpt.get("fpn_scales"),
         xview=ckpt.get("xview"),
-        match_dim=int(ckpt.get("match_dim") or 0),
-        match_residual=bool(ckpt.get("match_residual")),
+        matcher=ckpt.get("matcher"),
     )
-    model.load_state_dict(ckpt["model"])
+    state = ckpt["model"]
+    if has_lora(state):  # a trainer state (last.pt) of a post-training with LoRA: its factors merged
+        lora = ckpt.get("lora") or {}
+        state = merge_state(state, scale=float(lora.get("alpha", 1)) / float(lora.get("rank", 1)))
+    model.load_state_dict(state)
     model.eomt.set_attn_mask_probs([0.0] * model.config.num_blocks)  # checkpoints are saved and run mask-free
     model.match_thres = ckpt.get("match_thres")  # the links' calibration (eomt.engine.predict.link_defaults)
     model.link_group_by = tuple(ckpt["link_group_by"]) if ckpt.get("link_group_by") else None
@@ -420,8 +410,7 @@ def summarize_checkpoint(path: str | Path) -> dict[str, Any]:
         "num_upscale_blocks": ckpt.get("num_upscale_blocks"),
         "fpn_scales": ckpt.get("fpn_scales"),
         "xview": ckpt.get("xview"),
-        "match_dim": ckpt.get("match_dim"),
-        "match_residual": bool(ckpt.get("match_residual")),
+        "matcher": ckpt.get("matcher"),
         "match_thres": ckpt.get("match_thres"),
         "link_group_by": ckpt.get("link_group_by"),
         "dtype": ckpt.get("dtype"),
@@ -473,11 +462,12 @@ def format_summary(summary: dict[str, Any]) -> str:
         arch.append(f"FPN{tuple(summary['fpn_scales'])}")
     if summary.get("xview"):
         arch.append(f"cross-view (<= {summary['xview'].get('max_views')} photos)")
-    if summary.get("match_dim"):
-        arch.append(f"match head {summary['match_dim']}-d" + (" residual" if summary.get("match_residual") else ""))
+    if summary.get("matcher"):
+        arch.append(f"set matcher {summary['matcher'].get('layers')} x {summary['matcher'].get('dim')}-d")
     if summary.get("match_thres") is not None:
         gate = summary.get("link_group_by")
-        arch.append(f"links at cosine {summary['match_thres']:.2f}" + (f" within {', '.join(gate)}" if gate else ""))
+        what = "probability" if summary.get("matcher") else "cosine"
+        arch.append(f"links at {what} {summary['match_thres']:.2f}" + (f" within {', '.join(gate)}" if gate else ""))
     if summary.get("dtype"):
         arch.append(f"{summary['dtype']} Linear / Conv weights")
     if arch:

@@ -1,5 +1,5 @@
-"""Several photos of one subject: the sets (eomt.data.subjects), the cross-view sublayers, the matching head and its
-loss, the post-training, its validation, and prediction / linking of a subject's photos (CPU, tiny models)."""
+"""Several photos of one subject: the sets (eomt.data.subjects), the cross-view sublayers, the set matcher and its
+loss, LoRA, the post-training, its validation, and prediction / linking of a subject's photos (CPU, tiny models)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ import torch
 from PIL import Image
 
 from eomt import EoMT, build_model
-from eomt.aux_cls import match_loss, match_loss_params
+from eomt.lora import add_lora, merged_state_dict
+from eomt.matcher import SetMatcher, dual_log_softmax, mask_boxes, matcher_loss
 from eomt.data import CocoInstanceSeg, CocoSubjectSets, collate_sets, subjects_from_file_names
 from eomt.data.subjects import UNKNOWN_IDS
 from eomt.loss import EoMTLoss
@@ -186,7 +187,7 @@ def test_partial_labels_only_remove_no_object_terms():
 
 def test_cross_view_starts_as_the_identity_and_leaves_a_photo_alone_unchanged():
     torch.manual_seed(0)
-    m = build_model("s", nc=2, imgsz=112, xview={"max_views": 3}, match_dim=384, match_residual=True).eval()
+    m = build_model("s", nc=2, imgsz=112, xview={"max_views": 3}, matcher={}).eval()
     m.init_xview()
     x = torch.randn(3, 3, 112, 112)
     with torch.no_grad():
@@ -194,50 +195,87 @@ def test_cross_view_starts_as_the_identity_and_leaves_a_photo_alone_unchanged():
         apart = m(x, set_ids=torch.tensor([0, 1, 2]))                 # every photo alone in its set
         together = m(x, set_ids=torch.zeros(3, dtype=torch.long))
     assert torch.equal(alone["class_queries_logits"], apart["class_queries_logits"])
-    assert torch.allclose(alone["class_queries_logits"], together["class_queries_logits"], atol=1e-3)  # LayerScale 1e-5
-    # the residual matching head starts as re-identification: the normalized query embedding
-    ref = torch.nn.functional.normalize(alone["query_embed"].float(), dim=-1)
-    assert torch.allclose(alone["match_embed"], ref, atol=1e-6)
-    with pytest.raises(ValueError, match="hidden size"):
-        build_model("s", nc=2, imgsz=112, match_dim=128, match_residual=True)
+    assert torch.equal(alone["masks_queries_logits"], together["masks_queries_logits"])  # closed gates: the identity
+    for blk in m.eomt.xview:                                          # open gates: the set changes each photo
+        torch.nn.init.normal_(blk.gate.bias)
+        torch.nn.init.normal_(blk.patch_gate.bias)
+    with torch.no_grad():
+        live = m(x, set_ids=torch.zeros(3, dtype=torch.long))
+        trunk = m.eomt.encode_trunk(x)
+        again = m(x, set_ids=torch.zeros(3, dtype=torch.long), trunk=trunk)
+    assert not torch.allclose(live["masks_queries_logits"], alone["masks_queries_logits"])
+    assert torch.equal(live["masks_queries_logits"], again["masks_queries_logits"])  # the trunk once, the queries twice
+    with torch.no_grad():
+        assert torch.equal(m(x)["class_queries_logits"], alone["class_queries_logits"])  # a photo alone: unchanged
 
 
-def test_the_matching_loss_rewards_linked_instances_and_reports_what_it_sees():
+def test_the_set_matcher_gives_dual_softmax_probabilities_and_its_loss_rewards_the_links():
     torch.manual_seed(0)
-    params = match_loss_params()
-    a, b = torch.nn.functional.normalize(torch.randn(2, 8), dim=-1)
-    emb = torch.zeros(2, 3, 8)
-    emb[0, 0], emb[0, 1], emb[1, 0], emb[1, 1] = a, b, a, b        # instance 1 and 2 in two photos of one set
-    indices = [(torch.tensor([0, 1]), torch.tensor([0, 1])), (torch.tensor([0, 1]), torch.tensor([0, 1]))]
-    ids = [torch.tensor([1, 2]), torch.tensor([1, 2])]
+    scores = torch.randn(5, 5)
+    photo = torch.tensor([0, 0, 1, 1, 1])
+    valid = photo[:, None] != photo[None]
+    log_p, log_bin = dual_log_softmax(scores, photo, valid, torch.tensor(0.5))
+    p = log_p.exp()
+    assert torch.equal(p[~valid], torch.zeros_like(p[~valid])) and float(p.max()) <= 1.0
+    # each direction is a softmax over the other photo's instances and the bin
+    assert torch.allclose(log_bin[0, 1].exp() + torch.softmax(torch.cat((scores[0, 2:], torch.tensor([0.5]))), 0)[:3].sum(),
+                          torch.tensor(1.0), atol=1e-5)
+    # the loss: low when the scores agree with the ids, high when swapped
+    ids = torch.tensor([1, 2, 1, 2, 3])
+    known = torch.ones(5, dtype=torch.bool)
+    group = torch.zeros(5, dtype=torch.long)
+    good = torch.full((5, 5), -5.0)
+    good[0, 2] = good[2, 0] = good[1, 3] = good[3, 1] = 5.0
+    swapped = torch.full((5, 5), -5.0)
+    swapped[0, 3] = swapped[3, 0] = swapped[1, 2] = swapped[2, 1] = 5.0
     stats: dict = {}
-    good = match_loss({"match_embed": emb}, indices, ids, torch.tensor([0, 0]), params, stats=stats)
-    swapped = match_loss({"match_embed": emb}, indices, [torch.tensor([1, 2]), torch.tensor([2, 1])], torch.tensor([0, 0]),
-                         params)
-    assert good < swapped
-    assert torch.is_tensor(stats["pos_cos"]) and float(stats["pos_cos"]) == pytest.approx(1.0, abs=1e-5)
-    assert float(stats["unpaired"]) == 0.0
-    # two photos of two different sets never pair: nothing to learn
-    assert float(match_loss({"match_embed": emb}, indices, ids, torch.tensor([0, 1]), params)) == 0.0
+    lg = matcher_loss(*dual_log_softmax(good, photo, valid, torch.tensor(0.0)), ids, photo, group, known, stats)
+    ls = matcher_loss(*dual_log_softmax(swapped, photo, valid, torch.tensor(0.0)), ids, photo, group, known)
+    assert lg < ls and float(stats["pos_p"]) > 0.9 and float(stats["paired"]) == pytest.approx(4 / 5)
+    # the network: probabilities for every two instances of two photos of one group, 0 elsewhere
+    matcher = SetMatcher(64, dim=32, layers=2, heads=4)
+    feats, boxes = torch.randn(6, 64), torch.rand(6, 4)
+    lp, _ = matcher(feats, boxes, torch.tensor([0, 0, 1, 1, 2, 2]), torch.tensor([0, 0, 0, 0, 1, 1]))
+    assert torch.isinf(lp[0, 4]) and torch.isinf(lp[0, 1]) and torch.isfinite(lp[0, 2])
+    masks = torch.full((2, 10, 20), -1.0)
+    masks[0, 2:5, 4:10] = 1.0
+    assert torch.allclose(mask_boxes(masks), torch.tensor([[0.2, 0.2, 0.5, 0.5], [0.0, 0.0, 0.0, 0.0]]))
 
 
-def test_old_cross_view_checkpoints_are_upgraded_or_refused():
-    m = build_model("s", nc=2, imgsz=112, xview={}, match_dim=384, match_residual=True)
+def test_lora_adapts_the_blocks_below_the_queries_and_merges_exactly():
+    torch.manual_seed(0)
+    m = build_model("s", nc=2, imgsz=112).eval()
+    cfg = add_lora(m, rank=4, blocks=2)
+    adapted = {n.split(".")[2] for n, _ in m.named_parameters() if ".lora_" in n}
+    first = m.config.num_hidden_layers - m.config.num_blocks
+    assert cfg == {"rank": 4, "alpha": 4.0, "blocks": 2} and adapted == {str(first - 2), str(first - 1)}
+    x = torch.randn(1, 3, 112, 112)
+    with torch.no_grad():
+        start = m(x)["class_queries_logits"]
+    for n, p in m.named_parameters():
+        if "lora_b" in n:
+            torch.nn.init.normal_(p, std=0.02)
+    with torch.no_grad():
+        adapted_out = m(x)["class_queries_logits"]
+    plain = build_model("s", nc=2, imgsz=112).eval()
+    plain.load_state_dict(merged_state_dict(m))                       # strict: plain keys only
+    with torch.no_grad():
+        merged = plain(x)["class_queries_logits"]
+    assert not torch.allclose(start, adapted_out) and torch.allclose(adapted_out, merged, atol=1e-5)
+
+
+def test_multi_view_checkpoints_before_3_1_are_refused():
+    m = build_model("s", nc=2, imgsz=112, xview={})
     sd = m.state_dict()
-    base = wrap_checkpoint(sd, size="s", nc=2, imgsz=112, loss_weights=m.loss_weights, xview=m.xview_cfg, match_dim=384,
-                           match_residual=True)
-    # view types (2.x): their embedding and vocabulary are dropped
-    old = {**base, "schema_version": "1.0", "xview": {**m.xview_cfg, "keys": "both", "view_types": ["front", "rear"]},
-           "model": {**sd, "eomt.xview.0.view_embed.weight": torch.zeros(3, 384), "eomt.attn_mask_probs": torch.zeros(4)}}
-    up = migrate_checkpoint(old)
-    assert "view_types" not in up["xview"] and not any("view_embed" in k or "attn_mask" in k for k in up["model"])
-    # a validation that chose re-identification keeps linking that way: no matching head, its threshold
-    reid = migrate_checkpoint({**base, "link_embed": "reid", "reid_thres": 0.8, "match_thres": 0.9})
-    assert reid["match_dim"] == 0 and reid["match_thres"] == 0.8 and not any(k.startswith("match_head.") for k in reid["model"])
-    with pytest.raises(ValueError, match="refiner"):
-        migrate_checkpoint({**base, "xview": {"mode": "refiner"}})
+    base = wrap_checkpoint(sd, size="s", nc=2, imgsz=112, loss_weights=m.loss_weights, xview=m.xview_cfg)
+    old = {**base, "model": {**sd, "eomt.xview.0.null_logit": torch.zeros(6)}}
+    with pytest.raises(ValueError, match="before attr-eomt 3.1"):
+        migrate_checkpoint(old)
+    with pytest.raises(ValueError, match="before attr-eomt 3.1"):
+        migrate_checkpoint({**base, "match_dim": 384, "model": {**sd, "match_head.0.weight": torch.zeros(1)}})
     with pytest.raises(ValueError, match="compressed"):
         migrate_checkpoint({**base, "compression": {"recipe": "int8"}})
+    assert migrate_checkpoint(base)["xview"] == m.xview_cfg
 
 
 # ------------------------------------------------------------------------------------- post-training end to end
@@ -271,19 +309,21 @@ def test_post_training_freezes_the_checkpoint_and_its_validation_runs_standalone
     post = load_model(res["best"], device="cpu")
     before, after = start.state_dict(), post.state_dict()
     assert all(torch.equal(before[k], after[k]) for k in before)        # "new": only the added modules trained
-    assert post.eomt.xview is not None and post.match_residual and post.match_dim == 384
+    assert post.eomt.xview is not None and post.matcher is not None
     assert post.link_group_by == ("class",) and res["best_key"] == "sets/segm/mAP_set"
     row = next(csv.DictReader(open(tmp_path / "runs" / "xv" / "metrics.csv")))
     thres = float(row["val/sets/match_gated/thres"])  # the links are calibrated as they are made: within the gate
     assert post.match_thres == pytest.approx(thres) if math.isfinite(thres) else post.match_thres is None
     for key in ("val/segm/mAP", "val/sets/segm/mAP_set", "val/sets/match/f1", "val/sets/match_gated/f1",
-                "val/sets/reid/f1", "val/sets/match/cluster_f1", "train/match_loss"):
+                "val/sets/reid/f1", "val/sets/match/cluster_f1", "val/sets/match_oracle/f1", "val/sets/reid_oracle/f1",
+                "train/match_loss", "train/match/pos_p"):
         assert key in row
     # the standalone validation rebuilds the run's and gives its numbers; read back, the fixed sets give them too
     model = EoMT(res["best"], device="cpu")
     for kw in ({}, {"sets_file": str(tmp_path / "runs" / "xv" / "val_sets.json")}):
         got = model.val(multiview=True, workers=0, **kw)
-        for key in ("segm/mAP", "sets/segm/mAP_alone", "sets/segm/mAP_set", "sets/match/f1", "sets/reid/f1"):
+        for key in ("segm/mAP", "sets/segm/mAP_alone", "sets/segm/mAP_set", "sets/match/f1", "sets/reid/f1",
+                    "sets/match_oracle/f1"):
             assert got[key] == pytest.approx(float(row[f"val/{key}"]), abs=1e-6), (kw, key)
 
     # a subject of more photos than a set holds: predicted max_views at a time, linked across the groups
@@ -303,12 +343,30 @@ def test_post_training_freezes_the_checkpoint_and_its_validation_runs_standalone
     assert linked["num_images"] == 5 and linked["config"]["sim_thres"] == pytest.approx(link_defaults(post)[0])
 
 
+def test_post_training_with_lora_and_attention_supervision(tmp_path):
+    img_dir, jf = _subject_coco(tmp_path, n_s2=5)
+    start, init = _init_checkpoint(tmp_path, img_dir, jf)
+    res = _post_train(tmp_path, img_dir, jf, init, "lora", lora={"rank": 4, "blocks": 2}, attn_w=0.5)
+    row = next(csv.DictReader(open(tmp_path / "runs" / "lora" / "metrics.csv")))
+    assert math.isfinite(float(row["train/attn_loss"]))
+    best = load_model(res["best"], device="cpu")                     # exported: the factors merged, plain keys
+    last = load_model(res["last"], device="cpu")                     # the trainer state: merged on loading
+    raw = torch.load(res["best"], map_location="cpu", weights_only=True)["model"]
+    assert not any(".parametrizations." in k for k in raw)
+    assert any(".parametrizations." in k for k in torch.load(res["last"], map_location="cpu", weights_only=True)["model"])
+    first = start.config.num_hidden_layers - start.config.num_blocks
+    moved = [k for k, v in start.state_dict().items() if not torch.equal(v, best.state_dict()[k])]
+    assert moved and all(k.startswith((f"eomt.layers.{first - 2}.attention.", f"eomt.layers.{first - 1}.attention."))
+                         for k in moved)                             # only the adapted projections changed
+    assert set(last.state_dict()) == set(best.state_dict())
+
+
 def test_matching_without_cross_view(tmp_path):
     img_dir, jf = _subject_coco(tmp_path)
     _, init = _init_checkpoint(tmp_path, img_dir, jf)
     res = _post_train(tmp_path, img_dir, jf, init, "m", xview=False)
     post = load_model(res["best"], device="cpu")
-    assert post.eomt.xview is None and post.match_head is not None and res["best_key"] == "sets/match/f1"
+    assert post.eomt.xview is None and post.matcher is not None and res["best_key"] == "sets/match/f1"
     with pytest.raises(ValueError, match="nothing to train"):
         _post_train(tmp_path, img_dir, jf, init, "none", xview=False, matching=False)
 
@@ -316,7 +374,7 @@ def test_matching_without_cross_view(tmp_path):
 def test_trainable_presets_and_prefixes():
     from eomt.engine.train import MultiviewConfig, build_multiview_optimizer
 
-    m = build_model("s", nc=2, imgsz=112, xview={}, match_dim=384, match_residual=True)
+    m = build_model("s", nc=2, imgsz=112, xview={}, matcher={})
     opt = build_multiview_optimizer(m, 1e-4, 0.05, MultiviewConfig(trainable="query_blocks").groups())
     lrs = {round(g["lr"] / 1e-4, 3) for g in opt.param_groups}
     assert lrs == {1.0, 0.4, 0.2}
@@ -326,7 +384,8 @@ def test_trainable_presets_and_prefixes():
     assert not any(p.requires_grad for p in m.eomt.class_predictor.parameters())
     with pytest.raises(ValueError, match="neither a group"):
         build_multiview_optimizer(m, 1e-4, 0.05, {"xviews": 1.0})
-    assert MultiviewConfig(xview=False).groups() == {"match_head": 1.0}
+    assert MultiviewConfig(xview=False).groups() == {"matcher": 1.0}             # no LoRA unless asked
+    assert "lora" in MultiviewConfig(lora={"rank": 4}).groups()
 
 
 def test_sets_from_groups_with_a_share_of_random_ones(tmp_path):
