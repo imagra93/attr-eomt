@@ -188,7 +188,7 @@ def pairwise_matches(
     photo: torch.Tensor,
     keys: list[tuple[int, ...]],
     *,
-    sim_thres: float = 0.6,
+    sim_thres: float = 0.7,
 ) -> list[dict]:
     """Hungarian-match every pair of photos, one gate group at a time.
 
@@ -280,7 +280,7 @@ def cluster(
     photo: torch.Tensor,
     *,
     num_instances: int,
-    sim_thres: float = 0.6,
+    sim_thres: float = 0.7,
     guard: str = "mean",
     guard_factor: float = 1.0,
     gate: torch.Tensor | None = None,
@@ -381,9 +381,14 @@ def summarize_identities(
     Members whose id is ``-1`` (a class-scoped head that does not apply) are excluded
     from both the sum and the count rather than summed as zeros, and a head that no
     member has an opinion on is omitted entirely rather than reported as class 0.
+
+    Regression heads (``aux_values``) are fused into ``values``: the score-weighted mean of the members' values, in the
+    head's own space (of ``log1p`` for a ``log`` head, i.e. a weighted geometric mean), skipping the members it does not
+    apply to. One physical instance has one value, so the identity's is better than any single photo's.
     """
     s = sim.detach().cpu().numpy()
     aux_names = {sp.name: sp.names for sp in (aux_specs or [])}
+    log_heads = {sp.name for sp in (aux_specs or []) if getattr(sp, "log", False)}
     by_identity: dict[int, list[int]] = {}
     for m, cid in enumerate(identity.tolist()):
         by_identity.setdefault(int(cid), []).append(m)
@@ -392,6 +397,7 @@ def summarize_identities(
     for cid, members in by_identity.items():
         classes, photos, entries = [], [], []
         acc: dict[str, list] = {}
+        reg: dict[str, list] = {}
         for m in members:
             img, det = origin[m]
             res = results[img]
@@ -412,6 +418,10 @@ def summarize_identities(
                 slot = acc.setdefault(head, [np.zeros_like(probs), 0])
                 slot[0] += probs
                 slot[1] += 1
+            for head, vals in (res.get("aux_values") or {}).items():
+                v = float(vals[det])
+                if v == v:  # NaN: a class-scoped head that does not apply
+                    reg.setdefault(head, []).append((v, float(res["scores"][det])))
 
         attribute_ids, attributes = {}, {}
         for head, (total, count) in acc.items():
@@ -421,6 +431,13 @@ def summarize_identities(
             attribute_ids[head] = hid
             attributes[head] = str(aux_names.get(head, {}).get(hid, hid))
 
+        values = {}
+        for head, pairs in reg.items():
+            x, w = np.array([v for v, _ in pairs]), np.array([sc for _, sc in pairs])
+            t = np.log1p(np.clip(x, -1 + 1e-9, None)) if head in log_heads else x
+            mean = float((w * t).sum() / w.sum()) if w.sum() > 0 else float(t.mean())
+            values[head] = round(float(np.expm1(mean)) if head in log_heads else mean, 6)
+
         cls = max(set(classes), key=classes.count)
         cuts = [s[a, b] for i, a in enumerate(members) for b in members[i + 1:]]
         records.append({
@@ -429,6 +446,7 @@ def summarize_identities(
             "class_name": str(names.get(cls, cls)) if names else str(cls),
             "attributes": attributes,
             "attribute_ids": attribute_ids,
+            "values": values,
             "num_photos": len(set(photos)),
             "num_instances": len(members),
             "members": entries,
@@ -438,6 +456,42 @@ def summarize_identities(
         })
     records.sort(key=lambda r: (-r["num_photos"], r["identity_id"]))
     return records
+
+
+def link_identities(
+    results: list[dict],
+    *,
+    sim_thres: float,
+    group_by: tuple[str, ...] = (CLASS_KEY,),
+    dim: int | None = None,
+    sim: torch.Tensor | None = None,
+    center: bool = False,
+    guard: str = "mean",
+    guard_factor: float = 1.0,
+    names: dict[int, str] | None = None,
+    aux_specs=None,
+    paths: list[str] | None = None,
+) -> dict:
+    """The whole linking of a set of photos' results (each with ``"embed"``): flatten, similarity (the cosine of the
+    embeddings, or ``sim`` ``(M, M)`` over the detections in photo order, e.g. the set matcher's), Hungarian per photo
+    pair within the gate groups, union-find with the merge guard, one record per identity. Stamps every result with
+    ``identity_ids`` ``(n,)`` and returns ``{"identity", "identities", "pairs", "origin", "sim", "diagnostics"}``
+    (:func:`flatten_instances`, :func:`pairwise_matches`, :func:`cluster`, :func:`summarize_identities`,
+    :func:`similarity_diagnostics`). ``group_by`` must be validated (:func:`validate_group_by`)."""
+    embed, photo, keys, origin = flatten_instances(results, group_by=group_by, dim=dim)
+    if sim is None:
+        sim = similarity_matrix(embed, center=center)
+    gate = gate_mask(photo, keys)
+    pairs = pairwise_matches(sim, photo, keys, sim_thres=sim_thres)
+    identity, pairs = cluster(pairs, sim, photo, num_instances=len(origin), sim_thres=sim_thres, guard=guard,
+                              guard_factor=guard_factor, gate=gate)
+    identities = summarize_identities(identity, origin, results, sim, names=names, aux_specs=aux_specs, paths=paths)
+    flat_of = {o: m for m, o in enumerate(origin)}
+    for i, res in enumerate(results):
+        n = int(res["num_detections"])
+        res["identity_ids"] = torch.tensor([int(identity[flat_of[(i, j)]]) for j in range(n)], dtype=torch.long)
+    return {"identity": identity, "identities": identities, "pairs": pairs, "origin": origin, "sim": sim,
+            "diagnostics": similarity_diagnostics(sim, gate, identity)}
 
 
 def similarity_diagnostics(
@@ -451,14 +505,12 @@ def similarity_diagnostics(
     the JSON than to squint at the grid.
     """
     s = sim.detach().cpu().numpy()
-    g = gate.detach().cpu().numpy()
-    ident = identity.tolist()
-    within, across = [], []
-    for a in range(len(ident)):
-        for b in range(a + 1, len(ident)):
-            if not g[a, b]:
-                continue
-            (within if ident[a] == ident[b] else across).append(float(s[a, b]))
+    g = gate.detach().cpu().numpy().astype(bool)
+    ident = identity.detach().cpu().numpy()
+    a, b = np.triu_indices(len(ident), 1)  # every pair once, vectorised
+    keep = g[a, b] if len(ident) else np.zeros(0, dtype=bool)
+    vals, same = s[a, b][keep], (ident[a] == ident[b])[keep]
+    within, across = vals[same].tolist(), vals[~same].tolist()
 
     def stats(v):
         if not v:

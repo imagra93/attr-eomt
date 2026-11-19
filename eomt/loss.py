@@ -11,16 +11,16 @@ A reimplementation of ``transformers.models.eomt.modeling_eomt``'s loss stack (`
   pixel against the logits bilinearly upsampled to the GT resolution (:func:`upsample_logits`, as inference reads
   them), so every instance is supervised however small; and the reference's BCE on 12,544 points, three quarters of
   them where the prediction is least certain (:func:`uncertain_points`), which concentrates it on the boundaries.
-* ``get_num_masks`` drops the ``accelerate`` all-reduce branch — training here is single-process (no
-  ``PartialState`` is initialised). Re-add a reduce if DDP is introduced.
+* ``get_num_masks`` counts the instances of this process's batch: on several GPUs each process normalises by its own
+  count (the reference all-reduces it), and DistributedDataParallel averages the gradients.
 * **Partial labels** (:mod:`eomt.data.subjects`). ``ignore_masks`` (one map per photo, 1 = leave out) spare the
   unmatched queries whose mask lies mostly inside an ignore region the "no object" class loss, and ``neg_weight`` (one
   value per photo) scales that loss for every unmatched query of the photo: 0 for a photo whose annotations list only
   some of its instances, so nothing unannotated is taught as background. Matched queries are untouched.
 
-The matcher is exposed as ``EoMTLoss.matcher`` with the exact
-``(masks_queries_logits, class_queries_logits, mask_labels, class_labels)`` -> list-of-(src, tgt) signature that
-:func:`eomt.aux_cls.match_queries` calls.
+The matcher is exposed as ``EoMTLoss.matcher`` with the ``(masks_queries_logits, class_queries_logits, mask_labels,
+class_labels)`` -> list-of-(src, tgt) signature that :func:`eomt.aux_cls.match_queries` calls; the loss also returns the
+matching it used.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ import torch.nn.functional as F  # noqa: N812
 from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 
-from .box_loss import box_cxcywh_to_xyxy, generalized_box_iou, masks_to_norm_boxes
 
 
 def upsample_logits(logits: Tensor, size) -> Tensor:
@@ -86,18 +85,29 @@ def pair_wise_sigmoid_cross_entropy_loss(inputs: Tensor, labels: Tensor) -> Tens
     return loss_pos + loss_neg
 
 
-def dice_loss(inputs: Tensor, labels: Tensor, num_masks: int) -> Tensor:
+def dice_loss(inputs: Tensor, labels: Tensor, num_masks) -> Tensor:
     probs = inputs.sigmoid().flatten(1)
     numerator = 2 * (probs * labels).sum(-1)
     denominator = probs.sum(-1) + labels.sum(-1)
-    loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss.sum() / num_masks
+    return (1 - (numerator + 1) / (denominator + 1)).sum() / num_masks
 
 
-def sigmoid_cross_entropy_loss(inputs: Tensor, labels: Tensor, num_masks: int) -> Tensor:
-    criterion = nn.BCEWithLogitsLoss(reduction="none")
-    cross_entropy_loss = criterion(inputs, labels)
-    return cross_entropy_loss.mean(1).sum() / num_masks
+def sigmoid_cross_entropy_loss(inputs: Tensor, labels: Tensor, num_masks) -> Tensor:
+    return F.binary_cross_entropy_with_logits(inputs, labels, reduction="none").mean(1).sum() / num_masks
+
+
+def solve_assignments(costs: list[Tensor]) -> list[tuple[Tensor, Tensor]]:
+    """Hungarian assignment of each cost matrix, with ONE device-to-host copy for all of them (one per image would wait
+    for the GPU once per image)."""
+    costs = [torch.nan_to_num(c.float().clamp(-1e10, 1e10), 0) for c in costs]
+    flat = torch.cat([c.flatten() for c in costs]).cpu().numpy() if costs else np.zeros(0)
+    out, at = [], 0
+    for c in costs:
+        n = c.numel()
+        i, j = linear_sum_assignment(flat[at:at + n].reshape(c.shape))
+        at += n
+        out.append((torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)))
+    return out
 
 
 class HungarianMatcher(nn.Module):
@@ -107,16 +117,10 @@ class HungarianMatcher(nn.Module):
     query. Scoring the masks at the GT resolution fixes that but nearly doubles the step (all queries x every pixel).
     """
 
-    def __init__(
-        self, cost_class: float = 1.0, cost_mask: float = 1.0, cost_dice: float = 1.0,
-        cost_bbox: float = 0.0, cost_giou: float = 0.0,
-    ):
+    def __init__(self, cost_class: float = 1.0, cost_mask: float = 1.0, cost_dice: float = 1.0):
         super().__init__()
         if cost_class == 0 and cost_mask == 0 and cost_dice == 0:
             raise ValueError("All costs can't be 0")
-        # Optional box terms (L1 + GIoU on normalized cxcywh): 0 = the original mask-only matcher.
-        self.cost_bbox = cost_bbox
-        self.cost_giou = cost_giou
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
@@ -128,69 +132,32 @@ class HungarianMatcher(nn.Module):
         class_queries_logits: Tensor,
         mask_labels: list[Tensor],
         class_labels: list[Tensor],
-        pred_boxes: Tensor | None = None,
-        box_labels: list[Tensor] | None = None,
     ) -> list[tuple[Tensor, Tensor]]:
-        """``pred_boxes`` ``(B, Q, 4)`` (normalized cxcywh) adds an L1 + GIoU term to the cost; the GT boxes are
-        ``box_labels`` or, when omitted, the tight boxes of ``mask_labels``."""
-        indices: list[tuple[np.ndarray, np.ndarray]] = []
-        batch_size = masks_queries_logits.shape[0]
         grid = masks_queries_logits.shape[-2:]
-        for i in range(batch_size):
-            pred_probs = class_queries_logits[i].softmax(-1)
+        costs = []
+        for i in range(masks_queries_logits.shape[0]):
+            pred_probs = class_queries_logits[i].float().softmax(-1)
             cost_class = -pred_probs[:, class_labels[i]]
             pred_mask = masks_queries_logits[i].flatten(1).float()  # [Q, cells]
             target_mask = grid_targets(mask_labels[i], grid).flatten(1).to(pred_mask)  # [G, cells]
-
             cost_mask = pair_wise_sigmoid_cross_entropy_loss(pred_mask, target_mask)
             cost_dice = pair_wise_dice_loss(pred_mask, target_mask)
-            cost_matrix = self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice
-            if pred_boxes is not None and (self.cost_bbox or self.cost_giou) and mask_labels[i].shape[0] > 0:
-                tgt_boxes = (box_labels[i] if box_labels is not None else masks_to_norm_boxes(mask_labels[i])).to(
-                    device=pred_boxes.device, dtype=torch.float32
-                )
-                out_boxes = pred_boxes[i].float()
-                cost_matrix = (
-                    cost_matrix
-                    + self.cost_bbox * torch.cdist(out_boxes, tgt_boxes, p=1)
-                    - self.cost_giou * generalized_box_iou(box_cxcywh_to_xyxy(out_boxes), box_cxcywh_to_xyxy(tgt_boxes))
-                )
-            cost_matrix = torch.minimum(cost_matrix, torch.tensor(1e10))
-            cost_matrix = torch.maximum(cost_matrix, torch.tensor(-1e10))
-            cost_matrix = torch.nan_to_num(cost_matrix, 0)
-            indices.append(linear_sum_assignment(cost_matrix.cpu()))
-
-        return [
-            (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
-            for i, j in indices
-        ]
+            costs.append(self.cost_mask * cost_mask + self.cost_class * cost_class + self.cost_dice * cost_dice)
+        return solve_assignments(costs)
 
 
 class EoMTLoss(nn.Module):
     """EoMT mask-classification loss (class CE + mask BCE + dice on the logit grid)."""
 
-    def __init__(self, config, weight_dict: dict[str, float]):
+    def __init__(self, config):
         super().__init__()
         self.num_labels = config.num_labels
-        self.weight_dict = weight_dict
-
         self.eos_coef = config.no_object_weight
         empty_weight = torch.ones(self.num_labels + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
-
-        # Auxiliary box head (instance family): L1 + GIoU on the matched queries, and the same two terms in
-        # the matching cost. Off unless ``config.aux_box_head`` is set.
-        self.use_boxes = bool(getattr(config, "aux_box_head", False))
-        self.l1_weight = float(getattr(config, "l1_weight", 5.0)) if self.use_boxes else 0.0
-        self.giou_weight = float(getattr(config, "giou_weight", 2.0)) if self.use_boxes else 0.0
-
         self.matcher = HungarianMatcher(
-            cost_class=config.class_weight,
-            cost_dice=config.dice_weight,
-            cost_mask=config.mask_weight,
-            cost_bbox=self.l1_weight,
-            cost_giou=self.giou_weight,
+            cost_class=config.class_weight, cost_dice=config.dice_weight, cost_mask=config.mask_weight
         )
         # IoU-aware class targets: a matched query's class target is (1 + IoU) / 2 of its mask instead of 1, so the score
         # ranks masks by quality; above 0.5, so a matched query stays classified as its GT class (the attribute gate).
@@ -285,20 +252,6 @@ class EoMTLoss(nn.Module):
             "loss_dice": dice_loss(pred_masks, target_masks.flatten(1).to(pred_masks), num_masks),
         }
 
-    def loss_boxes(self, pred_boxes, box_labels, indices, num_boxes) -> dict[str, Tensor]:
-        """Box L1 + GIoU on the matched queries (normalized cxcywh)."""
-        idx = self._get_predictions_permutation_indices(indices)
-        src = pred_boxes[idx].float()
-        tgt = torch.cat([t[j.to(t.device)] for t, (_, j) in zip(box_labels, indices)]).to(src)
-        if src.numel() == 0:  # no matched query this batch: keep the graph alive
-            zero = pred_boxes.sum() * 0.0
-            return {"loss_bbox": zero, "loss_giou": zero}
-        giou = generalized_box_iou(box_cxcywh_to_xyxy(src), box_cxcywh_to_xyxy(tgt)).diagonal()
-        return {
-            "loss_bbox": F.l1_loss(src, tgt, reduction="sum") / num_boxes,
-            "loss_giou": (1 - giou).sum() / num_boxes,
-        }
-
     def _get_predictions_permutation_indices(self, indices):
         batch_indices = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         predictions_indices = torch.cat([src for (src, _) in indices])
@@ -310,26 +263,16 @@ class EoMTLoss(nn.Module):
         class_queries_logits: Tensor,
         mask_labels: list[Tensor],
         class_labels: list[Tensor],
-        auxiliary_predictions: dict[str, Tensor] | None = None,
-        pred_boxes: Tensor | None = None,
-        box_labels: list[Tensor] | None = None,
         pred_quality: Tensor | None = None,
         ignore_masks: list[Tensor | None] | None = None,
         neg_weight: Tensor | None = None,
-    ) -> dict[str, Tensor]:
-        """``pred_boxes`` (with the model built with ``aux_box_head``) adds the box terms to the matching and the loss.
+    ) -> tuple[dict[str, Tensor], list[tuple[Tensor, Tensor]]]:
+        """``(losses, indices)``: the unweighted loss terms and the query->target matching they used.
         ``pred_quality`` ``(B, Q)`` (mask-quality logits) adds ``loss_quality``: BCE of the matched queries' predicted
         against their measured mask IoU (Mask Scoring R-CNN); it does not enter the matching. ``ignore_masks`` and
-        ``neg_weight`` leave unannotated regions and partly annotated photos out of the "no object" loss (see the
-        module docstring).
-        """
-        use_boxes = self.use_boxes and pred_boxes is not None
-        if use_boxes and box_labels is None:
-            box_labels = [masks_to_norm_boxes(m) for m in mask_labels]
-        indices = self.matcher(
-            masks_queries_logits, class_queries_logits, mask_labels, class_labels,
-            pred_boxes=pred_boxes if use_boxes else None, box_labels=box_labels if use_boxes else None,
-        )
+        ``neg_weight`` leave unannotated regions and partly annotated photos out of the "no object" loss (see the module
+        docstring)."""
+        indices = self.matcher(masks_queries_logits, class_queries_logits, mask_labels, class_labels)
         num_masks = self.get_num_masks(class_labels, device=class_labels[0].device)
         quality = self.matched_iou(masks_queries_logits, mask_labels, indices) if self.iou_aware_cls else None
         negatives = self.negative_weights(masks_queries_logits, ignore_masks, neg_weight)
@@ -337,8 +280,6 @@ class EoMTLoss(nn.Module):
             **self.loss_masks(masks_queries_logits, mask_labels, indices, num_masks),
             **self.loss_labels(class_queries_logits, class_labels, indices, quality, negatives),
         }
-        if use_boxes:
-            losses.update(self.loss_boxes(pred_boxes, box_labels, indices, num_masks))
         if pred_quality is not None:
             iou = quality if quality is not None else self.matched_iou(masks_queries_logits, mask_labels, indices)
             pred = pred_quality[self._get_predictions_permutation_indices(indices)].float()
@@ -346,16 +287,7 @@ class EoMTLoss(nn.Module):
                 F.binary_cross_entropy_with_logits(pred, iou.to(pred), reduction="sum") / num_masks
                 if pred.numel() else pred_quality.sum() * 0.0
             )
-        if auxiliary_predictions is not None:
-            for idx, aux_outputs in enumerate(auxiliary_predictions):
-                loss_dict = self.forward(
-                    aux_outputs["masks_queries_logits"],
-                    aux_outputs["class_queries_logits"],
-                    mask_labels,
-                    class_labels,
-                )
-                losses.update({f"{k}_{idx}": v for k, v in loss_dict.items()})
-        return losses
+        return losses, indices
 
     def get_num_masks(self, class_labels, device) -> Tensor:
         num_masks = sum(len(classes) for classes in class_labels)

@@ -75,14 +75,12 @@ def test_train_with_a_regression_head_then_predict_real_values(tmp_path):
 
     img_dir, jf = _with_cost(tmp_path)
     res = train(train_images=str(img_dir), train_json=str(jf), val_images=str(img_dir), val_json=str(jf), size="s",
-                imgsz=112, epochs=1, batch=1, accum=1, workers=0, device="cpu", amp=False, pretrained=False, ema=False,
-                seed=0, project=str(tmp_path / "runs"), name="r", warmup_steps=(1, 1), aux_iou_gate=0.0,
-                aux_class_gate=False, aux_class_weights=True, aux_balance="uncertainty")
+                imgsz=112, epochs=1, batch=1, nominal_batch=1, workers=0, device="cpu", amp=False, pretrained=False,
+                seed=0, project=str(tmp_path / "runs"), name="r", optim={"ema": False, "warmup_steps": (1, 1)},
+                aux={"iou_gate": 0.0, "class_gate": False, "class_weights": True})
     row = next(csv.DictReader(open(tmp_path / "runs" / "r" / "metrics.csv")))
     assert "train/aux_acc/kind" in row and "val/aux_acc/kind" in row
     assert math.isfinite(float(row["train/aux_mae/cost"])) and math.isfinite(float(row["val/aux_mae/cost"]))
-    assert float(row["train/aux_grad/cost"]) > 0 and float(row["train/aux_grad/kind"]) > 0
-    assert set(torch.load(res["last"], weights_only=False)["aux_log_vars"]) == {"kind", "cost"}
 
     model = load_model(res["last"], device="cpu")
     cost = model.aux_specs[1]
@@ -236,3 +234,20 @@ def test_metric_plots_show_each_regression_head_as_its_mae(tmp_path, monkeypatch
     assert acc.get_title() == "aux 'kind' accuracy by primary class" and acc.get_ylim()[1] == 1.08
     assert mae.get_title() == "aux 'cost' mean absolute error by primary class"
     assert [b.get_height() for b in mae.patches] == [25.0, 10.0] and mae.get_ylim()[1] > 25.0
+
+
+def test_regression_metrics_weigh_every_instance_alike_and_report_buckets():
+    from eomt.config import AuxHeadSpec
+    from eomt.engine.validate import attr_metric_names, regression_metrics
+
+    spec = AuxHeadSpec("surface", 1, regression=True, log=True, bins=(10, 35))
+    gt = torch.tensor([5.0, 20.0, 100.0])
+    pred = torch.tensor([10.0, 20.0, 50.0])  # x2 on the small one, exact, /2 on the large one
+    m = regression_metrics(spec, pred, gt)
+    assert set(m) == set(attr_metric_names(spec))
+    assert m["aux_mae/surface"] == pytest.approx(55 / 3)  # dominated by the large instance
+    assert m["aux_ratio/surface"] == pytest.approx(1.0)  # the median ratio
+    assert m["aux_mae/surface@<10"] == pytest.approx(5.0) and m["aux_ratio/surface@>=35"] == pytest.approx(0.5)
+    assert m["aux_logmae/surface@10-35"] == pytest.approx(0.0)
+    plain = regression_metrics(AuxHeadSpec("cost", 1, regression=True), pred, gt)
+    assert set(plain) == {"aux_mae/cost"}  # log-space metrics for a log head only

@@ -29,11 +29,8 @@ def match_queries(model, out: dict, geom_labels, class_labels):
     """
     if "pred_boxes" in out:  # detect family
         return model.eomt.criterion.matcher(out["pred_boxes"], out["class_queries_logits"], geom_labels, class_labels)
-    # Instance family; with the auxiliary box head the matcher also uses the box cost, as the loss did.
-    boxes = {"pred_boxes": out["aux_boxes"]} if out.get("aux_boxes") is not None else {}
-    return model.eomt.criterion.matcher(
-        out["masks_queries_logits"], out["class_queries_logits"], geom_labels, class_labels, **boxes
-    )
+    return model.eomt.criterion.matcher(out["masks_queries_logits"], out["class_queries_logits"], geom_labels,
+                                        class_labels)
 
 
 def _gather_matched(out: dict, indices):
@@ -117,12 +114,6 @@ def _localization_iou(out, b, src, tgt, geom_labels, is_detect, dev):
     return inter / union
 
 
-def _density_weights(bins, z: torch.Tensor) -> torch.Tensor:
-    """Per-sample weight of standardized regression targets ``z`` from ``bins = (edges, weights)``."""
-    edges, w = (t.to(z.device, z.dtype) for t in bins)
-    return w[torch.bucketize(z, edges[1:-1])]
-
-
 def aux_loss(
     model,
     out: dict,
@@ -133,21 +124,18 @@ def aux_loss(
     *,
     indices=None,
     class_weights: dict | None = None,
-    log_vars=None,
     ignore_index: int = -100,
+    stats: dict | None = None,
 ):
     """Weighted sum of per-attribute losses over matched queries: CE, or Huber for a regression head.
 
-    ``aux_labels`` maps head name → per-image label tensors (line-aligned with
-    ``class_labels``). Labels equal to ``ignore_index`` (missing / out-of-vocab
-    attributes; NaN for a regression head) are skipped — they contribute no loss instead of being trained as
-    class 0. ``weights`` scales each head; ``class_weights`` optionally re-weights
-    classes within a head (imbalance), or, for a regression head, its values by density (``(edges, weights)``
-    over the standardized values). ``log_vars`` (``{name: scalar parameter s}``) turns on uncertainty weighting
-    (Kendall et al., 2018): each head contributes ``exp(-s) * loss + s``, so ``exp(-s)`` is a learned weight.
-    Pass ``indices`` to reuse a matching already
-    computed this step (avoids re-running the Hungarian matcher). Returns
-    ``(total_loss, {name: per_head_loss})``, the per-head losses unweighted.
+    ``aux_labels`` maps head name → per-image label tensors (line-aligned with ``class_labels``). Labels equal to
+    ``ignore_index`` (missing / out-of-vocab attributes; NaN for a regression head) are skipped — they contribute no
+    loss instead of being trained as class 0. ``weights`` scales each head; ``class_weights`` optionally re-weights the
+    classes within a categorical head (imbalance). Pass ``indices`` to reuse a matching already computed this step.
+    ``stats`` (a dict) receives per head ``(correct, counted)`` as device tensors (no host sync; for a regression head
+    the summed absolute error in real units instead of ``correct``), from the same logits.
+    Returns ``(total_loss, {name: per_head_loss})``, the per-head losses unweighted.
     """
     if indices is None:
         indices = match_queries(model, out, mask_labels, class_labels)
@@ -164,87 +152,84 @@ def aux_loss(
     for name, head in model.aux_heads.items():
         logits = head(matched)  # [N, ns]
         gt = torch.cat([aux_labels[name][b][tgt] for (b, tgt) in batch_tgt]).to(logits.device)
-        cw = class_weights.get(name)
         if specs[name].regression:
             valid = ~gt.isnan()
             if valid.any():
                 z = specs[name].encode(gt[valid].float())
-                err = F.huber_loss(logits[valid, 0].float(), z, delta=1.0, reduction="none")
-                sw = _density_weights(cw, z) if cw is not None else None
-                loss = (err * sw).sum() / sw.sum() if sw is not None else err.mean()
+                loss = F.huber_loss(logits[valid, 0].float(), z, delta=1.0)
             else:  # every matched value ignored — keep the graph alive with a zero
                 loss = logits.sum() * 0.0
         elif (gt != ignore_index).any():
-            if cw is not None:
-                cw = cw.to(logits.device, logits.dtype)
-            loss = F.cross_entropy(logits, gt, weight=cw, ignore_index=ignore_index)
+            cw = class_weights.get(name)
+            loss = F.cross_entropy(logits, gt, weight=None if cw is None else cw.to(logits.device, logits.dtype),
+                                   ignore_index=ignore_index)
         else:  # every matched label ignored — keep the graph alive with a zero
             loss = logits.sum() * 0.0
         per_head[name] = loss
+        if stats is not None:
+            with torch.no_grad():
+                hit, valid = _hits(specs[name], logits, aux_labels[name], batch_tgt, ignore_index)
+                stats[name] = (hit.float().sum(), valid.sum())
         w = float(weights.get(name, 1.0))
-        if log_vars is not None:
-            loss = torch.exp(-log_vars[name]) * loss + log_vars[name]
         total = w * loss if total is None else total + w * loss
     return total, per_head
 
 
-def match_loss(out: dict, indices, inst_ids: list[torch.Tensor], set_ids: torch.Tensor, tau: float = 0.1):
-    """Contrastive loss of the matching head (``out["match_embed"]``) over the matched queries of each set of photos.
-
-    Two matched queries are positives when their targets carry the same instance id in two different photos of a set;
-    every other matched query of the set (in any of its photos) is a negative. Each query with a positive is an anchor:
-    ``-log`` of the softmax mass (temperature ``tau``) its positives take among all its candidates (supervised InfoNCE).
-    ``indices`` is the query->target matching (gated as for the attribute heads); returns 0 when nothing pairs up.
-    Targets with a negative id (another photo of the subject, which of its instances are which unknown,
-    :data:`eomt.data.sets.UNKNOWN_IDS`) are neither anchors nor candidates.
-    """
-    emb = out["match_embed"]
-    feats, ids, photo, sets = [], [], [], []
+def xview_attention_loss(model, out: dict, indices, inst_ids: list[torch.Tensor], mask_labels: list[torch.Tensor],
+                         grid: tuple[int, int]) -> torch.Tensor:
+    """Where the queries look in the other photos of their set (``out["xview_attn"]``, a forward with
+    ``keep_xview_attn=True``): for each query matched (``indices``) to an instance of known id that another photo of
+    the set shows, in every cross-view sublayer, ``-log`` of the attention (averaged over the heads) it puts on that
+    instance in the other photos: the patches under its mask there (``mask_labels``, at the input size) and the query
+    matched to it there. The mean over those queries and sublayers; 0 when no instance is shown by two photos."""
+    cache = out.get("xview_attn") or []
+    zero = out["query_embed"].sum() * 0.0
+    if not cache:
+        return zero
+    nq = model.config.num_queries
+    start = nq + model.eomt.embeddings.num_prefix_tokens
+    query_of, target_of = {}, {}  # (photo, id) -> its matched query / its target
     for b, (src, tgt) in enumerate(indices):
-        if src.numel():
-            feats.append(emb[b, src])
-            ids.append(inst_ids[b].to(emb.device)[tgt])
-            photo.append(torch.full_like(src, b, device=emb.device))
-            sets.append(torch.full_like(src, int(set_ids[b]), device=emb.device))
-    if not feats:
-        return emb.sum() * 0.0
-    f, ids, photo, sets = torch.cat(feats), torch.cat(ids), torch.cat(photo), torch.cat(sets)
-    known = ids >= 0
-    if not known.any():
-        return emb.sum() * 0.0
-    f, ids, photo, sets = f[known], ids[known], photo[known], sets[known]
-    sim = (f @ f.T) / tau
-    cand = (sets[:, None] == sets[None]) & ~torch.eye(len(f), dtype=torch.bool, device=f.device)
-    pos = cand & (ids[:, None] == ids[None]) & (photo[:, None] != photo[None])
-    anchors = pos.any(1)
-    if not anchors.any():
-        return emb.sum() * 0.0
-    sim, cand, pos = sim[anchors], cand[anchors], pos[anchors]
-    neg_inf = torch.finfo(sim.dtype).min
-    return (sim.masked_fill(~cand, neg_inf).logsumexp(1) - sim.masked_fill(~pos, neg_inf).logsumexp(1)).mean()
+        ids = inst_ids[b].tolist()
+        for t, i in enumerate(ids):
+            if i >= 0:
+                target_of[(b, i)] = t
+        for s_, t_ in zip(src.tolist(), tgt.tolist()):
+            if ids[t_] >= 0:
+                query_of[(b, ids[t_])] = s_
+    patches: dict = {}
 
+    def patch_mask(b: int, t: int) -> torch.Tensor:
+        if (b, t) not in patches:
+            m = mask_labels[b][t].float()[None, None]
+            patches[(b, t)] = (F.adaptive_max_pool2d(m, grid) > 0.5).flatten()
+        return patches[(b, t)]
 
-def harm_loss(out: dict, alone: dict, indices, class_labels: list[torch.Tensor], set_ids: torch.Tensor):
-    """Do-no-harm loss of the cross-view post-training: how much predicting a photo with the other photos of its set
-    lowers the probability of a true instance's class below predicting it alone, hinged at 0 (the others may raise it,
-    never lower it). ``alone`` is the forward of the same photos each in its own set (with the checkpoint frozen, its
-    own prediction); ``indices`` the query->target matching of ``out``. Mean over the matched queries of the photos in
-    sets of several; 0 when there are none.
-
-    NOTE: what is lost to a lowered true instance downstream (an FP filter can drop false detections, not bring back a
-    true one) is not what is gained by a lowered false one, so only the true instances are held to their score alone.
-    """
-    sizes = torch.bincount(set_ids.cpu())
-    drops = []
-    for b, (src, tgt) in enumerate(indices):
-        if src.numel() and sizes[int(set_ids[b])] > 1:
-            cls = class_labels[b][tgt.to(class_labels[b].device)].to(out["class_queries_logits"].device)[:, None]
-            p = out["class_queries_logits"][b, src].float().softmax(-1).gather(1, cls)[:, 0]
-            p_alone = alone["class_queries_logits"][b, src].float().softmax(-1).gather(1, cls)[:, 0]
-            drops.append((p_alone - p).clamp(min=0))
-    if not drops:
-        return out["class_queries_logits"].sum() * 0.0
-    return torch.cat(drops).mean()
+    terms = []
+    for entry in cache:  # one per cross-view sublayer and set
+        idx, q, k, others, n = entry["idx"].tolist(), entry["q"], entry["k"], entry["others"].tolist(), entry["tokens"]
+        for vi, b in enumerate(idx):
+            rows, wanted = [], []
+            for (bb, iid), s_ in query_of.items():
+                if bb != b:
+                    continue
+                keys = torch.zeros(len(others[vi]) * n, dtype=torch.bool, device=k.device)
+                for oi, j in enumerate(others[vi]):
+                    bj = idx[j]
+                    if (bj, iid) not in target_of:
+                        continue
+                    keys[oi * n + start: (oi + 1) * n] = patch_mask(bj, target_of[(bj, iid)]).to(k.device)
+                    if (bj, iid) in query_of:
+                        keys[oi * n + query_of[(bj, iid)]] = True
+                if keys.any():
+                    rows.append(s_)
+                    wanted.append(keys)
+            if rows:
+                qr = q[vi][:, rows].float()  # [h, R, dh]
+                attn = (qr @ k[vi].float().transpose(-1, -2) * qr.shape[-1] ** -0.5).softmax(-1).mean(0)  # [R, keys]
+                mass = (attn * torch.stack(wanted).float()).sum(-1)
+                terms.append(-torch.log(mass.clamp_min(1e-6)))
+    return torch.cat(terms).mean() if terms else zero
 
 
 @torch.no_grad()
@@ -274,6 +259,25 @@ def aux_accuracy(
     for name, head in model.aux_heads.items():
         hit, valid = _hits(specs[name], head(matched), aux_labels[name], batch_tgt, ignore_index)
         res[name] = (hit.sum().item() if specs[name].regression else int(hit.sum()), int(valid.sum()))
+    return res
+
+
+@torch.no_grad()
+def aux_regression_pairs(model, out: dict, aux_labels: dict[str, list[torch.Tensor]], indices):
+    """``{head: (predictions, GT values)}`` of every regression head over the matched queries ``indices`` with a valid
+    GT value, in real units, on the CPU (for :func:`eomt.engine.validate.regression_metrics`)."""
+    matched, batch_tgt = _gather_matched(out, indices)
+    res = {}
+    for spec in model.aux_specs:
+        if not spec.regression:
+            continue
+        if matched is None:
+            res[spec.name] = (torch.zeros(0), torch.zeros(0))
+            continue
+        gt = torch.cat([aux_labels[spec.name][b][tgt] for (b, tgt) in batch_tgt]).to(matched.device).float()
+        valid = ~gt.isnan()
+        pred = spec.decode(model.aux_heads[spec.name](matched)[:, 0].float())
+        res[spec.name] = (pred[valid].cpu(), gt[valid].cpu())
     return res
 
 

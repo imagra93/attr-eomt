@@ -30,7 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
-from .box_loss import DetectionLoss, masks_to_norm_boxes
+from ._log import LOG
+from .box_loss import DetectionLoss
 from .config import (
     DEFAULT_IMAGE_SIZE,
     EOMT_CONFIGS,
@@ -40,6 +41,7 @@ from .config import (
     normalize_loss_weights,
 )
 from .loss import EoMTLoss
+from .matcher import DEFAULT_MATCHER, SetMatcher
 from .preprocess import IMAGENET_MEAN, IMAGENET_STD
 
 #: Supported task families. ``"instance"`` is the original mask-classification head;
@@ -64,9 +66,10 @@ class EoMTOutput:
     class_queries_logits: torch.Tensor | None = None
     masks_queries_logits: torch.Tensor | None = None
     pred_boxes: torch.Tensor | None = None
-    aux_boxes: torch.Tensor | None = None  # instance family: boxes of the auxiliary box head (normalized cxcywh)
     quality_logits: torch.Tensor | None = None  # instance family: predicted mask IoU (logits) of the quality head
     last_hidden_state: torch.Tensor | None = None
+    indices: list | None = None  # training: the final prediction's query -> target matching
+    xview_attn: list | None = None  # keep_xview_attn: per cross-view sublayer and set, its query rows and keys
 
 
 def _act(name: str):
@@ -422,112 +425,81 @@ def _set_groups(set_ids, device) -> list[torch.Tensor]:
 
 
 class CrossViewAttention(nn.Module):
-    """Cross-view sublayer (level 2), applied after a query block: the queries of each photo attend to
-    every token of the OTHER photos of its set — their patches (local evidence: a clearer view of an instance) and
-    their queries (the instances forming there) — plus a null token with a zero value, so that a query with nothing
-    to take from the others abstains.
+    """Cross-view sublayer, applied after a query block: the queries of each photo, and its patch tokens pooled
+    ``pool`` x ``pool``, attend to every token of the OTHER photos of its set (their patches: local evidence, a clearer
+    view of an instance; their queries: the instances forming there).
 
-    The patches of a photo never look outside it, so its masks still cover only what it shows; the evidence from the
-    other photos enters through the queries and reaches the patches in the next block's self-attention. Starts as a
-    copy of the block's own attention (:meth:`init_from`: from the first step a query looks in another photo for what
-    it looks for in its own) behind a LayerScale of ``init_scale``, so it starts as the identity.
+    What each row takes is gated per head by ``tanh(W x + b)`` of the row itself (``W``, ``b`` start at 0, so the
+    sublayer starts as the identity and each query learns how much, and when, to use the other photos). The pooled
+    patch rows have their own gate; their update is spread back over the patches they pool, so the evidence of the
+    other photos reaches the mask features directly and a photo's masks can sharpen where another photo sees better.
+    The attention starts as a copy of the block's own (:meth:`init_from`): from the first step a query looks in another
+    photo for what it looks for in its own.
+
+    One attention call per set, with each photo's keys being the tokens of the others. Optionally (``cache``) each
+    set's query rows and keys are kept, for the loss that supervises where the queries look
+    (:func:`eomt.aux_cls.xview_attention_loss`).
     """
 
-    def __init__(self, config, init_scale: float = 1e-5, null_logit: float = 4.0):
+    def __init__(self, config, *, patches: bool = True, pool: int = 2):
         super().__init__()
+        h = config.num_attention_heads
+        self.patches = bool(patches)
+        self.pool = int(pool)
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = Attention(config)
-        self.null_key = nn.Parameter(torch.zeros(config.hidden_size))  # in key space (after k_proj)
-        self.null_logit = nn.Parameter(torch.full((config.num_attention_heads,), float(null_logit)))
-        self.layer_scale = nn.Parameter(torch.full((config.hidden_size,), float(init_scale)))
+        self.attention.out_proj.register_parameter("bias", None)  # a closed gate adds nothing, not even a bias
+        self.gate = nn.Linear(config.hidden_size, h)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+        if self.patches:
+            self.patch_gate = nn.Linear(config.hidden_size, h)
+            nn.init.zeros_(self.patch_gate.weight)
+            nn.init.zeros_(self.patch_gate.bias)
 
     @torch.no_grad()
     def init_from(self, block: "Layer") -> None:
         self.norm.load_state_dict(block.norm1.state_dict())
-        self.attention.load_state_dict(block.attention.state_dict())
+        self.attention.load_state_dict({k: v for k, v in block.attention.state_dict().items() if k != "out_proj.bias"})
 
-    def forward(self, hidden_states: torch.Tensor, groups: list[torch.Tensor], num_queries: int) -> torch.Tensor:
-        a = self.attention
+    def forward(self, hidden_states: torch.Tensor, groups: list[torch.Tensor], num_queries: int, num_prefix: int,
+                grid: tuple[int, int], cache: list | None = None) -> torch.Tensor:
+        a, nq = self.attention, num_queries
         h, dh, d = a.num_heads, a.head_dim, a.embed_dim
-        rows = list(hidden_states[:, :num_queries].unbind(0))
+        n = hidden_states.shape[1]
+        start = nq + num_prefix  # the first patch token
+        queries, patches = hidden_states[:, :nq], hidden_states[:, start:]
         for idx in groups:
+            v_n = len(idx)
             x = self.norm(hidden_states[idx])  # [V, N, D]: every token of the set's photos
-            q, k, v = a.q_proj(x[:, :num_queries]), a.k_proj(x), a.v_proj(x)
-            for i in range(len(idx)):
-                others = [j for j in range(len(idx)) if j != i]
-                kk = torch.cat([k[others].reshape(-1, d), self.null_key.to(k.dtype)[None]])
-                vv = torch.cat([v[others].reshape(-1, d), v.new_zeros(1, d)])
-                n = kk.shape[0]
-                qh = q[i].view(-1, h, dh).transpose(0, 1)[None]  # [1, h, Q, dh]
-                bias = torch.cat([qh.new_zeros(h, 1, n - 1), self.null_logit.to(qh.dtype).view(h, 1, 1)], -1)
-                out = F.scaled_dot_product_attention(
-                    qh, kk.view(n, h, dh).transpose(0, 1)[None], vv.view(n, h, dh).transpose(0, 1)[None],
-                    attn_mask=bias[None], scale=a.scale,
-                )
-                b = int(idx[i])
-                rows[b] = rows[b] + self.layer_scale * a.out_proj(out[0].transpose(0, 1).reshape(-1, d))
-        return torch.cat((torch.stack(rows), hidden_states[:, num_queries:]), dim=1)
+            k = a.k_proj(x).view(v_n, n, h, dh)
+            v = a.v_proj(x).view(v_n, n, h, dh)
+            others = torch.tensor([[j for j in range(v_n) if j != i] for i in range(v_n)], device=x.device)
+            kk = k[others].reshape(v_n, (v_n - 1) * n, h, dh).transpose(1, 2)  # [V, h, (V-1) N, dh]
+            vv = v[others].reshape(v_n, (v_n - 1) * n, h, dh).transpose(1, 2)
+            rows = x[:, :nq]
+            if self.patches:
+                pooled = F.avg_pool2d(x[:, start:].transpose(1, 2).reshape(v_n, d, *grid), self.pool, ceil_mode=True)
+                pgrid = pooled.shape[-2:]
+                rows = torch.cat((rows, pooled.flatten(2).transpose(1, 2)), dim=1)  # [V, Q + P, D]
+            qh = a.q_proj(rows).view(v_n, rows.shape[1], h, dh).transpose(1, 2)  # [V, h, R, dh]
+            out = F.scaled_dot_product_attention(qh, kk, vv, scale=a.scale)  # [V, h, R, dh]
+            if cache is not None:
+                cache.append({"idx": idx, "q": qh[:, :, :nq], "k": kk, "others": others, "tokens": n})
+            gate = torch.tanh(self.gate(rows[:, :nq])).transpose(1, 2)[..., None]  # [V, h, Q, 1]
+            upd = a.out_proj((out[:, :, :nq] * gate).transpose(1, 2).reshape(v_n, nq, d))
+            queries = queries.index_add(0, idx, upd.to(queries.dtype))
+            if self.patches:
+                pgate = torch.tanh(self.patch_gate(rows[:, nq:])).transpose(1, 2)[..., None]  # [V, h, P, 1]
+                pupd = a.out_proj((out[:, :, nq:] * pgate).transpose(1, 2).reshape(v_n, -1, d))
+                pupd = F.interpolate(pupd.transpose(1, 2).reshape(v_n, d, *pgrid), size=grid, mode="nearest")
+                patches = patches.index_add(0, idx, pupd.flatten(2).transpose(1, 2).to(patches.dtype))
+        return torch.cat((queries, hidden_states[:, nq:start], patches), dim=1)
 
 
-class _RefinerBlock(nn.Module):
-    """One block of :class:`CrossViewRefiner`: attention to the queries of the other photos, then an MLP."""
-
-    def __init__(self, dim: int, heads: int, init_scale: float, null_logit: float):
-        super().__init__()
-        self.h, self.dh = heads, dim // heads
-        self.norm = nn.LayerNorm(dim)
-        self.q, self.k, self.v, self.o = (nn.Linear(dim, dim) for _ in range(4))
-        for lin in (self.q, self.k):  # Q = K = identity: the logit starts as sqrt(dh) x cosine, re-ID's similarity
-            nn.init.eye_(lin.weight)
-            nn.init.zeros_(lin.bias)
-        self.null_key = nn.Parameter(torch.zeros(dim))
-        self.null_logit = nn.Parameter(torch.full((heads,), float(null_logit)))
-        self.ls1 = nn.Parameter(torch.full((dim,), float(init_scale)))
-        self.mlp = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
-        self.ls2 = nn.Parameter(torch.full((dim,), float(init_scale)))
-
-    def forward(self, x: torch.Tensor, view: torch.Tensor, key_bias: torch.Tensor) -> torch.Tensor:
-        m = x.shape[0]
-        split = lambda t: t.view(-1, self.h, self.dh).transpose(0, 1)  # noqa: E731 - [h, L, dh]
-        n = self.norm(x)
-        q, k, v = split(self.q(n)), split(self.k(n)), split(self.v(n))
-        k = torch.cat([k, self.null_key.to(k.dtype).view(self.h, 1, self.dh)], 1)
-        v = torch.cat([v, v.new_zeros(self.h, 1, self.dh)], 1)  # the null token brings nothing
-        bias = key_bias.to(q.dtype)[None].expand(m, m).masked_fill(view[:, None] == view[None], float("-inf"))
-        bias = torch.cat([bias.expand(self.h, m, m), self.null_logit.to(q.dtype).view(-1, 1, 1).expand(-1, m, 1)], 2)
-        out = F.scaled_dot_product_attention(q[None], k[None], v[None], attn_mask=bias[None])[0]
-        x = x + self.ls1 * self.o(out.transpose(0, 1).reshape(m, -1))
-        return x + self.ls2 * self.mlp(x)
-
-
-class CrossViewRefiner(nn.Module):
-    """Label refiner (level 1; the baseline of :class:`CrossViewAttention`): between the final queries
-    and the class / attribute heads, each query attends to the final queries of the OTHER photos of its set — keys
-    biased by ``log p(object)`` so the "no object" queries are barely looked at, plus a null token — and corrects its
-    embedding. The masks keep reading the original queries, so only the labels can change. Identity at init
-    (LayerScale ``init_scale``) and exactly the identity for a photo alone in its set.
-    """
-
-    def __init__(self, dim: int, layers: int = 2, heads: int = 8, init_scale: float = 1e-5, null_logit: float = 4.0):
-        super().__init__()
-        self.blocks = nn.ModuleList(_RefinerBlock(dim, heads, init_scale, null_logit) for _ in range(layers))
-
-    def forward(self, emb: torch.Tensor, groups: list[torch.Tensor], obj_logprob: torch.Tensor) -> torch.Tensor:
-        rows = list(emb.unbind(0))
-        for idx in groups:
-            v, q = len(idx), emb.shape[1]
-            x = emb[idx].reshape(v * q, -1)
-            view = torch.arange(v, device=emb.device).repeat_interleave(q)
-            for blk in self.blocks:
-                x = blk(x, view, obj_logprob[idx].reshape(-1))
-            for i, b in enumerate(idx.tolist()):
-                rows[b] = x[i * q:(i + 1) * q]
-        return torch.stack(rows)
-
-
-#: Cross-view settings (``EoMTModel(xview=...)``, saved in the checkpoint): ``mode`` "blocks" (level 2) or "refiner"
-#: (level 1), the starting LayerScale and null-token logit, the refiner's depth / heads, and the most photos per set.
-DEFAULT_XVIEW: dict = {"mode": "blocks", "init_scale": 1e-5, "null_logit": 4.0, "layers": 2, "heads": 8, "max_views": 4}
+#: Cross-view settings (``EoMTModel(xview=...)``, saved in the checkpoint): whether the pooled patch tokens take part
+#: (``patches``, pooled ``pool`` x ``pool``) and the most photos predicted together. ``mode`` is always "blocks".
+DEFAULT_XVIEW: dict = {"mode": "blocks", "patches": True, "pool": 2, "max_views": 4}
 
 
 class EoMTEncoder(nn.Module):
@@ -540,9 +512,12 @@ class EoMTEncoder(nn.Module):
 
     When ``config.fpn_scales`` is set, a :class:`SimpleFPN` builds a multi-scale token
     bank from the patch features at the query-injection point and each query block
-    gains a :class:`QueryCrossAttention` sublayer so queries can attend to it (the B1
-    multi-scale fix). Left unset, the module is bit-for-bit the original EoMT — no
-    extra params, so it keeps state-dict parity with the HF model.
+    gains a :class:`QueryCrossAttention` sublayer so queries can attend to it. Left
+    unset, the module is bit-for-bit the original EoMT, with state-dict parity with the HF model.
+
+    Masked attention: :attr:`mask_probs` holds the probability of each query block masking its queries (1 = always,
+    0 = mask-free, how every checkpoint is saved and deployed). It is a plain list, set by :meth:`set_attn_mask_probs`,
+    so the forward branches on it without reading the GPU.
     """
 
     def __init__(self, config, family: str = "instance"):
@@ -558,9 +533,8 @@ class EoMTEncoder(nn.Module):
         self.grid_size = (config.image_size // config.patch_size, config.image_size // config.patch_size)
 
         if family == "detect":
-            # Box head only; no mask head / upscale block, so no unused params are
-            # saved into the checkpoint. ``l1_weight``/``giou_weight`` are stashed on
-            # the config by ``EoMTModel`` (EomtConfig has no box-weight fields).
+            # Box head only; no mask head / upscale block. ``l1_weight``/``giou_weight`` are stashed on the config by
+            # ``EoMTModel`` (EomtConfig has no box-weight fields).
             self.box_head = BoxHead(config)
             self.weight_dict = {
                 "loss_cross_entropy": config.class_weight,
@@ -576,23 +550,10 @@ class EoMTEncoder(nn.Module):
                 "loss_mask": config.mask_weight,
                 "loss_dice": config.dice_weight,
             }
-            self.criterion = EoMTLoss(config=config, weight_dict=self.weight_dict)
-        self.register_buffer("attn_mask_probs", torch.ones(config.num_blocks))
-        # Host-side mirror of ``attn_mask_probs`` (set by :meth:`set_attn_mask_probs`) so training can branch on
-        # a block's probability without a GPU sync. ``None`` -> read the buffer.
-        self._mask_host: list[float] | None = None
-        #: Supervise every query block (deep supervision). When off, a block's prediction is still supervised while
-        #: that block uses masked attention (probability > 0), because that prediction builds its attention mask;
-        #: once a block's mask is annealed away only the final output is supervised.
-        self.deep_supervision = True
-
-        # Optional auxiliary box head (instance family): per-query boxes trained with L1 + GIoU and used in the
-        # matching cost, a localisation signal that does not depend on the mask grid. Off by default.
-        self.aux_box_head = None
-        if family != "detect" and getattr(config, "aux_box_head", False):
-            self.aux_box_head = BoxHead(config)
-            self.weight_dict["loss_bbox"] = float(getattr(config, "l1_weight", 5.0))
-            self.weight_dict["loss_giou"] = float(getattr(config, "giou_weight", 2.0))
+            self.criterion = EoMTLoss(config=config)
+        #: Masked-attention probability of each query block (see the class docstring): mask-free, as every model is run,
+        #: unless a training's annealing schedule sets them.
+        self.mask_probs: list[float] = [0.0] * config.num_blocks
 
         # Optional mask-quality head (instance family): per query, the IoU of its mask with its matched GT (Mask Scoring
         # R-CNN), trained on the final prediction; postprocess then scores class prob x predicted IoU. Off unless
@@ -603,9 +564,8 @@ class EoMTEncoder(nn.Module):
             self.quality_head = nn.Sequential(nn.Linear(h, h), _act(config.hidden_act), nn.Linear(h, 1))
             self.weight_dict["loss_quality"] = float(config.quality_weight)
 
-        # Optional multi-scale (B1): SimpleFPN bank + one query→bank cross-attention
-        # per query block. Built only when enabled, so the default model adds no
-        # params and keeps state-dict parity with the HF EoMT.
+        # Optional multi-scale: SimpleFPN bank + one query->bank cross-attention per query block. Built only when
+        # enabled, so the model without it keeps state-dict parity with the HF EoMT.
         fpn_scales = getattr(config, "fpn_scales", None)
         self.fpn_scales = tuple(fpn_scales) if fpn_scales else None
         if self.fpn_scales:
@@ -615,42 +575,38 @@ class EoMTEncoder(nn.Module):
                 [QueryCrossAttention(config) for _ in range(config.num_blocks)]
             )
 
-        # Optional cross-view modules (several photos of one subject predicted together, ``forward(set_ids=...)``):
-        # a :class:`CrossViewAttention` after every query block (level 2) or a :class:`CrossViewRefiner` before the
-        # heads (level 1). Built only when configured, so the default model keeps state-dict parity.
+        # Optional cross-view sublayers (several photos of one subject predicted together, ``forward(set_ids=...)``):
+        # a :class:`CrossViewAttention` after every query block. Built only when configured.
         xv = getattr(config, "xview", None)
-        self.xview = self.refiner = None
-        if xv and xv["mode"] == "blocks":
-            self.xview = nn.ModuleList(
-                [CrossViewAttention(config, xv["init_scale"], xv["null_logit"]) for _ in range(config.num_blocks)]
-            )
-        elif xv and xv["mode"] == "refiner":
-            self.refiner = CrossViewRefiner(config.hidden_size, xv["layers"], xv["heads"], xv["init_scale"], xv["null_logit"])
-        elif xv:
-            raise ValueError(f"xview mode {xv['mode']!r}: 'blocks' or 'refiner'")
+        self.xview = None
+        if xv:
+            if xv.get("mode", "blocks") != "blocks":
+                raise ValueError(f"xview mode {xv['mode']!r}: only 'blocks' is supported")
+            kw = {k: xv[k] for k in ("patches", "pool") if k in xv}
+            self.xview = nn.ModuleList([CrossViewAttention(config, **kw) for _ in range(config.num_blocks)])
 
     # --- loss plumbing (mirrors HF get_loss_dict / get_loss) ----------------
 
     def get_loss_dict(self, masks_queries_logits, class_queries_logits, mask_labels, class_labels,
-                      pred_boxes=None, box_labels=None, pred_quality=None, ignore_masks=None, neg_weight=None):
-        extra = {"pred_boxes": pred_boxes, "box_labels": box_labels} if pred_boxes is not None else {}
+                      pred_quality=None, ignore_masks=None, neg_weight=None):
+        """Weighted loss terms of one prediction layer, and its query->target matching."""
+        extra = {}
         if pred_quality is not None:
             extra["pred_quality"] = pred_quality
         if self.family != "detect" and (ignore_masks is not None or neg_weight is not None):
             extra.update(ignore_masks=ignore_masks, neg_weight=neg_weight)  # partial labels (eomt.data.subjects)
-        loss_dict = self.criterion(
+        loss_dict, indices = self.criterion(
             masks_queries_logits=masks_queries_logits,
             class_queries_logits=class_queries_logits,
             mask_labels=mask_labels,
             class_labels=class_labels,
-            auxiliary_predictions=None,
             **extra,
         )
         for key, weight in self.weight_dict.items():
             for loss_key, loss in loss_dict.items():
                 if key in loss_key:
                     loss_dict[loss_key] = loss * weight
-        return loss_dict
+        return loss_dict, indices
 
     def get_loss(self, loss_dict):
         return sum(loss_dict.values())
@@ -662,8 +618,7 @@ class EoMTEncoder(nn.Module):
         """Per-query heads. Returns ``(geometry, class_logits)``: mask logits
         ``(B, Q, h, w)`` for the instance family, box preds ``(B, Q, 4)`` for detect.
 
-        ``grid_size`` is the actual patch grid of the current input; it defaults to
-        the trained ``self.grid_size`` so legacy callers keep working. ``upscale_steps``
+        ``grid_size`` is the actual patch grid of the current input (default: the trained one). ``upscale_steps``
         limits the mask resolution (``None`` = the full head).
         """
         grid_size = grid_size or self.grid_size
@@ -684,20 +639,12 @@ class EoMTEncoder(nn.Module):
         mask_logits = torch.einsum("bqc, bchw -> bqhw", query_tokens, prefix_tokens)
         return mask_logits, class_logits
 
-    def predict_boxes(self, logits: torch.Tensor) -> torch.Tensor:
-        """Auxiliary box head on the per-query tokens of a (normed) hidden state: ``(B, Q, 4)`` cxcywh."""
-        return self.aux_box_head(logits[:, : self.config.num_queries, :])
-
     def set_attn_mask_probs(self, probs) -> None:
-        """Set the per-block masked-attention probabilities (buffer + host mirror, no GPU sync on read)."""
+        """Set the per-block masked-attention probabilities (:attr:`mask_probs`)."""
         probs = [float(x) for x in probs]
-        self._mask_host = probs
-        self.attn_mask_probs.copy_(torch.tensor(probs, dtype=self.attn_mask_probs.dtype))
-
-    def _block_prob(self, block_idx: int) -> float:
-        if self.training and self._mask_host is not None:
-            return self._mask_host[block_idx]
-        return float(self.attn_mask_probs[block_idx])
+        if len(probs) != self.config.num_blocks:
+            raise ValueError(f"{len(probs)} masked-attention probabilities for {self.config.num_blocks} query blocks")
+        self.mask_probs = probs
 
     def _build_attention_mask(self, hidden_states, masks_queries_logits, prob, grid_size=None):
         """Masked attention as a boolean ``[B, 1, N, N]`` mask (True = may attend), broadcast over heads.
@@ -730,136 +677,106 @@ class EoMTEncoder(nn.Module):
         set_ids: torch.Tensor | None = None,
         ignore_masks: list[torch.Tensor | None] | None = None,
         neg_weight: torch.Tensor | None = None,
+        trunk: torch.Tensor | None = None,
+        keep_xview_attn: bool = False,
     ) -> EoMTOutput:
         """``set_ids`` ``[B]`` groups the photos into sets of the same subject predicted together (equal ids = one set)
-        for the cross-view modules; ``None``, or a photo alone in its set, is the single-photo model. ``ignore_masks``
+        for the cross-view sublayers; ``None``, or a photo alone in its set, is the single-photo model. ``ignore_masks``
         and ``neg_weight`` (training only) leave regions and partly annotated photos out of the "no object" loss
-        (:class:`~eomt.loss.EoMTLoss`)."""
-        cross_view = self.xview is not None or self.refiner is not None
-        groups = _set_groups(set_ids, pixel_values.device) if cross_view else []
-        # Per-layer geometry (mask logits or box preds) for deep supervision.
-        geom_per_layer, class_per_layer, box_per_layer = (), (), ()
-        is_detect = self.family == "detect"
-        # GT geometry for this family: boxes for detect, masks for instance.
-        geom_labels = box_labels if is_detect else mask_labels
+        (:class:`~eomt.loss.EoMTLoss`). In training every query block's prediction is supervised (deep supervision) and
+        ``indices`` is the final prediction's query->target matching.
 
+        ``trunk``: the hidden states :meth:`encode_trunk` returned for ``pixel_values``, to run only the query blocks
+        (e.g. a set predicted alone and together). ``keep_xview_attn`` keeps each cross-view sublayer's query rows and
+        keys (``xview_attn``) for :func:`eomt.aux_cls.xview_attention_loss`."""
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")
+        groups = _set_groups(set_ids, pixel_values.device) if self.xview is not None else []
+        xview_cache = [] if keep_xview_attn and groups else None
+        geom_per_layer, class_per_layer = (), ()
+        is_detect = self.family == "detect"
+        geom_labels = box_labels if is_detect else mask_labels  # GT geometry for this family
+        training = self.training and geom_labels is not None
 
-        # Actual patch grid for this input (may differ from the trained grid when
-        # running at a non-native image size); threaded into the prediction heads.
+        # The actual patch grid of this input (it may differ from the trained grid at another input size).
         ps = self.config.patch_size
         grid = (pixel_values.shape[-2] // ps, pixel_values.shape[-1] // ps)
-
-        hidden_states = self.embeddings(pixel_values)
-
-        # Multi-scale bank (B1), built once from the patch features at the injection
-        # point and held fixed across the query blocks (Mask2Former-style memory).
-        bank_feats = bank_pos = None
-        supervise_blocks = self.training and self.deep_supervision
         nq = self.config.num_queries
+        first_query_block = self.num_hidden_layers - self.config.num_blocks
+        hidden_states = self.encode_trunk(pixel_values) if trunk is None else trunk
+        bank_feats = bank_pos = None
 
         for idx, layer_module in enumerate(self.layers):
-            if idx == self.num_hidden_layers - self.config.num_blocks:
-                if self.fpn_scales:
-                    num_prefix = self.embeddings.num_prefix_tokens
-                    patch = hidden_states[:, num_prefix:]  # [B, Hn*Wn, hidden]
+            if idx < first_query_block:
+                continue
+            if idx == first_query_block:
+                if self.fpn_scales:  # the multi-scale bank, built once at the injection point
+                    patch = hidden_states[:, self.embeddings.num_prefix_tokens:]  # [B, Hn*Wn, hidden]
                     patch2d = patch.transpose(1, 2).reshape(patch.shape[0], -1, *grid)
                     bank_feats, bank_pos = self.bank(self.fpn(patch2d))
-                query = (
-                    self.query.weight[None, :, :]
-                    .expand(hidden_states.shape[0], -1, -1)
-                    .to(hidden_states.device)
-                )
+                query = self.query.weight[None, :, :].expand(hidden_states.shape[0], -1, -1).to(hidden_states.device)
                 hidden_states = torch.cat((query, hidden_states), dim=1)
 
-            block_idx = idx - self.num_hidden_layers + self.config.num_blocks
-            in_query_blocks = idx >= self.num_hidden_layers - self.config.num_blocks
+            block_idx = idx - first_query_block
+            in_query_blocks = block_idx >= 0
             attention_mask = None
-            if in_query_blocks and is_detect:
-                # Deep supervision: predict per query-block during training. No masked
-                # attention (no masks to focus on) — queries do full attention.
-                if supervise_blocks:
+            if in_query_blocks:
+                prob = 0.0 if is_detect else self.mask_probs[block_idx]
+                if training or prob > 0:
                     norm_hidden_states = self.layernorm(hidden_states)
-                    geom, cls = self.predict(norm_hidden_states, grid)
-                    geom_per_layer += (geom,)
-                    class_per_layer += (cls,)
-            elif in_query_blocks:
-                prob = self._block_prob(block_idx)
-                # An unsupervised prediction makes a meaningless attention mask (in a final-only run P0 let every
-                # query see a random half of the image), so a block that masks is always supervised in training.
-                supervise = supervise_blocks or (self.training and prob > 0)
-                if supervise or prob > 0:
-                    norm_hidden_states = self.layernorm(hidden_states)
-                    if supervise:
-                        masks_queries_logits, class_queries_logits = self.predict(
-                            norm_hidden_states, grid, INTERMEDIATE_UPSCALE_STEPS
-                        )
-                        geom_per_layer += (masks_queries_logits,)
-                        class_per_layer += (class_queries_logits,)
-                        if self.aux_box_head is not None:
-                            box_per_layer += (self.predict_boxes(norm_hidden_states),)
+                    if training:  # deep supervision: every query block's prediction
+                        geom, cls = self.predict(norm_hidden_states, grid, None if is_detect else INTERMEDIATE_UPSCALE_STEPS)
+                        geom_per_layer += (geom,)
+                        class_per_layer += (cls,)
                     else:  # masked inference: only the attention mask needs this prediction
                         with torch.no_grad():
-                            masks_queries_logits, _ = self.predict(
-                                norm_hidden_states, grid, INTERMEDIATE_UPSCALE_STEPS
-                            )
+                            geom, _ = self.predict(norm_hidden_states, grid, INTERMEDIATE_UPSCALE_STEPS)
                     if prob > 0:  # a block whose annealing probability reached 0 builds no mask at all
-                        attention_mask = self._build_attention_mask(
-                            hidden_states, masks_queries_logits.detach(), prob, grid
-                        )
+                        attention_mask = self._build_attention_mask(hidden_states, geom.detach(), prob, grid)
 
             hidden_states = layer_module(hidden_states, attention_mask)
-
-            # Multi-scale (B1): after the shared self-attention, let the query slice
-            # cross-attend to the bank so it gathers fine/coarse context the native
-            # grid alone can't provide. The next block's prediction reads the result.
-            if self.fpn_scales and in_query_blocks:
+            if self.fpn_scales and in_query_blocks:  # the queries gather fine / coarse context from the bank
                 refined = self.cross_blocks[block_idx](hidden_states[:, :nq], bank_feats, bank_pos)
                 hidden_states = torch.cat((refined, hidden_states[:, nq:]), dim=1)
-            # Cross-view (level 2): the queries of each photo of a set take what the other photos show.
-            if groups and self.xview is not None and in_query_blocks:
-                hidden_states = self.xview[block_idx](hidden_states, groups, nq)
+            if groups and in_query_blocks:  # cross-view: each photo takes what the other photos show
+                hidden_states = self.xview[block_idx](hidden_states, groups, nq, self.embeddings.num_prefix_tokens,
+                                                      grid, xview_cache)
 
         sequence_output = self.layernorm(hidden_states)
         geom_final, class_queries_logits = self.predict(sequence_output, grid)
-        aux_boxes = None
-        if self.aux_box_head is not None:
-            aux_boxes = self.predict_boxes(sequence_output)
-            box_per_layer += (aux_boxes,)
         quality_logits = None
         if self.quality_head is not None:
-            quality_logits = self.quality_head(sequence_output[:, : self.config.num_queries])[..., 0]
-        # Cross-view (level 1): refine the final queries of a set's photos; the class (and, through the returned
-        # hidden state, the attribute heads) read the refined queries, the geometry and the quality the original ones.
-        if groups and self.refiner is not None:
-            obj_logprob = (1 - class_queries_logits.detach().float().softmax(-1)[..., -1]).clamp_min(1e-6).log()
-            refined = self.refiner(sequence_output[:, :nq], groups, obj_logprob)
-            class_queries_logits = self.class_predictor(refined)
-            sequence_output = torch.cat((refined, sequence_output[:, nq:]), dim=1)
+            quality_logits = self.quality_head(sequence_output[:, :nq])[..., 0]
         geom_per_layer += (geom_final,)
         class_per_layer += (class_queries_logits,)
 
-        loss = None
-        if geom_labels is not None and class_labels is not None:
+        loss = indices = None
+        if training and class_labels is not None:
             loss = 0.0
-            gt_boxes = [masks_to_norm_boxes(m) for m in geom_labels] if self.aux_box_head is not None else None
             last = len(geom_per_layer) - 1
             for i, (g, c) in enumerate(zip(geom_per_layer, class_per_layer)):
-                pb = box_per_layer[i] if box_per_layer else None
-                pq = quality_logits if i == last else None
-                loss = loss + self.get_loss(self.get_loss_dict(g, c, geom_labels, class_labels, pb, gt_boxes, pq,
-                                                               ignore_masks, neg_weight))
+                loss_dict, indices = self.get_loss_dict(g, c, geom_labels, class_labels,
+                                                        quality_logits if i == last else None, ignore_masks, neg_weight)
+                loss = loss + self.get_loss(loss_dict)
 
         return EoMTOutput(
             loss=loss,
             masks_queries_logits=None if is_detect else geom_final,
             pred_boxes=geom_final if is_detect else None,
-            aux_boxes=aux_boxes,
             quality_logits=quality_logits,
             class_queries_logits=class_queries_logits,
             last_hidden_state=sequence_output,
+            indices=indices,
+            xview_attn=xview_cache,
         )
+
+    def encode_trunk(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """The hidden states entering the first query block: the embeddings and every block before the queries (with
+        cross-view sublayers, the same for a photo alone and in its set)."""
+        hidden_states = self.embeddings(pixel_values)
+        for layer_module in self.layers[: self.num_hidden_layers - self.config.num_blocks]:
+            hidden_states = layer_module(hidden_states)
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------
@@ -917,30 +834,23 @@ def build_model(
     loss_weights: dict | None = None,
     num_upscale_blocks: int | None = None,
     fpn_scales: tuple[float, ...] | list[float] | None = None,
-    aux_box_head: bool = False,
     xview: dict | None = None,
-    match_dim: int = 0,
+    matcher: dict | None = None,
 ) -> "EoMTModel":
     """Build an :class:`EoMTModel`.
 
-    ``family`` selects the prediction head: ``"instance"`` (mask + class, the
-    default) or ``"detect"`` (DETR-style box + class). ``aux_heads`` adds one
-    secondary per-instance classifier per spec; ``aux_head_arch`` sets their shared
-    network shape (see ``_build_aux_head``). ``loss_weights`` overrides the
-    criterion weights (mask/dice for instance, L1/GIoU for detect — see
-    ``normalize_loss_weights``); ``num_upscale_blocks`` overrides the mask-head
-    upsampling depth (instance only; ``None`` = size preset default).
-    ``fpn_scales`` enables the B1 multi-scale path (SimpleFPN + query
-    cross-attention); ``None`` = the original single-scale model. ``aux_box_head`` adds an
-    auxiliary box head (L1 + GIoU loss and a box term in the matching cost) to the instance family.
-    ``xview`` (see :data:`DEFAULT_XVIEW`) adds the cross-view modules that let several photos of one subject be
-    predicted together, and ``match_dim > 0`` a head embedding each query for matching instances across photos.
+    ``family`` selects the prediction head: ``"instance"`` (mask + class, the default) or ``"detect"`` (DETR-style box
+    + class). ``aux_heads`` adds one per-instance attribute head per spec; ``aux_head_arch`` sets their shared network
+    shape (see ``_build_aux_head``). ``loss_weights`` overrides the criterion weights (see ``normalize_loss_weights``);
+    ``num_upscale_blocks`` the mask-head upsampling depth (instance only; ``None`` = the size preset's). ``fpn_scales``
+    enables the multi-scale path (SimpleFPN + query cross-attention); ``None`` = the original single-scale model.
+    ``xview`` (see :data:`DEFAULT_XVIEW`) adds the cross-view sublayers that let several photos of one subject be
+    predicted together, and ``matcher`` (see :data:`~eomt.matcher.DEFAULT_MATCHER`) the set matcher that links the
+    instances of several photos (:class:`~eomt.matcher.SetMatcher`).
     """
     if family not in FAMILIES:
         raise ValueError(f"family={family!r} is not one of {FAMILIES}.")
-    if family == "detect" and aux_box_head:
-        raise ValueError("aux_box_head applies to the instance family only.")
-    if family == "detect" and xview:
+    if family == "detect" and xview is not None:
         raise ValueError("xview applies to the instance family only.")
     return EoMTModel(
         size=size,
@@ -954,24 +864,25 @@ def build_model(
         loss_weights=loss_weights,
         num_upscale_blocks=num_upscale_blocks,
         fpn_scales=fpn_scales,
-        aux_box_head=aux_box_head,
         xview=xview,
-        match_dim=match_dim,
+        matcher=matcher,
     )
 
 
 class EoMTModel(nn.Module):
-    """Thin ``nn.Module`` wrapping ``EomtForUniversalSegmentation``.
+    """The trainable model: the encoder (:class:`EoMTEncoder`) plus the per-instance attribute heads and the optional
+    set matcher (:class:`~eomt.matcher.SetMatcher`, applied to the detections by the linker and the trainer).
 
-    The forward returns the raw HF output dict during inference, or the scalar
-    loss when ``mask_labels`` / ``class_labels`` are supplied (training).
+    The forward returns a dict: the raw query outputs (``class_queries_logits``, ``masks_queries_logits`` or
+    ``pred_boxes``, ``query_embed`` and, with heads, ``aux_queries_logits`` / ``aux_queries_values``), plus ``loss``,
+    ``indices`` (the final query->target matching) and, when asked, ``xview_attn`` in training.
     """
 
     def __init__(
         self,
         size: str = "l",
         nc: int = 80,
-        image_size: int = 644,
+        image_size: int = DEFAULT_IMAGE_SIZE,
         patch_size: int = PATCH_SIZE,
         names: dict[int, str] | None = None,
         family: str = "instance",
@@ -980,9 +891,8 @@ class EoMTModel(nn.Module):
         loss_weights: dict | None = None,
         num_upscale_blocks: int | None = None,
         fpn_scales: tuple[float, ...] | list[float] | None = None,
-        aux_box_head: bool = False,
         xview: dict | None = None,
-        match_dim: int = 0,
+        matcher: dict | None = None,
     ):
         super().__init__()
         self.size = size
@@ -991,16 +901,12 @@ class EoMTModel(nn.Module):
         self.patch_size = patch_size
         self.names = names
         self.family = family
-        # Pixel normalization (ImageNet by default), persisted in the checkpoint so
-        # eval/predict reproduce preprocessing from the file alone.
+        # Pixel normalization (ImageNet), persisted in the checkpoint so eval/predict reproduce preprocessing.
         self.pixel_mean: tuple[float, float, float] = tuple(float(x) for x in IMAGENET_MEAN)
         self.pixel_std: tuple[float, float, float] = tuple(float(x) for x in IMAGENET_STD)
-        # Criterion weights and mask-head depth, persisted in the checkpoint so a
-        # tuned objective / head shape is rebuilt identically on reload. The valid
-        # keys depend on the family (mask/dice vs box L1/GIoU).
+        # Criterion weights and mask-head depth, persisted in the checkpoint so a tuned objective / head shape is
+        # rebuilt identically on reload. The valid keys depend on the family (mask/dice vs box L1/GIoU).
         self.loss_weights = normalize_loss_weights(loss_weights, family=family)
-        # ``build_eomt_config`` only knows the mask/dice + shared keys; pass those
-        # through and keep mask/dice at their defaults for detect (unused there).
         cfg_weights = {
             k: v for k, v in self.loss_weights.items()
             if k in ("no_object_weight", "class_weight", "mask_weight", "dice_weight")
@@ -1014,42 +920,26 @@ class EoMTModel(nn.Module):
             num_upscale_blocks=num_upscale_blocks,
             **cfg_weights,
         )
-        # Box-loss weights have no EomtConfig field; stash them on the config so
-        # ``EoMTEncoder`` (which only receives the config) can read them.
+        # Settings EomtConfig has no field for, stashed on it for the encoder (which only receives the config).
         if family == "detect":
             config.l1_weight = float(self.loss_weights["l1_weight"])
             config.giou_weight = float(self.loss_weights["giou_weight"])
-        else:  # loss-only settings, stashed the same way
+        else:
             config.iou_aware_cls = bool(self.loss_weights["iou_aware_cls"])
             config.quality_weight = float(self.loss_weights["quality_weight"])
-        # Multi-scale (B1): stash the FPN scales on the config so ``EoMTEncoder``
-        # (which only receives the config) builds the SimpleFPN + cross-attn modules.
-        # ``EomtConfig`` has no such field, so this is an added attribute; left unset
-        # the encoder is the original single-scale model.
         self.fpn_scales = tuple(float(s) for s in fpn_scales) if fpn_scales else None
         if self.fpn_scales:
             config.fpn_scales = self.fpn_scales
-        # Auxiliary box head: stashed on the config for the encoder, recorded in the checkpoint metadata.
-        # Left unset the encoder is the model without it.
-        self.aux_box_head = bool(aux_box_head) and family != "detect"
-        if self.aux_box_head:
-            config.aux_box_head = True
-            config.l1_weight = float(self.loss_weights["l1_weight"])
-            config.giou_weight = float(self.loss_weights["giou_weight"])
-        # Cross-view modules: stashed on the config for the encoder, recorded in the checkpoint metadata.
-        self.xview_cfg = {**DEFAULT_XVIEW, **xview} if xview else None
+        self.xview_cfg = {**DEFAULT_XVIEW, **xview} if xview is not None else None  # {}: the defaults
         if self.xview_cfg:
             config.xview = self.xview_cfg
         self.config = config
-        # Effective upscale depth (resolved from the preset when not overridden).
         self.num_upscale_blocks = int(config.num_upscale_blocks)
         self.eomt = EoMTEncoder(config, family=family)
 
-        # Secondary per-instance heads (attributes). Each reads the per-query
-        # embedding — the leading ``num_queries`` rows of the encoder's final hidden
-        # state, i.e. exactly what ``class_predictor`` is fed.
-        # ``aux_head_arch`` (a small MLP by default) is the shared head shape; it is
-        # persisted in the checkpoint so reload rebuilds the same modules.
+        # Per-instance attribute heads. Each reads the per-query embedding — the leading ``num_queries`` rows of the
+        # encoder's final hidden state, exactly what ``class_predictor`` is fed. ``aux_head_arch`` (a small MLP by
+        # default) is persisted in the checkpoint so reload rebuilds the same modules.
         self.aux_specs: list[AuxHeadSpec] = list(aux_heads or [])
         self.aux_head_arch: dict = _normalize_aux_arch(aux_head_arch)
         self.aux_heads = nn.ModuleDict(
@@ -1058,15 +948,13 @@ class EoMTModel(nn.Module):
                 for s in self.aux_specs
             }
         )
-        # Cross-photo matching head: one L2-normalized ``match_dim`` vector per query, trained so that the same
-        # instance in two photos of a set lands close (``eomt.aux_cls.match_loss``). ``match_thres`` is the cosine
-        # floor for "same instance", calibrated on the validation sets and restored from the checkpoint.
-        self.match_dim = int(match_dim)
-        self.match_head = None
-        if self.match_dim > 0:
-            h = config.hidden_size
-            self.match_head = nn.Sequential(nn.Linear(h, h), nn.GELU(), nn.Linear(h, self.match_dim))
+        # The set matcher (multi-view post-training): links the detections of several photos. ``match_thres`` is the
+        # probability floor for "same instance", calibrated on the validation sets and restored from the checkpoint,
+        # and ``link_group_by`` the gate keys the links were validated with.
+        self.matcher_cfg = {**DEFAULT_MATCHER, **matcher} if matcher is not None else None
+        self.matcher = SetMatcher(config.hidden_size, **self.matcher_cfg) if self.matcher_cfg else None
         self.match_thres: float | None = None
+        self.link_group_by: tuple[str, ...] | None = None
 
     @torch.no_grad()
     def init_xview(self) -> None:
@@ -1086,6 +974,8 @@ class EoMTModel(nn.Module):
         set_ids: torch.Tensor | None = None,
         ignore_masks: list[torch.Tensor | None] | None = None,
         neg_weight: torch.Tensor | None = None,
+        trunk: torch.Tensor | None = None,
+        keep_xview_attn: bool = False,
     ):
         out = self.eomt(
             pixel_values=pixel_values,
@@ -1095,50 +985,49 @@ class EoMTModel(nn.Module):
             set_ids=set_ids,
             ignore_masks=ignore_masks,
             neg_weight=neg_weight,
+            trunk=trunk,
+            keep_xview_attn=keep_xview_attn,
         )
-        geom_labels = box_labels if self.family == "detect" else mask_labels
-        training = geom_labels is not None and class_labels is not None
+        training = out.loss is not None
         if self.family == "detect":
-            result = {
-                "pred_boxes": out.pred_boxes,
-                "class_queries_logits": out.class_queries_logits,
-            }
+            result = {"pred_boxes": out.pred_boxes, "class_queries_logits": out.class_queries_logits}
         else:
-            result = {
-                "masks_queries_logits": out.masks_queries_logits,
-                "class_queries_logits": out.class_queries_logits,
-            }
-            if out.aux_boxes is not None:  # not "pred_boxes": that key marks the detect family downstream
-                result["aux_boxes"] = out.aux_boxes
+            result = {"masks_queries_logits": out.masks_queries_logits, "class_queries_logits": out.class_queries_logits}
             if out.quality_logits is not None:
                 result["quality_logits"] = out.quality_logits
-        # The per-query embedding [B, Q, hidden]: the leading queries of the final
-        # hidden state, which is precisely the tensor ``class_predictor`` consumes.
-        # Always exposed — aux heads read it, and so does cross-photo re-identification
-        # on checkpoints that carry no aux heads at all.
+        # The per-query embedding [B, Q, hidden]: what ``class_predictor`` consumes. Always exposed: the attribute heads
+        # read it, and so does re-identification on checkpoints without a matching head.
         q = out.last_hidden_state[:, : self.config.num_queries, :]
         result["query_embed"] = q
-        if self.match_head is not None:
-            result["match_embed"] = F.normalize(self.match_head(q).float(), dim=-1)
-        if self.aux_heads:
-            # Per-query logits over ALL queries are only consumed by postprocess at
-            # inference; in training the aux loss applies each head to the matched
-            # subset only, so skip the full-query application here.
-            if not training:
-                specs = {s.name: s for s in self.aux_specs}
-                outs = {name: head(q) for name, head in self.aux_heads.items()}
-                logits = {n: o for n, o in outs.items() if not specs[n].regression}
-                if logits:
-                    result["aux_queries_logits"] = logits
-                # Regression heads: their values in real units, ``{name: (B, Q)}``.
-                values = {n: specs[n].decode(o[..., 0].float()) for n, o in outs.items() if specs[n].regression}
-                if values:
-                    result["aux_queries_values"] = values
+        # The photo's embedding [B, hidden]: the mean of its final patch tokens over the photo itself, what comparing
+        # photos by appearance reads (e.g. grouping a subject's photos, :func:`eomt.engine.predict.similar_groups`).
+        # A patch whose pixels are all exactly 0 is letterbox padding (the preprocessing fills it with 0, which no
+        # normalized pixel equals) and is left out, so photos of other shapes compare alike. A mean: always exposed.
+        first_patch = self.config.num_queries + self.eomt.embeddings.num_prefix_tokens
+        patches = out.last_hidden_state[:, first_patch:]
+        ps = self.config.patch_size
+        content = F.max_pool2d(pixel_values.detach().abs().amax(1, keepdim=True).float(), ps).flatten(1) > 0
+        if content.shape[1] != patches.shape[1]:  # not one input patch per token: every token
+            content = torch.ones(patches.shape[:2], dtype=torch.bool, device=patches.device)
+        content |= ~content.any(1, keepdim=True)  # an all-zero input: every patch
+        w = content.to(patches.dtype).unsqueeze(-1)
+        result["photo_embed"] = (patches * w).sum(1) / w.sum(1)
+        if self.aux_heads and not training:
+            # In training the attribute loss applies each head to the matched queries only.
+            specs = {s.name: s for s in self.aux_specs}
+            outs = {name: head(q) for name, head in self.aux_heads.items()}
+            logits = {n: o for n, o in outs.items() if not specs[n].regression}
+            if logits:
+                result["aux_queries_logits"] = logits
+            # Regression heads: their values in real units, ``{name: (B, Q)}``.
+            values = {n: specs[n].decode(o[..., 0].float()) for n, o in outs.items() if specs[n].regression}
+            if values:
+                result["aux_queries_values"] = values
         if training:
             result["loss"] = out.loss
-            # The tensor the final predictions are read from (``query_embed`` is a view of it), for the per-task
-            # gradient diagnostic of the attribute heads.
-            result["last_hidden_state"] = out.last_hidden_state
+            result["indices"] = out.indices
+            if out.xview_attn is not None:
+                result["xview_attn"] = out.xview_attn
         return result
 
 
@@ -1240,7 +1129,7 @@ def load_dinov2_backbone(model: EoMTModel, *, verbose: bool = True) -> dict[str,
 
     size_cfg = EOMT_CONFIGS[model.size]
     if verbose:
-        print(f"[eomt] loading DINOv2 backbone: {size_cfg.dinov2_repo}")
+        LOG.info(f"[eomt] loading DINOv2 backbone: {size_cfg.dinov2_repo}")
     dino = Dinov2WithRegistersModel.from_pretrained(size_cfg.dinov2_repo)
     dino_sd = dino.state_dict()
 
@@ -1281,7 +1170,7 @@ def load_dinov2_backbone(model: EoMTModel, *, verbose: bool = True) -> dict[str,
 
     model.eomt.load_state_dict(new_sd, strict=False)
     if verbose:
-        print(
+        LOG.info(
             f"[eomt] DINOv2 -> EoMT: matched={matched} skipped={skipped} "
             f"interpolated={interpolated}; prediction head left random."
         )

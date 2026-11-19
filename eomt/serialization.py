@@ -7,8 +7,11 @@ metadata (size / task / nc / names / imgsz) to rebuild the model with
 
 from __future__ import annotations
 
+import functools
+import re
+import subprocess
 import warnings
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Any
 
@@ -16,18 +19,54 @@ import torch
 
 from .config import HIDDEN_TO_SIZE, aux_specs_from_meta, aux_specs_to_meta
 from .device import resolve_device
+from .lora import has_lora, merge_state
 from .model import EoMTModel, build_model
 from .preprocess import IMAGENET_MEAN, IMAGENET_STD
 
-SCHEMA_VERSION = "1.0"
+#: 2.0: written by eomt 3 (no masked-attention buffer, no cross-view view types / refiner, one link calibration).
+#: Older checkpoints are upgraded on load by :func:`migrate_checkpoint`.
+SCHEMA_VERSION = "2.0"
+
+#: Checkpoint metadata about where the weights come from, kept on a loaded model (``model.meta``) so that a re-save
+#: (:meth:`eomt.EoMT.save`) carries it over: the run that made them, the epoch and the metrics row it was saved at, and
+#: the key ``best.pt`` was chosen on.
+CARRIED_KEYS = ("run_config", "epoch", "metrics", "best_key", "best_metric")
 
 
+def module_counts(keys) -> str:
+    """``"eomt.xview (52), matcher (40)"``: state-dict keys counted per module (two levels under ``eomt.``)."""
+    counts: dict[str, int] = {}
+    for k in keys:
+        parts = k.split(".")
+        mod = ".".join(parts[:2]) if parts[0] == "eomt" and len(parts) > 2 else parts[0]
+        counts[mod] = counts.get(mod, 0) + 1
+    return ", ".join(f"{m} ({c})" for m, c in sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+@functools.lru_cache(maxsize=1)
 def get_version() -> str:
-    """Return the installed package version, with an editable-install fallback."""
+    """The version of the eomt code that is running, recorded in every checkpoint: the installed distribution's when
+    this module is it; else (a source checkout or a copy of one) the ``pyproject.toml`` version next to the package,
+    plus the git commit and ``.dirty`` when the package has uncommitted changes, e.g. ``3.0.0+g1a2b3c4.dirty``."""
+    here = Path(__file__).resolve().parent
     try:
-        return version("attr-eomt")
+        dist = distribution("attr-eomt")
+        if Path(str(dist.locate_file("eomt/__init__.py"))).resolve().parent == here:
+            return dist.version
     except PackageNotFoundError:
-        return "0.0.0.dev0"
+        pass
+    ver = "0.0.0"
+    pyproject = here.parent / "pyproject.toml"
+    if pyproject.is_file():
+        m = re.search(r'^version\s*=\s*"([^"]+)"', pyproject.read_text(), re.M)
+        ver = m.group(1) if m else ver
+    try:
+        git = functools.partial(subprocess.run, cwd=here, capture_output=True, text=True, timeout=5, check=False)
+        sha = git(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+        dirty = bool(git(["git", "status", "--porcelain", "--", "."]).stdout.strip()) if sha else False
+    except (OSError, subprocess.SubprocessError):
+        sha, dirty = "", False
+    return f"{ver}+g{sha}{'.dirty' if dirty else ''}" if sha else f"{ver}+unknown"
 
 
 def normalize_names(names: Any, nc: int) -> dict[int, str]:
@@ -64,11 +103,9 @@ def wrap_checkpoint(
     loss_weights: dict | None = None,
     num_upscale_blocks: int | None = None,
     fpn_scales: tuple[float, ...] | list[float] | None = None,
-    aux_box_head: bool = False,
     norm_mean: Any = None,
     norm_std: Any = None,
     patch_size: int | None = None,
-    compression: dict | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
     """Build a metadata-wrapped checkpoint that :func:`load_model` can restore.
@@ -111,14 +148,6 @@ def wrap_checkpoint(
     # SimpleFPN + cross-attn modules with matching shapes on reload.
     if fpn_scales is not None:
         checkpoint["fpn_scales"] = [float(s) for s in fpn_scales]
-    # Auxiliary box head: load-bearing for the module shapes, recorded so it is rebuilt on reload
-    # (a checkpoint without this key is the model without it).
-    if aux_box_head:
-        checkpoint["aux_box_head"] = True
-    # Records the torchao recipe (if the weights are compressed) so ``load_model``
-    # re-creates the quantized layout before loading the subclassed tensors.
-    if compression is not None:
-        checkpoint["compression"] = dict(compression)
     checkpoint.update({k: v for k, v in extra.items() if v is not None})
     return checkpoint
 
@@ -133,8 +162,9 @@ def save_checkpoint(checkpoint: dict[str, Any], path: str | Path) -> None:
 
 
 def load_raw(path: str | Path, *, map_location: Any = "cpu") -> dict[str, Any]:
-    """Load a checkpoint dict from disk."""
-    return torch.load(path, map_location=map_location, weights_only=False)
+    """Load a checkpoint dict from disk, as plain data: tensors and Python containers only (``weights_only``), so a
+    checkpoint can never run code when it is loaded."""
+    return torch.load(path, map_location=map_location, weights_only=True)
 
 
 #: Default checkpoint filename used for Hugging Face Hub repos when none is given.
@@ -200,205 +230,150 @@ def resolve_checkpoint(path: str | Path, *, prefer: str = "best") -> Path:
     raise FileNotFoundError(f"checkpoint path does not exist: {p}")
 
 
-def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
-    """Rebuild an :class:`EoMTModel` from a wrapped checkpoint and load its weights.
 
-    ``path`` may be a checkpoint file or a run/weights folder (``best.pt`` is
-    preferred); the model size is recovered from the checkpoint metadata.
+
+def migrate_checkpoint(ckpt: dict[str, Any]) -> dict[str, Any]:
+    """Bring a checkpoint written by an older eomt to the current format (a new dict; the state dict is copied, its
+    tensors are not). Every old-format rule is here, so the rest of the package reads one format:
+
+    * metadata predating its field: the size, classes, input size and family read off the weights; single Linear
+      attribute heads (``aux_head_arch``); stretch preprocessing (``letterbox``); ImageNet normalisation; the mask-head
+      depth and the multi-scale levels counted from the weights;
+    * the masked-attention probability buffer (``eomt.attn_mask_probs``) is dropped: checkpoints are saved mask-free;
+    * the auxiliary box head is dropped with a warning (it only added boxes to the outputs);
+    * link records of older versions (``reid_thres``, ``link_embed``, ``link_f1``) are dropped;
+    * multi-view post-trainings before 3.1 (cross-view sublayers with a null token, an embedding matching head) and
+      int8-compressed and pixel-detail checkpoints are refused.
+    """
+    if "model" not in ckpt:
+        raise ValueError("not a wrapped EoMT checkpoint (no 'model' key)")
+    ck = dict(ckpt)
+    state = dict(ck["model"])
+    if ck.get("compression"):
+        raise ValueError("int8-compressed checkpoints are no longer supported: load the fp32 / bf16 one")
+    if ck.get("detail") or any(k.startswith("eomt.detail.") for k in state):
+        raise ValueError("this checkpoint uses the pixel-detail pathway, which eomt no longer has")
+    for key, infer in (("size", _infer_size), ("nc", _infer_nc), ("imgsz", _infer_imgsz)):
+        if not ck.get(key):
+            ck[key] = infer(state)
+    if not ck.get("task"):
+        ck["task"] = "detect" if any(k.startswith("eomt.box_head.") for k in state) else "instance"
+    if ck.get("aux_heads") and not ck.get("aux_head_arch"):
+        ck["aux_head_arch"] = {"layers": 1}  # attribute heads predating the MLP were single Linear layers
+    ck.setdefault("letterbox", False)  # stretch resize, before letterboxing existed
+    ck.setdefault("norm_mean", list(IMAGENET_MEAN))
+    ck.setdefault("norm_std", list(IMAGENET_STD))
+    if not ck.get("num_upscale_blocks"):
+        ck["num_upscale_blocks"] = _infer_num_upscale_blocks(state)
+    if not ck.get("fpn_scales"):
+        ck["fpn_scales"] = _infer_fpn_scales(state)
+    if ck.get("schema_version") != SCHEMA_VERSION and ck["task"] != "detect":
+        # the IoU-aware class targets and the quality head became defaults in schema 2.0: off where not recorded
+        ck["loss_weights"] = {"iou_aware_cls": False, "quality_weight": 0.0, **(ck.get("loss_weights") or {})}
+    state.pop("eomt.attn_mask_probs", None)
+    if ck.get("xview") and any(k.startswith("eomt.xview.") and k.endswith(".null_logit") for k in state) or \
+            ck.get("match_dim") or any(k.startswith(("match_head.", "match_skip.")) for k in state):
+        raise ValueError("a multi-view post-training before attr-eomt 3.1 (cross-view null token / embedding matching "
+                         "head): no longer supported; its base single-photo checkpoint still loads")
+    if ck.pop("aux_box_head", None) or any(k.startswith("eomt.aux_box_head.") for k in state):
+        warnings.warn("the auxiliary box head is no longer supported: its weights are ignored (it only added boxes "
+                      "to the outputs; masks, classes and attributes are unchanged)", RuntimeWarning, stacklevel=3)
+        state = {k: v for k, v in state.items() if not k.startswith("eomt.aux_box_head.")}
+    for key in ("reid_thres", "link_embed", "link_f1", "match_dim", "match_residual"):
+        ck.pop(key, None)
+    ck["model"] = state
+    ck["schema_version"] = SCHEMA_VERSION
+    return ck
+
+
+def load_model(path: str | Path, *, device: str = "auto") -> EoMTModel:
+    """Rebuild an :class:`EoMTModel` from a checkpoint and load its weights (strictly: every weight must fit).
+
+    ``path`` may be a checkpoint file, a run/weights folder (``best.pt`` is preferred) or a ``hf://`` reference.
+    Checkpoints of older versions are upgraded first (:func:`migrate_checkpoint`).
     """
     path = resolve_checkpoint(path, prefer="best")
-    ckpt = load_raw(path)
-    if "model" not in ckpt:
-        raise ValueError(f"{path} is not a wrapped EoMT checkpoint (no 'model' key).")
-    state = ckpt["model"]
-
-    size = ckpt.get("size") or _infer_size(state)
-    nc = int(ckpt.get("nc") or _infer_nc(state))
-    imgsz = int(ckpt.get("imgsz") or _infer_imgsz(state))
-    names = ckpt.get("names")
-    # Head family ("instance" | "detect") is recorded in ``task``; fall back to the
-    # state dict (a box head has ``eomt.box_head.*`` keys, masks have ``eomt.mask_head.*``).
-    family = ckpt.get("task") or _infer_family(state)
-    aux_heads = aux_specs_from_meta(ckpt.get("aux_heads")) or _infer_aux_heads(state)
-    # Rebuild the exact secondary-head shape. Checkpoints written before aux_head_arch
-    # existed only ever had single Linear heads, so default to that for them.
-    aux_head_arch = ckpt.get("aux_head_arch") or ({"layers": 1} if aux_heads else None)
-    # Restore the tuned criterion + mask-head depth. ``num_upscale_blocks`` changes
-    # the ``upscale_block`` weight shapes, so it must match the saved tensors for a
-    # clean load — recover it from the state dict when the metadata predates it.
-    loss_weights = ckpt.get("loss_weights")
-    num_upscale_blocks = ckpt.get("num_upscale_blocks") or _infer_num_upscale_blocks(state)
-    # Multi-scale (B1) modules: rebuilt from the recorded scales (or recovered
-    # best-effort from the state dict when the metadata predates the field).
-    fpn_scales = ckpt.get("fpn_scales") or _infer_fpn_scales(state)
-    if ckpt.get("detail") or any(_state_keys(state, "eomt.detail.", "detail.")):
-        raise ValueError(f"{path} uses the pixel-detail pathway, which this version of eomt no longer has.")
-    aux_box_head = bool(ckpt.get("aux_box_head")) or _infer_aux_box_head(state)
-
+    ckpt = migrate_checkpoint(load_raw(path))
     model = build_model(
-        size,
-        nc=nc,
-        imgsz=imgsz,
-        names=names,
-        family=family,
-        aux_heads=aux_heads,
-        aux_head_arch=aux_head_arch,
-        loss_weights=loss_weights,
-        num_upscale_blocks=num_upscale_blocks,
-        fpn_scales=fpn_scales,
-        aux_box_head=aux_box_head,
+        ckpt["size"],
+        nc=int(ckpt["nc"]),
+        imgsz=int(ckpt["imgsz"]),
+        names=ckpt.get("names"),
+        family=ckpt["task"],
+        aux_heads=aux_specs_from_meta(ckpt.get("aux_heads")),
+        aux_head_arch=ckpt.get("aux_head_arch"),
+        loss_weights=ckpt.get("loss_weights"),
+        num_upscale_blocks=ckpt.get("num_upscale_blocks"),
+        fpn_scales=ckpt.get("fpn_scales"),
         xview=ckpt.get("xview"),
-        match_dim=int(ckpt.get("match_dim") or 0),
+        matcher=ckpt.get("matcher"),
     )
-    model.match_thres = ckpt.get("match_thres")
-    # Compressed checkpoints carry int8 tensor subclasses (torchao). Re-create the
-    # quantized layout, then load with ``assign=True`` so the saved subclassed
-    # tensors *replace* the module weights directly — copying into freshly built
-    # fp parameters would fail on the packed-layout shape mismatch. The loaded
-    # tensors are pinned to the exact target device (the int8 subclass deserializes
-    # onto a bare ``cuda`` without an index, which ``assign`` rejects against a
-    # ``cuda:0`` module), so normalize each with ``.to(dev)`` before assigning.
-    compression = ckpt.get("compression")
-    if compression:
-        from .compress import compress_model
-
-        dev = resolve_device(device)
-        model = compress_model(model.to(dev), compression.get("recipe", "int8"))
-        state = {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in state.items()}
-        missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
-    else:
-        missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        warnings.warn(
-            f"load_state_dict: {len(missing)} missing / {len(unexpected)} unexpected keys.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    # Record the preprocessing mode the model was trained with so val/predict
-    # match it (older checkpoints predate this flag → legacy stretch resize).
-    model.preprocess_letterbox = bool(ckpt.get("letterbox", False))
-    # Restore normalization (legacy checkpoints predate it → keep the ImageNet default).
-    model.pixel_mean = tuple(float(x) for x in ckpt.get("norm_mean", model.pixel_mean))
-    model.pixel_std = tuple(float(x) for x in ckpt.get("norm_std", model.pixel_std))
-    # How the model is meant to be run (the run config's `inference`: conf_thres, ...): predict / track's defaults.
+    state = ckpt["model"]
+    if has_lora(state):  # a trainer state (last.pt) of a post-training with LoRA: its factors merged
+        lora = ckpt.get("lora") or {}
+        state = merge_state(state, scale=float(lora.get("alpha", 1)) / float(lora.get("rank", 1)))
+    model.load_state_dict(state)
+    model.eomt.set_attn_mask_probs([0.0] * model.config.num_blocks)  # checkpoints are saved and run mask-free
+    model.match_thres = ckpt.get("match_thres")  # the links' calibration (eomt.engine.predict.link_defaults)
+    model.link_group_by = tuple(ckpt["link_group_by"]) if ckpt.get("link_group_by") else None
+    model.meta = {k: ckpt[k] for k in CARRIED_KEYS if ckpt.get(k) is not None}
+    model.preprocess_letterbox = bool(ckpt["letterbox"])
+    model.pixel_mean = tuple(float(x) for x in ckpt["norm_mean"])
+    model.pixel_std = tuple(float(x) for x in ckpt["norm_std"])
+    # How the model is meant to be run (the run config's `inference`: conf_thres, ...): the defaults of predict().
     model.inference = dict(ckpt.get("inference") or {})
-    # Stash the compression recipe so a re-save round-trips it (see EoMT.save).
-    model._compression_meta = dict(compression) if compression else None
-    if compression:
-        return model.eval()  # already on the target device via assigned tensors
     return model.to(resolve_device(device)).eval()
 
 
-# --- best-effort inference of metadata from a bare state dict ---------------
+# --- metadata read off the weights, for checkpoints predating a field --------
 
 
 def _infer_size(state: dict) -> str:
-    for key in ("eomt.layernorm.weight", "layernorm.weight"):
-        if key in state:
-            size = HIDDEN_TO_SIZE.get(int(state[key].shape[0]))
-            if size:
-                return size
-    raise ValueError("could not infer model size from state dict.")
-
-
-def _infer_family(state: dict) -> str:
-    """Recover the head family from the state dict: box head -> detect, else instance."""
-    if any(k.startswith(("eomt.box_head.", "box_head.")) for k in state):
-        return "detect"
-    return "instance"
+    key = "eomt.layernorm.weight"
+    size = HIDDEN_TO_SIZE.get(int(state[key].shape[0])) if key in state else None
+    if size is None:
+        raise ValueError("could not infer the model size from the state dict")
+    return size
 
 
 def _infer_nc(state: dict) -> int:
-    for key in ("eomt.class_predictor.weight", "class_predictor.weight"):
-        if key in state:
-            return int(state[key].shape[0]) - 1  # drop the +1 null class
-    raise ValueError("could not infer nc from state dict.")
-
-
-def _infer_aux_heads(state: dict) -> list:
-    """Recover aux-head specs from ``aux_heads.<name>.weight`` keys (names lost)."""
-    from .config import AuxHeadSpec
-
-    specs = []
-    for key, tensor in state.items():
-        for prefix in ("aux_heads.", "eomt_aux_heads."):
-            if key.startswith(prefix) and key.endswith(".weight"):
-                name = key[len(prefix) : -len(".weight")]
-                # Only bare Linear heads are inferable from a metadata-less state dict;
-                # an MLP head (``aux_heads.<name>.<idx>.weight``) needs the saved
-                # ``aux_head_arch`` to rebuild and is skipped here.
-                if "." in name:
-                    continue
-                specs.append(AuxHeadSpec(name=name, num_classes=int(tensor.shape[0])))
-    return specs
-
-
-def _infer_num_upscale_blocks(state: dict) -> int | None:
-    """Recover the mask-head upscale depth by counting ``upscale_block.block.<i>`` indices.
-
-    Returns ``None`` when no upscale-block keys are present (let the size preset
-    default apply). Tolerates the ``eomt.`` prefix.
-    """
-    idxs = set()
-    for key in state:
-        for prefix in ("eomt.upscale_block.block.", "upscale_block.block."):
-            if key.startswith(prefix):
-                rest = key[len(prefix) :]
-                head = rest.split(".", 1)[0]
-                if head.isdigit():
-                    idxs.add(int(head))
-                break
-    return (max(idxs) + 1) if idxs else None
-
-
-def _infer_fpn_scales(state: dict) -> list[float] | None:
-    """Best-effort recovery of B1 multi-scale: ``None`` unless FPN keys are present.
-
-    The conv weights record only the *count* of pyramid levels (``eomt.fpn.blocks.<i>``),
-    not their scale factors, so this falls back to the default scale tuple for that
-    count. Trust the ``fpn_scales`` metadata when present; this only covers a
-    metadata-stripped FPN checkpoint and warns implicitly via the level-count match.
-    """
-    from .model import DEFAULT_FPN_SCALES
-
-    idxs = set()
-    for key in state:
-        for prefix in ("eomt.fpn.blocks.", "fpn.blocks."):
-            if key.startswith(prefix):
-                head = key[len(prefix) :].split(".", 1)[0]
-                if head.isdigit():
-                    idxs.add(int(head))
-                break
-    if not idxs:
-        return None
-    n = max(idxs) + 1
-    return list(DEFAULT_FPN_SCALES) if n == len(DEFAULT_FPN_SCALES) else None
-
-
-def _state_keys(state: dict, *prefixes: str):
-    for key in state:
-        for prefix in prefixes:
-            if key.startswith(prefix):
-                yield key
-                break
-
-
-def _infer_aux_box_head(state: dict) -> bool:
-    """True if the state dict carries the instance family's auxiliary box head."""
-    return any(_state_keys(state, "eomt.aux_box_head.", "aux_box_head."))
+    if "eomt.class_predictor.weight" not in state:
+        raise ValueError("could not infer nc from the state dict")
+    return int(state["eomt.class_predictor.weight"].shape[0]) - 1  # drop the +1 null class
 
 
 def _infer_imgsz(state: dict, patch_size: int = 14) -> int:
     import math
 
-    for key in (
-        "eomt.embeddings.position_embeddings.weight",
-        "embeddings.position_embeddings.weight",
-    ):
-        if key in state:
-            grid = int(math.isqrt(int(state[key].shape[0])))
-            return grid * patch_size
-    raise ValueError("could not infer imgsz from state dict.")
+    key = "eomt.embeddings.position_embeddings.weight"
+    if key not in state:
+        raise ValueError("could not infer imgsz from the state dict")
+    return int(math.isqrt(int(state[key].shape[0]))) * patch_size
+
+
+def _layer_count(state: dict, prefix: str) -> int:
+    """``max(i) + 1`` over the keys ``<prefix><i>.``, 0 when there is none."""
+    idxs = {int(k[len(prefix):].split(".", 1)[0]) for k in state
+            if k.startswith(prefix) and k[len(prefix):].split(".", 1)[0].isdigit()}
+    return max(idxs) + 1 if idxs else 0
+
+
+def _infer_num_upscale_blocks(state: dict) -> int | None:
+    """The mask-head upscale depth (``None`` without a mask head: the size preset's)."""
+    return _layer_count(state, "eomt.upscale_block.block.") or None
+
+
+def _infer_fpn_scales(state: dict) -> list[float] | None:
+    """The multi-scale levels of an FPN checkpoint predating ``fpn_scales``: the weights only give their count, so the
+    default scales when it matches."""
+    from .model import DEFAULT_FPN_SCALES
+
+    n = _layer_count(state, "eomt.fpn.blocks.")
+    if not n:
+        return None
+    if n != len(DEFAULT_FPN_SCALES):
+        raise ValueError(f"an FPN of {n} levels without its fpn_scales: cannot rebuild it")
+    return list(DEFAULT_FPN_SCALES)
 
 
 # --- checkpoint inspection --------------------------------------------------
@@ -412,18 +387,19 @@ def summarize_checkpoint(path: str | Path) -> dict[str, Any]:
     inferred from the state dict where possible.
     """
     resolved = resolve_checkpoint(path, prefer="best")
-    ckpt = load_raw(resolved)
-    state = ckpt.get("model", ckpt)
+    raw = load_raw(resolved)
+    ckpt = migrate_checkpoint(raw)
+    state = ckpt["model"]
     summary: dict[str, Any] = {
         "path": str(resolved),
         "file_mb": round(resolved.stat().st_size / 1e6, 1),
         "num_tensors": len(state),
-        "schema_version": ckpt.get("schema_version"),
+        "schema_version": raw.get("schema_version"),
         "eomt_version": ckpt.get("eomt_version"),
-        "size": ckpt.get("size") or _try(lambda: _infer_size(state)),
-        "task": ckpt.get("task") or _try(lambda: _infer_family(state)),
-        "nc": ckpt.get("nc") or _try(lambda: _infer_nc(state)),
-        "imgsz": ckpt.get("imgsz") or _try(lambda: _infer_imgsz(state)),
+        "size": ckpt["size"],
+        "task": ckpt["task"],
+        "nc": ckpt["nc"],
+        "imgsz": ckpt["imgsz"],
         "patch_size": ckpt.get("patch_size", 14),
         "letterbox": ckpt.get("letterbox"),
         "norm_mean": ckpt.get("norm_mean", list(IMAGENET_MEAN)),
@@ -432,26 +408,22 @@ def summarize_checkpoint(path: str | Path) -> dict[str, Any]:
         "aux_heads": ckpt.get("aux_heads"),
         "loss_weights": ckpt.get("loss_weights"),
         "num_upscale_blocks": ckpt.get("num_upscale_blocks"),
-        "fpn_scales": ckpt.get("fpn_scales") or _try(lambda: _infer_fpn_scales(state)),
-        "aux_box_head": bool(ckpt.get("aux_box_head")) or bool(_try(lambda: _infer_aux_box_head(state))),
+        "fpn_scales": ckpt.get("fpn_scales"),
         "xview": ckpt.get("xview"),
-        "match_dim": ckpt.get("match_dim"),
+        "matcher": ckpt.get("matcher"),
         "match_thres": ckpt.get("match_thres"),
-        # Training state (only present in last.pt).
+        "link_group_by": ckpt.get("link_group_by"),
+        "dtype": ckpt.get("dtype"),
+        # Where the weights come from: the epoch and metrics row they were saved at, best.pt's key, the run.
         "epoch": ckpt.get("epoch"),
         "best_metric": ckpt.get("best_metric"),
+        "best_key": ckpt.get("best_key"),
+        "metrics": ckpt.get("metrics"),
+        "provenance": (ckpt.get("run_config") or {}).get("provenance"),
         "has_optimizer": "optimizer" in ckpt,
         "has_ema": "ema" in ckpt,
     }
     return summary
-
-
-def _try(fn):
-    """Best-effort metadata inference; ``None`` if it can't be recovered."""
-    try:
-        return fn()
-    except Exception:
-        return None
 
 
 def format_summary(summary: dict[str, Any]) -> str:
@@ -488,21 +460,39 @@ def format_summary(summary: dict[str, Any]) -> str:
     arch = []
     if summary.get("fpn_scales"):
         arch.append(f"FPN{tuple(summary['fpn_scales'])}")
-    if summary.get("aux_box_head"):
-        arch.append("box head")
     if summary.get("xview"):
-        xv = summary["xview"]
-        arch.append(f"cross-view {xv.get('mode')} (<= {xv.get('max_views')} photos)")
-    if summary.get("match_dim"):
-        thr = summary.get("match_thres")
-        arch.append(f"match head {summary['match_dim']}-d" + (f" (thres {thr:.2f})" if thr is not None else ""))
+        arch.append(f"cross-view (<= {summary['xview'].get('max_views')} photos)")
+    if summary.get("matcher"):
+        arch.append(f"set matcher {summary['matcher'].get('layers')} x {summary['matcher'].get('dim')}-d")
+    if summary.get("match_thres") is not None:
+        gate = summary.get("link_group_by")
+        what = "probability" if summary.get("matcher") else "cosine"
+        arch.append(f"links at {what} {summary['match_thres']:.2f}" + (f" within {', '.join(gate)}" if gate else ""))
+    if summary.get("dtype"):
+        arch.append(f"{summary['dtype']} Linear / Conv weights")
     if arch:
         lines.insert(5, "  extras   : " + ", ".join(arch))
     if summary.get("epoch") is not None or summary.get("has_optimizer"):
         bm = summary.get("best_metric")
         bm_str = f"{bm:.4f}" if isinstance(bm, (int, float)) else str(bm)
+        key = summary.get("best_key")
+        key = key if isinstance(key, str) or key is None else " + ".join(f"{w:g} x {k}" for k, w in key.items())
         lines.append(
-            f"  training : epoch={summary.get('epoch')}  best_metric={bm_str}"
-            f"  optimizer={summary.get('has_optimizer')}  ema={summary.get('has_ema')}"
+            f"  training : epoch={summary.get('epoch')}  best_metric={bm_str}" + (f" ({key})" if key else "")
+            + f"  optimizer={summary.get('has_optimizer')}  ema={summary.get('has_ema')}"
         )
+    metrics = summary.get("metrics") or {}
+    shown = [k for k in _HEADLINE if isinstance(metrics.get(k), (int, float)) and metrics[k] == metrics[k]]
+    if shown:
+        lines.append("  metrics  : " + ", ".join(f"{k[4:] if k.startswith('val/') else k}={metrics[k]:.4f}" for k in shown))
+    prov = summary.get("provenance") or {}
+    if prov.get("init_weights"):
+        lines.append(f"  started  : {prov['init_weights']} (sha256 {str(prov.get('init_sha256'))[:12]})")
+    for name, rec in (prov.get("data") or {}).items():
+        lines.append(f"  data     : {name} {rec.get('path')} (sha256 {str(rec.get('sha256'))[:12]})")
     return "\n".join(lines)
+
+
+#: The metrics :func:`format_summary` shows of a checkpoint's metrics row, when it has them.
+_HEADLINE = ("val/segm/mAP", "val/bbox/mAP", "val/sets/segm/mAP_alone", "val/sets/segm/mAP_set",
+             "val/sets/segm/mAP_linked_set", "val/sets/match/f1", "val/sets/match/cluster_f1")

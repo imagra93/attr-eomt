@@ -11,8 +11,13 @@ box-regression head).
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F  # noqa: N812
+
+#: Bytes of float32 full-resolution mask logits upsampled at once (the masks are binarized chunk by chunk).
+_UPSAMPLE_BUDGET = 1 << 28
 
 
 def _build_aux_result(aux_logits: dict, sel, classes, aux_scopes: dict | None) -> dict:
@@ -34,16 +39,18 @@ def aux_result(aux_probs: dict, classes, aux_scopes: dict | None) -> dict:
         ids = probs.argmax(dim=-1)
         scope = aux_scopes.get(name)
         if scope is not None and ids.numel():
-            out_of_scope = torch.tensor(
-                [int(c) not in scope for c in classes.tolist()],
-                dtype=torch.bool, device=ids.device,
-            )
+            out_of_scope = _out_of_scope(classes, scope)
             ids = ids.clone()
             ids[out_of_scope] = -1
             probs = probs.clone()
             probs[out_of_scope] = 0.0
         res[name] = {"ids": ids, "probs": probs}
     return res
+
+
+def _out_of_scope(classes: torch.Tensor, scope) -> torch.Tensor:
+    """Per detection, whether its class is outside a head's ``scope`` (a set of class ids), on the classes' device."""
+    return ~torch.isin(classes, torch.tensor(sorted(int(c) for c in scope), device=classes.device, dtype=classes.dtype))
 
 
 def aux_value_result(aux_values: dict, classes, aux_scopes: dict | None) -> dict:
@@ -54,8 +61,7 @@ def aux_value_result(aux_values: dict, classes, aux_scopes: dict | None) -> dict
     for name, v in aux_values.items():
         scope = aux_scopes.get(name)
         if scope is not None and v.numel():
-            out_of_scope = torch.tensor([int(c) not in scope for c in classes.tolist()], dtype=torch.bool, device=v.device)
-            v = v.masked_fill(out_of_scope, float("nan"))
+            v = v.masked_fill(_out_of_scope(classes, scope), float("nan"))
         res[name] = v
     return res
 
@@ -107,6 +113,20 @@ def _masks_to_original(mask_logits, orig_h, orig_w, preprocess_meta):
     )[0]
 
 
+def masks_to_original(mask_logits: torch.Tensor, orig_h: int, orig_w: int, preprocess_meta, mask_thresh: float):
+    """Boolean masks ``(N, orig_h, orig_w)`` of mask logits ``(N, h, w)``: upsampled as :func:`_masks_to_original` does,
+    a chunk of masks at a time (a hundred float masks of a 12 MP photo would take ~5 GB), and binarized on the logits
+    (``sigmoid(x) > t`` is ``x > logit(t)``: no full-resolution sigmoid)."""
+    out = torch.empty((mask_logits.shape[0], orig_h, orig_w), dtype=torch.bool, device=mask_logits.device)
+    t = min(max(float(mask_thresh), 0.0), 1.0)
+    cut = -math.inf if t <= 0 else math.inf if t >= 1 else math.log(t / (1 - t))
+    side = int(preprocess_meta["input_size"]) if preprocess_meta and preprocess_meta.get("letterbox") else 0
+    chunk = max(1, _UPSAMPLE_BUDGET // (4 * max(orig_h * orig_w, side * side)))
+    for i in range(0, mask_logits.shape[0], chunk):
+        out[i:i + chunk] = _masks_to_original(mask_logits[i:i + chunk], orig_h, orig_w, preprocess_meta) > cut
+    return out
+
+
 def boxes_to_original(
     boxes_cxcywh: torch.Tensor, orig_h: int, orig_w: int, preprocess_meta: dict | None
 ) -> torch.Tensor:
@@ -143,7 +163,6 @@ def postprocess_detection(
     max_det: int = 100,
     preprocess_meta: dict | None = None,
     aux_scopes: dict | None = None,
-    **_: object,
 ) -> dict:
     """Convert raw EoMT **detection** output to the canonical instance dict (no masks).
 
@@ -174,26 +193,6 @@ def postprocess_detection(
 
     orig_w, orig_h = original_size
     sel = (scores >= conf_thres).nonzero(as_tuple=True)[0]
-    if sel.numel() == 0:
-        empty = {
-            "num_detections": 0,
-            "boxes": torch.zeros((0, 4)),
-            "scores": torch.zeros((0,)),
-            "classes": torch.zeros((0,), dtype=torch.long),
-            "query_idx": torch.zeros((0,), dtype=torch.long),
-        }
-        if aux_logits is not None:
-            empty["aux"] = {
-                name: {
-                    "ids": torch.zeros((0,), dtype=torch.long),
-                    "probs": torch.zeros((0, lg.shape[-1])),
-                }
-                for name, lg in aux_logits.items()
-            }
-        if aux_values is not None:
-            empty["aux_values"] = {name: torch.zeros((0,)) for name in aux_values}
-        return empty
-
     if sel.numel() > max_det:
         sel = sel[scores[sel].topk(max_det).indices]
 
@@ -251,7 +250,6 @@ def postprocess_instance(
     min_mask_area: float = 0.0,
     preprocess_meta: dict | None = None,
     aux_scopes: dict | None = None,
-    **_: object,
 ) -> dict:
     """Convert raw EoMT output to the canonical instance-seg dict.
 
@@ -287,37 +285,11 @@ def postprocess_instance(
 
     orig_w, orig_h = original_size
     sel = (scores >= conf_thres).nonzero(as_tuple=True)[0]  # indices into Q
-    if sel.numel() == 0:
-        empty = {
-            "num_detections": 0,
-            "boxes": torch.zeros((0, 4)),
-            "scores": torch.zeros((0,)),
-            "classes": torch.zeros((0,), dtype=torch.long),
-            "masks": torch.zeros((0, orig_h, orig_w), dtype=torch.bool),
-            "query_idx": torch.zeros((0,), dtype=torch.long),
-        }
-        if output.get("aux_boxes") is not None:
-            empty["head_boxes"] = torch.zeros((0, 4))
-        if aux_logits is not None:
-            empty["aux"] = {
-                name: {
-                    "ids": torch.zeros((0,), dtype=torch.long),
-                    "probs": torch.zeros((0, lg.shape[-1])),
-                }
-                for name, lg in aux_logits.items()
-            }
-        if aux_values is not None:
-            empty["aux_values"] = {name: torch.zeros((0,)) for name in aux_values}
-        return empty
-
     if sel.numel() > max_det:
         sel = sel[scores[sel].topk(max_det).indices]
 
     scores, classes = scores[sel], classes[sel]
-    mask_logits = mask_logits[sel]
-
-    masks = _masks_to_original(mask_logits, orig_h, orig_w, preprocess_meta)
-    masks = masks.sigmoid() > mask_thresh  # (N, H, W) bool
+    masks = masks_to_original(mask_logits[sel], orig_h, orig_w, preprocess_meta, mask_thresh)  # (N, H, W) bool
 
     # Drop tiny masks (speck false-positives) at the original resolution. Keep the
     # selection indices ``sel`` aligned so the aux heads index the same instances.
@@ -334,9 +306,6 @@ def postprocess_instance(
         "masks": masks,
         "query_idx": sel,
     }
-    if output.get("aux_boxes") is not None:
-        # Boxes regressed by the auxiliary box head (xyxy, original pixels), next to the mask-derived ``boxes``.
-        result["head_boxes"] = boxes_to_original(output["aux_boxes"][0].float()[sel], orig_h, orig_w, preprocess_meta)
     if aux_logits is not None:
         result["aux"] = _build_aux_result(aux_logits, sel, classes, aux_scopes)
     if aux_values is not None:

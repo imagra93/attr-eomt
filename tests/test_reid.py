@@ -343,3 +343,20 @@ def test_similarity_diagnostics_splits_within_and_across():
     assert similarity_diagnostics(
         sim, torch.zeros((3, 3), dtype=torch.bool), torch.tensor([0, 1, 2])
     )["within_identity"] == {"n": 0}
+
+
+def test_summarize_fuses_regression_values_per_identity():
+    from eomt.config import AuxHeadSpec
+
+    results = [
+        {"num_detections": 1, "classes": torch.tensor([0]), "scores": torch.tensor([0.9]),
+         "boxes": torch.zeros(1, 4), "aux_values": {"size": torch.tensor([10.0])}},
+        {"num_detections": 1, "classes": torch.tensor([0]), "scores": torch.tensor([0.3]),
+         "boxes": torch.zeros(1, 4), "aux_values": {"size": torch.tensor([float("nan")])}},  # does not apply
+        {"num_detections": 1, "classes": torch.tensor([0]), "scores": torch.tensor([0.9]),
+         "boxes": torch.zeros(1, 4), "aux_values": {"size": torch.tensor([1000.0])}},
+    ]
+    spec = AuxHeadSpec("size", 1, regression=True, log=True)
+    rec = summarize_identities(torch.tensor([0, 0, 0]), [(0, 0), (1, 0), (2, 0)], results, torch.eye(3),
+                               aux_specs=[spec])[0]
+    assert rec["values"]["size"] == pytest.approx(np.expm1((np.log1p(10.0) + np.log1p(1000.0)) / 2), rel=1e-5)

@@ -1,4 +1,10 @@
-"""Video object tracking for EoMT (per-frame inference + ByteTrack association).
+"""Example: video tracking with an EoMT model and ByteTrack (``pip install "supervision<0.30" opencv-python``).
+
+Not part of the package: an example of building on :func:`eomt.engine.predict.predict_image`. Usage::
+
+    python examples/track.py runs/train/eomt-l video.mp4
+
+Video object tracking for EoMT (per-frame inference + ByteTrack association).
 
 Runs the still-image inference (:func:`~eomt.engine.predict.predict_image`) on every
 frame of a video, associates detections across frames into persistent ``track_id``s
@@ -23,8 +29,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..serialization import load_model
-from .predict import predict_image
+from eomt.engine.predict import predict_image
+from eomt.serialization import load_model
 
 _AUX_DATA_PREFIX = "aux::"  # namespaces aux probs stashed in sv.Detections.data
 
@@ -494,3 +500,9 @@ class _Associator:
             return empty, np.array([], int), []
         merged = self._sv.Detections.merge(out_dets)
         return merged, merged.tracker_id.astype(int), out_keys
+
+
+if __name__ == "__main__":
+    import sys
+
+    track(sys.argv[1], sys.argv[2])

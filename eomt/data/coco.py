@@ -106,7 +106,7 @@ def _load_attr_schema(root: Path):
             else:  # bare label -> auto id by position
                 cats.append({"id": i, "name": str(c)})
         entry = {"name": d["name"], "categories": cats}
-        for key in ("applies_to", "type", "log", "range", "crop", "min_visible", "flip_aware"):
+        for key in ("applies_to", "type", "log", "range", "crop", "min_visible", "flip_aware", "bins"):
             if d.get(key) is not None:
                 entry[key] = d[key]
         norm.append(entry)
@@ -249,9 +249,13 @@ def _regression_spec(d: dict, anns: list, cat2contig: dict, applies_to) -> AuxHe
     min_visible = float(d.get("min_visible", 0.9))
     if crop not in (None, "scale", "ignore") or not 0.0 <= min_visible <= 1.0:
         raise ValueError(f"attribute {d['name']!r}: crop={crop!r} ('scale' or 'ignore'), min_visible={min_visible} (in [0, 1])")
+    bins = tuple(float(b) for b in d["bins"]) if d.get("bins") else None
+    if bins and list(bins) != sorted(set(bins)):
+        raise ValueError(f"attribute {d['name']!r}: bins {list(bins)} must increase")
     spec = AuxHeadSpec(
         name=d["name"], num_classes=1, applies_to=applies_to, regression=True, log=bool(d.get("log", False)),
         value_range=(float(rng[0]), float(rng[1])) if rng is not None else None, crop=crop, min_visible=min_visible,
+        bins=bins,
     )
     vals = [
         _attr_label(spec, {}, a.get("attributes", {}), cat2contig.get(a.get("category_id")))
@@ -267,8 +271,9 @@ def _regression_spec(d: dict, anns: list, cat2contig: dict, applies_to) -> AuxHe
     return spec
 
 
-#: How a head trains on an attribute: set by the run config (``attributes:`` of the training YAML), not the data.
-BEHAVIOR_KEYS = ("flip_aware", "crop", "min_visible", "log", "range", "applies_to")
+#: How a head trains on an attribute (and, ``bins``, how its errors are reported): set by the run config
+#: (``attributes:`` of the training YAML), not the data.
+BEHAVIOR_KEYS = ("flip_aware", "crop", "min_visible", "log", "range", "applies_to", "bins")
 
 
 def _build_attribute_maps(coco, only: list[str] | dict | None = None, *, cat2contig=None, contig_names=None):
@@ -323,8 +328,8 @@ def _build_attribute_maps(coco, only: list[str] | dict | None = None, *, cat2con
         kind = d.get("type", "categorical")
         if kind not in ("categorical", "regression"):
             raise ValueError(f"attribute {name!r}: unknown type {kind!r} (categorical or regression)")
-        if kind != "regression" and d.get("crop") is not None:
-            raise ValueError(f"attribute {name!r}: 'crop' applies to regression attributes only")
+        if kind != "regression" and (d.get("crop") is not None or d.get("bins")):
+            raise ValueError(f"attribute {name!r}: 'crop' and 'bins' apply to regression attributes only")
         if kind == "regression" and d.get("flip_aware"):
             raise ValueError(f"attribute {name!r}: 'flip_aware' applies to categorical attributes only")
         if kind == "regression":

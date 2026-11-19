@@ -21,6 +21,8 @@ def test_a_run_config_resolves_its_sections_and_paths_against_its_folder(tmp_pat
         "path": "../data", "train_images": "images", "train_json": "train.json",
         "attributes": {"side": {"flip_aware": {"left": "right"}}, "size": {"log": True, "crop": "scale"}},
         "aug": {"rotate_prob": 0.3},
+        "optim": {"lr0": 5e-5},
+        "multiview": {"val_sets": "sets.json"},
         "train": {"epochs": 24, "init_weights": "../weights/best.pt", "project": "../runs", "seed": 0},
         "inference": {"conf_thres": 0.25},
     }))
@@ -29,11 +31,13 @@ def test_a_run_config_resolves_its_sections_and_paths_against_its_folder(tmp_pat
     assert cfg["train"] == {"epochs": 24, "init_weights": str(tmp_path / "weights" / "best.pt"),
                             "project": str(tmp_path / "runs"), "seed": 0}
     assert cfg["attributes"] == {"side": {"flip_aware": {"left": "right"}}, "size": {"log": True, "crop": "scale"}}
-    assert cfg["train_aug"] == {"rotate_prob": 0.3} and cfg["inference"] == {"conf_thres": 0.25}
+    assert cfg["aug"] == {"rotate_prob": 0.3} and cfg["inference"] == {"conf_thres": 0.25}
+    assert cfg["optim"] == {"lr0": 5e-5} and cfg["multiview"] == {"val_sets": str(tmp_path / "configs" / "sets.json")}
+    assert cfg["model"] is None and cfg["val"] is None
 
-    (tmp_path / "both.yaml").write_text(yaml.safe_dump({"aug": {"rotate_prob": 0.1}, "train_aug": {"blur_prob": 0.1}}))
-    with pytest.raises(ValueError, match="same section"):
-        load_data_config(tmp_path / "both.yaml", autodownload=False)
+    (tmp_path / "old.yaml").write_text(yaml.safe_dump({"train_aug": {"blur_prob": 0.1}}))
+    with pytest.warns(UserWarning, match="unknown keys"):          # the pre-3.0 name of `aug` is not read
+        load_data_config(tmp_path / "old.yaml", autodownload=False)
     (tmp_path / "paths.yaml").write_text(yaml.safe_dump({"train": {"train_json": "x.json", "size": "s"}}))
     with pytest.raises(ValueError, match="cannot set"):
         load_data_config(tmp_path / "paths.yaml", autodownload=False)
@@ -81,8 +85,9 @@ def test_a_run_from_its_yaml_records_it_and_predicts_with_its_inference_settings
     run.write_text(yaml.safe_dump({
         "path": str(tmp_path), "train_images": "images", "train_json": jf.name, "val_images": "images", "val_json": jf.name,
         "attributes": {"kind": None},
-        "train": {"epochs": 1, "imgsz": 112, "batch": 1, "accum": 1, "workers": 0, "amp": False, "pretrained": False,
-                  "ema": False, "seed": 0, "project": "runs", "name": "r", "warmup_steps": [1, 1]},
+        "optim": {"ema": False, "warmup_steps": [1, 1]},
+        "train": {"epochs": 1, "imgsz": 112, "batch": 1, "nominal_batch": 1, "workers": 0, "amp": False,
+                  "pretrained": False, "seed": 0, "project": "runs", "name": "r"},
         "inference": {"conf_thres": 0.9, "max_det": 7},
     }))
     model = EoMT("s", device="cpu", pretrained=False)
@@ -91,11 +96,13 @@ def test_a_run_from_its_yaml_records_it_and_predicts_with_its_inference_settings
     args = yaml.safe_load((tmp_path / "runs" / "r" / "args.yaml").read_text())  # `project` relative to the YAML
     assert args["attributes"] == {"kind": {"type": "categorical", "categories": ["blob", "line"]}}
     assert args["inference"] == {"conf_thres": 0.9, "max_det": 7} and args["epochs"] == 1
-    ck = torch.load(res["best"], weights_only=False)
+    ck = torch.load(res["best"], weights_only=True)
     assert ck["inference"] == {"conf_thres": 0.9, "max_det": 7} and ck["run_config"]["attributes"] == args["attributes"]
 
     seen = {}
-    monkeypatch.setattr("eomt.api._predict", lambda model, source, **kw: seen.update(kw) or [])
+    import sys
+
+    monkeypatch.setattr(sys.modules["eomt.engine.predict"], "predict", lambda model, source, **kw: seen.update(kw) or [])
     model.predict(str(img_dir))
     assert (seen["conf_thres"], seen["max_det"], seen["mask_thresh"]) == (0.9, 7, 0.5)  # saved, saved, default
     model.predict(str(img_dir), conf_thres=0.1)

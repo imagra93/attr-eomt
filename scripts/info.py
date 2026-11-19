@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 
-from eomt import format_summary, summarize_checkpoint
+from eomt.serialization import format_summary, summarize_checkpoint
 
 
 def main() -> None:

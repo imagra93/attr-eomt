@@ -51,7 +51,12 @@ def test_state_dict_keys_match(size):
     cfg = build_eomt_config(size, nc=NC, image_size=IMGSZ)
     hf = EomtForUniversalSegmentation(cfg)
     nat = EoMTEncoder(cfg)
-    assert set(hf.state_dict()) == set(nat.state_dict())
+    # every key but HF's masked-attention probability buffer (a plain list here, set by set_attn_mask_probs)
+    assert set(hf.state_dict()) - {"attn_mask_probs"} == set(nat.state_dict())
+
+
+def _hf_state(hf) -> dict:
+    return {k: v for k, v in hf.state_dict().items() if k != "attn_mask_probs"}
 
 
 @pytest.mark.parametrize("probs", [1.0, 0.0])
@@ -60,11 +65,11 @@ def test_forward_parity_fresh_weights(probs):
     cfg = build_eomt_config("s", nc=NC, image_size=IMGSZ)
     hf = EomtForUniversalSegmentation(cfg).eval()
     nat = EoMTEncoder(cfg).eval()
-    missing, unexpected = nat.load_state_dict(hf.state_dict())
+    missing, unexpected = nat.load_state_dict(_hf_state(hf))
     assert not missing and not unexpected
 
     hf.attn_mask_probs.fill_(probs)
-    nat.attn_mask_probs.fill_(probs)
+    nat.set_attn_mask_probs([probs] * cfg.num_blocks)
     _use_reference_attention_mask(nat)  # everything but the mask construction must match HF
     x = torch.randn(2, 3, IMGSZ, IMGSZ)
     with torch.no_grad():
@@ -80,7 +85,7 @@ def test_loss_parity_fresh_weights():
     cfg = build_eomt_config("s", nc=NC, image_size=IMGSZ, mask_weight=0.0, dice_weight=0.0)
     hf = EomtForUniversalSegmentation(cfg).train()
     nat = EoMTEncoder(cfg).train()
-    nat.load_state_dict(hf.state_dict())
+    nat.load_state_dict(_hf_state(hf))
     _use_reference_attention_mask(nat)
 
     x = torch.randn(2, 3, IMGSZ, IMGSZ)
@@ -109,7 +114,7 @@ def test_real_checkpoint_parity(ckpt_rel):
     cfg = build_eomt_config(size, nc=nc, image_size=imgsz,
                             num_upscale_blocks=nub, **(ckpt.get("loss_weights") or {}))
     # eomt.* subset of the (EoMTModel) state dict, with the prefix stripped.
-    state = {k[len("eomt."):]: v for k, v in ckpt["model"].items() if k.startswith("eomt.")}
+    state = {k[len("eomt."):]: v for k, v in ckpt["model"].items() if k.startswith("eomt.") and k != "eomt.attn_mask_probs"}
 
     nat = EoMTEncoder(cfg).eval()
     missing, unexpected = nat.load_state_dict(state, strict=False)
@@ -119,7 +124,7 @@ def test_real_checkpoint_parity(ckpt_rel):
     hf.load_state_dict(state, strict=False)
 
     hf.attn_mask_probs.zero_()
-    nat.attn_mask_probs.zero_()
+    nat.set_attn_mask_probs([0.0] * cfg.num_blocks)
     torch.manual_seed(0)
     x = torch.randn(1, 3, imgsz, imgsz)
     with torch.no_grad():

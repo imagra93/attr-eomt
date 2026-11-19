@@ -13,24 +13,27 @@ whether to auto-download COCO 2017 if missing::
 The same YAML is the **run config**: everything a training run needs besides the data, written out in one file, so that
 the dataset holds only images, annotations and its attributes' names, types and categories, and the YAML says how a
 model is trained on it and how it is to be run (``sample_data/run.yaml`` is a commented template). Every section is
-optional::
+optional; each is one settings section of :func:`eomt.engine.train.train`::
 
     attributes:                    # the per-instance heads to train (an attribute of the data left out is not) and how
       laterality: {flip_aware: {left: right}}       # each one learns (eomt.data.coco.BEHAVIOR_KEYS); without the
       area: {log: true, range: [0, 50000], crop: scale}   # section, every attribute as the data declares it
       pose:
-    aug:                          # AugConfig fields (``train_aug``, the older name, is the same)
-      min_scale: 0.6
-      instance_crop_prob: 0.8
-    train:                         # train() keywords: epochs, imgsz, lr0, init_weights, project, name, hires_epochs...
+    aug: {min_scale: 0.6}          # AugConfig
+    model: {quality_weight: 0}     # ModelConfig: architecture and loss weights of a new model
+    optim: {lr0: 5.0e-5}           # OptimConfig: optimizer, schedule, EMA, masked attention
+    aux: {class_weights: true}     # AuxConfig: how the attribute heads train
+    val: {interval: 1}             # ValConfig: validation and best.pt
+    multiview: {trainable: new}    # MultiviewConfig: a post-training on sets of photos of one subject
+    train:                         # train() keywords: epochs, batch, imgsz, init_weights, project, name, ...
       epochs: 20
       init_weights: ../runs/base/weights/best.pt
-    inference:                     # saved in every checkpoint; the defaults of predict() / track() with that model
+    inference:                     # saved in every checkpoint; the defaults of predict() with that model
       conf_thres: 0.25
 
 Explicit arguments (code, command line) beat the YAML, which beats ``train()``'s defaults. Relative paths (``path``,
-``train.init_weights``, ``train.project``) are relative to the YAML. The model size and the device are not part of it
-(``EoMT("l")`` / ``--size``, ``--device``): a warm start takes the size from its checkpoint.
+``train.init_weights``, ``train.project``, ``multiview.val_sets``) are relative to the YAML. The model size and the
+device are not part of it (``EoMT("l")`` / ``--size``, ``--device``): a warm start takes the size from its checkpoint.
 """
 
 from __future__ import annotations
@@ -48,7 +51,8 @@ _TRAIN_PATH_KEYS = ("init_weights", "project")
 #: train() keywords the ``train`` section cannot set: the data paths are the YAML's top level, the size and the device
 #: are chosen when the model is built.
 _TRAIN_RESERVED = ("train_images", "train_json", "val_images", "val_json", "size", "device")
-_SECTIONS = ("attributes", "aug", "train_aug", "train", "inference")
+#: The settings sections (the keyword of train() each one is passed as).
+_SECTIONS = ("attributes", "aug", "model", "optim", "aux", "val", "multiview", "train", "inference")
 _KEYS = {"path", "train_images", "train_json", "val_images", "val_json", "download", *_SECTIONS}
 
 
@@ -72,6 +76,8 @@ def _read_config(yaml_path: Path) -> dict:
     for key in _TRAIN_PATH_KEYS:
         if isinstance((cfg.get("train") or {}).get(key), str):
             cfg["train"][key] = str((here / cfg["train"][key]).resolve())
+    if isinstance((cfg.get("multiview") or {}).get("val_sets"), str):
+        cfg["multiview"]["val_sets"] = str((here / cfg["multiview"]["val_sets"]).resolve())
     return cfg
 
 
@@ -111,18 +117,12 @@ def load_data_config(yaml_path: str | Path, *, autodownload: bool = True) -> dic
         val_images = val_images or paths["val_images"]
         val_json = val_json or paths["val_json"]
 
-    if cfg.get("aug") is not None and cfg.get("train_aug") is not None:
-        raise ValueError(f"{yaml_path}: `aug` and `train_aug` are the same section; use one")
-    train_aug = cfg.get("aug", cfg.get("train_aug"))
-
     return {
-        "attributes": cfg.get("attributes"),
+        **{key: cfg.get(key) for key in _SECTIONS if key != "train"},
         "train": cfg.get("train") or {},
-        "inference": cfg.get("inference"),
         "path": str(root),
         "train_images": str(train_images) if train_images else None,
         "train_json": str(train_json) if train_json else None,
         "val_images": str(val_images) if val_images else None,
         "val_json": str(val_json) if val_json else None,
-        "train_aug": train_aug,
     }

@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 import torch
 
-from eomt import build_eomt_config, build_model, postprocess_instance
+from eomt import build_model
+from eomt.config import build_eomt_config
+from eomt.postprocess import postprocess_instance
 from eomt.postprocess import postprocess_detection as _postprocess_detection
 from eomt.config import EOMT_CONFIGS
 
@@ -37,7 +39,8 @@ def test_build_forward_shapes():
         out = model(x)
     # ``query_embed`` is emitted unconditionally — including for models with no aux
     # heads, which is what lets cross-photo re-id run on any checkpoint.
-    assert set(out) == {"masks_queries_logits", "class_queries_logits", "query_embed"}
+    assert set(out) == {"masks_queries_logits", "class_queries_logits", "quality_logits", "query_embed",
+                        "photo_embed"}
     q = EOMT_CONFIGS["s"].num_queries
     assert out["class_queries_logits"].shape == (2, q, NC + 1)
     assert out["masks_queries_logits"].shape[:2] == (2, q)
@@ -455,10 +458,8 @@ def test_model_ema_tracks_params_and_copies_buffers():
     after = ema.module.state_dict()[name]
     assert torch.allclose(after, 0.5 * before + 0.5 * live, atol=1e-5)
 
-    # The annealed attn_mask_probs buffer is copied verbatim, never averaged.
-    model.eomt.attn_mask_probs.fill_(0.7)
-    ema.update(model)
-    assert torch.allclose(ema.module.eomt.attn_mask_probs, model.eomt.attn_mask_probs)
+    # The masked-attention probabilities are no buffer: the trainer sets the EMA's own before validating it.
+    assert not any("attn_mask_probs" in k for k in ema.module.state_dict())
 
 
 def test_build_optimizer_no_decay_and_llrd():
@@ -606,7 +607,8 @@ def test_old_checkpoint_without_loss_metadata_loads(tmp_path):
 
     from eomt.serialization import _infer_num_upscale_blocks, load_model, save_checkpoint
 
-    model = build_model("s", nc=NC, imgsz=IMGSZ).eval()
+    # a model of that time: no quality head, hard class targets (the defaults before checkpoints recorded them)
+    model = build_model("s", nc=NC, imgsz=IMGSZ, loss_weights={"quality_weight": 0.0, "iou_aware_cls": False}).eval()
     sd = model.state_dict()
     assert _infer_num_upscale_blocks(sd) == 2
     save_checkpoint({"model": sd, "size": "s", "nc": NC, "imgsz": IMGSZ}, tmp_path / "old.pt")
@@ -943,3 +945,31 @@ def test_link_width_is_independent_of_panel_size():
     assert len(set(widths.values())) == 1, f"stroke varies with panel_size: {widths}"
     lo, hi = LINK_WIDTH_PX
     assert lo <= next(iter(widths.values())) <= hi
+
+
+def test_progress_prints_plain_lines_when_not_on_a_terminal(capsys, monkeypatch):
+    import sys
+
+    from eomt import progress as P
+
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+    bar = P.progress(range(20), desc="epoch 0/1", unit="batch")
+    assert isinstance(bar, P.LineProgress)
+    for i in bar:
+        bar.set_postfix({"loss": f"{i:.1f}"})
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("epoch 0/1")]
+    assert len(lines) == 10 and "\r" not in "".join(lines)  # one line per 10 %
+    assert lines[-1].startswith("epoch 0/1: 20/20 (100%)") and "loss=19.0" in lines[-1]
+
+
+def test_metrics_csv_of_a_resumed_run_takes_new_columns(tmp_path):
+    import csv
+
+    from eomt.engine.train import _CsvLogger
+
+    path = tmp_path / "metrics.csv"
+    path.write_text("epoch,train/loss\n0,1.5\n")
+    log = _CsvLogger(path, ["epoch", "train/loss", "train/data_wait"])
+    log.append({"epoch": 1, "train/loss": 1.2, "train/data_wait": 0.1})
+    rows = list(csv.DictReader(path.open()))
+    assert [r["train/data_wait"] for r in rows] == ["nan", "0.1"] and rows[0]["train/loss"] == "1.5"
